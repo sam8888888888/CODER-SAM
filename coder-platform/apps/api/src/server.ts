@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import cookie from "@fastify/cookie";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { extname, join, normalize } from "node:path";
 import { mkdirSync } from "node:fs";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
@@ -188,6 +188,25 @@ app.get<{ Params: { artifactId: string } }>("/api/v1/artifacts/:artifactId/downl
   try { const content = await readFile(artifact.storagePath); return reply.header("Content-Disposition", `attachment; filename="${artifact.name.replaceAll('"', "")}"`).type(artifact.mimeType).send(content); }
   catch { return reply.code(404).send({ error: "ARTIFACT_FILE_MISSING" }); }
 });
+app.post<{ Params: { workspaceId: string }; Body: { email?: string; role?: "owner" | "admin" | "member" | "viewer" } }>("/api/v1/workspaces/:workspaceId/invitations", { preHandler: requireUser }, async (request: any, reply) => {
+  const membership = db.prepare("SELECT role FROM memberships WHERE workspace_id=? AND user_id=?").get(request.params.workspaceId, request.user!.id) as { role: string } | undefined;
+  if (!membership) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (membership.role !== "owner") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const email = request.body?.email?.trim().toLowerCase(); const role = request.body?.role ?? "viewer";
+  if (!email || !/^\S+@\S+\.\S+$/.test(email) || !["owner","admin","member","viewer"].includes(role)) return reply.code(400).send({ error: "INVALID_INVITATION" });
+  const token = randomBytes(32).toString("hex"); const id = randomUUID(); const now = new Date(); const expires = new Date(now.getTime() + 7 * 86400000).toISOString();
+  db.prepare("INSERT INTO workspace_invitations (id,workspace_id,email,role,token_hash,expires_at,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)").run(id,request.params.workspaceId,email,role,createHash("sha256").update(token).digest("hex"),expires,request.user!.id,now.toISOString());
+  return reply.code(201).send({ id, workspaceId: request.params.workspaceId, email, role, expiresAt: expires, token });
+});
+app.post<{ Body: { token?: string } }>("/api/v1/invitations/accept", { preHandler: requireUser }, async (request: any, reply) => {
+  const token = request.body?.token?.trim(); if (!token) return reply.code(400).send({ error: "TOKEN_REQUIRED" });
+  const invitation = db.prepare("SELECT * FROM workspace_invitations WHERE token_hash=? AND accepted_at IS NULL").get(createHash("sha256").update(token).digest("hex")) as any;
+  if (!invitation || new Date(invitation.expires_at).getTime() <= Date.now()) return reply.code(400).send({ error: "INVITATION_INVALID_OR_EXPIRED" });
+  if (invitation.email !== request.user!.email.toLowerCase()) return reply.code(403).send({ error: "INVITATION_EMAIL_MISMATCH" });
+  const apply = db.transaction(() => { db.prepare("INSERT INTO memberships (workspace_id,user_id,role,created_at) VALUES (?,?,?,?) ON CONFLICT(workspace_id,user_id) DO UPDATE SET role=excluded.role").run(invitation.workspace_id,request.user!.id,invitation.role,new Date().toISOString()); db.prepare("UPDATE workspace_invitations SET accepted_at=? WHERE id=?").run(new Date().toISOString(),invitation.id); }); apply();
+  return { accepted: true, workspaceId: invitation.workspace_id, role: invitation.role };
+});
+
 app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/workflows", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
