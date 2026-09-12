@@ -4,11 +4,11 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { config } from "./config.js";
 import { db } from "./db.js";
-import { UnconfiguredEngine } from "./engine-adapter.js";
+import { UnconfiguredEngine, type AgentEngine } from "./engine-adapter.js";
 import { clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
 
 const app = Fastify({ logger: true, trustProxy: false });
-const engine = new UnconfiguredEngine();
+const engine: AgentEngine = new UnconfiguredEngine();
 await app.register(cookie);
 
 app.get("/health", async () => ({ status: "ok", service: "coder-api", time: new Date().toISOString() }));
@@ -76,6 +76,46 @@ app.post<{ Params: { workspaceId: string }; Body: { name?: string; slug?: string
     if (String(error).includes("UNIQUE")) return reply.code(409).send({ error: "PROJECT_SLUG_EXISTS" });
     throw error;
   }
+});
+
+async function executeRun(runId: string, projectId: string, prompt: string) {
+  const startedAt = new Date().toISOString();
+  db.prepare("UPDATE runs SET status='running', started_at=? WHERE id=?").run(startedAt, runId);
+  let text = "";
+  try {
+    for await (const event of engine.run({ runId, sessionId: runId, prompt })) {
+      if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+      if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
+    }
+    db.prepare("UPDATE runs SET status='completed', result=?, finished_at=? WHERE id=?").run(text || null, new Date().toISOString(), runId);
+  } catch (error) {
+    db.prepare("UPDATE runs SET status='failed', error_code=?, finished_at=? WHERE id=?").run(error instanceof Error ? error.message : "RUN_FAILED", new Date().toISOString(), runId);
+  }
+}
+
+app.post<{ Params: { projectId: string }; Body: { prompt?: string } }>("/api/v1/projects/:projectId/runs", { preHandler: requireUser }, async (request: any, reply) => {
+  const prompt = request.body?.prompt?.trim();
+  if (!prompt || prompt.length > 100_000) return reply.code(400).send({ error: "INVALID_PROMPT" });
+  const project = db.prepare("SELECT p.id, p.workspace_id AS workspaceId FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id) as { id: string; workspaceId: string } | undefined;
+  if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const id = randomUUID(); const createdAt = new Date().toISOString();
+  db.prepare("INSERT INTO runs (id,project_id,status,prompt,created_at) VALUES (?,?,?,?,?)").run(id, project.id, "queued", prompt, createdAt);
+  void executeRun(id, project.id, prompt);
+  return reply.code(202).send({ id, projectId: project.id, status: "queued", prompt, createdAt });
+});
+
+app.get<{ Params: { runId: string } }>("/api/v1/runs/:runId", { preHandler: requireUser }, async (request: any, reply) => {
+  const run = db.prepare("SELECT r.id, r.project_id AS projectId, r.status, r.prompt, r.result, r.error_code AS errorCode, r.started_at AS startedAt, r.finished_at AS finishedAt, r.created_at AS createdAt FROM runs r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE r.id=? AND m.user_id=?").get(request.params.runId, request.user!.id);
+  if (!run) return reply.code(404).send({ error: "RUN_NOT_FOUND" });
+  return run;
+});
+
+app.post<{ Params: { runId: string } }>("/api/v1/runs/:runId/cancel", { preHandler: requireUser }, async (request: any, reply) => {
+  const run = db.prepare("SELECT r.id FROM runs r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE r.id=? AND m.user_id=?").get(request.params.runId, request.user!.id);
+  if (!run) return reply.code(404).send({ error: "RUN_NOT_FOUND" });
+  await engine.cancel(request.params.runId);
+  db.prepare("UPDATE runs SET status='cancelled', finished_at=? WHERE id=? AND status IN ('queued','running')").run(new Date().toISOString(), request.params.runId);
+  return { ok: true };
 });
 
 app.setErrorHandler((error, _request, reply) => { app.log.error(error); return reply.code(500).send({ error: "INTERNAL_ERROR" }); });

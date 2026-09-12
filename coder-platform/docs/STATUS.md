@@ -12,8 +12,9 @@
 
 ## Belum selesai
 - RBAC per route, CSRF strategy, rate limiting, MFA.
+- Project run lifecycle (`queued`, `running`, `completed`, `failed`, `cancelled`) dan cancel endpoint.
 - Prime Agent RPC adapter nyata.
 - Frontend baru dipindahkan ke apps/web.
-- Queue/run orchestration.
+- Queue/run orchestration (lifecycle dasar sudah ada; worker persisten belum).
 - Knowledge, artifacts, workflow, billing.
 - Dockerfile dan deployment VPS.
