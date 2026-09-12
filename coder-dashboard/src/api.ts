@@ -8,10 +8,10 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return data as T;
 }
 export const api = {
-  me: () => request<{ authed: boolean; user: User | null }>('/me'),
-  login: (username: string, password: string) => request<{ user: User }>('/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
-  register: (username: string, password: string, name: string) => request<{ user: User }>('/register', { method: 'POST', body: JSON.stringify({ username, password, name }) }),
-  logout: () => request('/logout', { method: 'POST' }),
+  me: () => request<{ user: User }>('/v1/auth/me'),
+  login: (username: string, password: string) => request<{ user: User }>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: username, password }) }),
+  register: (username: string, password: string, name: string) => request<{ user: User }>('/v1/auth/register', { method: 'POST', body: JSON.stringify({ email: username, password, displayName: name }) }),
+  logout: () => request('/v1/auth/logout', { method: 'POST' }),
   sessions: () => request<{ sessions: Session[] }>('/sessions'),
   createSession: (name = 'Percakapan baru') => request<{ session: Session }>('/sessions', { method: 'POST', body: JSON.stringify({ name }) }),
   messages: (id: string) => request<{ messages: Message[] }>(`/sessions/${encodeURIComponent(id)}/messages`, { method: 'POST' }),
