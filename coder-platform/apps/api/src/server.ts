@@ -1,9 +1,9 @@
 import Fastify from "fastify";
 import cookie from "@fastify/cookie";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { extname, join, normalize } from "node:path";
 import { mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
 import { db } from "./db.js";
 import { MockEngine, UnconfiguredEngine, type AgentEngine } from "./engine-adapter.js";
@@ -11,6 +11,13 @@ import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, ge
 
 const app = Fastify({ logger: true, trustProxy: false });
 const engine: AgentEngine = config.MOCK_ENGINE ? new MockEngine() : new UnconfiguredEngine();
+type Subscriber = (event: { type: string; data: unknown }) => void;
+const subscribers = new Map<string, Set<Subscriber>>();
+function publishRunEvent(runId: string, type: string, data: unknown) {
+  db.prepare("INSERT INTO run_events (run_id,type,data_json,created_at) VALUES (?,?,?,?)").run(runId, type, JSON.stringify(data), new Date().toISOString());
+  for (const send of subscribers.get(runId) ?? []) send({ type, data });
+}
+function subscribeRun(runId: string, send: Subscriber) { const set = subscribers.get(runId) ?? new Set<Subscriber>(); set.add(send); subscribers.set(runId, set); return () => { set.delete(send); if (!set.size) subscribers.delete(runId); }; }
 await app.register(cookie);
 
 app.get("/health", async () => ({ status: "ok", service: "coder-api", time: new Date().toISOString() }));
@@ -105,13 +112,17 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
   let text = "";
   try {
     for await (const event of engine.run({ runId, sessionId: runId, prompt })) {
+      if (event.type !== "completed") publishRunEvent(runId, event.type, event.data);
       if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
       if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
     }
     db.prepare("UPDATE runs SET status='completed', result=?, finished_at=? WHERE id=?").run(text || null, new Date().toISOString(), runId);
+    publishRunEvent(runId, "completed", { result: text });
     if (conversationId) db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(randomUUID(),conversationId,"assistant",text || "",runId,new Date().toISOString());
   } catch (error) {
-    db.prepare("UPDATE runs SET status='failed', error_code=?, finished_at=? WHERE id=?").run(error instanceof Error ? error.message : "RUN_FAILED", new Date().toISOString(), runId);
+    const message = error instanceof Error ? error.message : "RUN_FAILED";
+    db.prepare("UPDATE runs SET status='failed', error_code=?, finished_at=? WHERE id=?").run(message, new Date().toISOString(), runId);
+    publishRunEvent(runId, "failed", { message });
   }
 }
 
@@ -141,6 +152,20 @@ app.post<{ Params: { projectId: string }; Body: { prompt?: string } }>("/api/v1/
   return reply.code(202).send({ id, projectId: project.id, status: "queued", prompt, createdAt });
 });
 
+app.get<{ Params: { runId: string } }>("/api/v1/runs/:runId/events", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT r.id FROM runs r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE r.id=? AND m.user_id=?").get(request.params.runId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "RUN_NOT_FOUND" });
+  reply.hijack(); const response = reply.raw; response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+  const write = (event: { type: string; data: unknown }) => response.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+  const history = db.prepare("SELECT type,data_json AS data FROM run_events WHERE run_id=? ORDER BY id ASC").all(request.params.runId) as { type: string; data: string }[];
+  for (const event of history) write({ type: event.type, data: JSON.parse(event.data) });
+  const done = history.some((event) => ["completed", "failed"].includes(event.type));
+  if (done) { response.end(); return; }
+  const unsubscribe = subscribeRun(request.params.runId, write); const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
+  const close = () => { clearInterval(heartbeat); unsubscribe(); };
+  request.raw.on("close", close);
+});
+
 app.get<{ Params: { runId: string } }>("/api/v1/runs/:runId", { preHandler: requireUser }, async (request: any, reply) => {
   const run = db.prepare("SELECT r.id, r.project_id AS projectId, r.status, r.prompt, r.result, r.error_code AS errorCode, r.started_at AS startedAt, r.finished_at AS finishedAt, r.created_at AS createdAt FROM runs r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE r.id=? AND m.user_id=?").get(request.params.runId, request.user!.id);
   if (!run) return reply.code(404).send({ error: "RUN_NOT_FOUND" });
@@ -153,6 +178,24 @@ app.post<{ Params: { runId: string } }>("/api/v1/runs/:runId/cancel", { preHandl
   await engine.cancel(request.params.runId);
   db.prepare("UPDATE runs SET status='cancelled', finished_at=? WHERE id=? AND status IN ('queued','running')").run(new Date().toISOString(), request.params.runId);
   return { ok: true };
+});
+
+app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/artifacts", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  return db.prepare("SELECT id, project_id AS projectId, run_id AS runId, name, mime_type AS mimeType, size_bytes AS sizeBytes, sha256, created_at AS createdAt FROM artifacts WHERE project_id=? ORDER BY created_at DESC").all(request.params.projectId);
+});
+app.post<{ Params: { projectId: string }; Body: { name?: string; mimeType?: string; contentBase64?: string; runId?: string } }>("/api/v1/projects/:projectId/artifacts", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const name = request.body?.name?.trim(); const mimeType = request.body?.mimeType?.trim(); const encoded = request.body?.contentBase64;
+  if (!name || !mimeType || !encoded || encoded.length > 14_000_000 || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || name.includes("/") || name.includes("\\")) return reply.code(400).send({ error: "INVALID_ARTIFACT" });
+  let content: Buffer; try { content = Buffer.from(encoded, "base64"); } catch { return reply.code(400).send({ error: "INVALID_ARTIFACT_ENCODING" }); }
+  if (content.length > 10 * 1024 * 1024) return reply.code(413).send({ error: "ARTIFACT_TOO_LARGE" });
+  const id = randomUUID(); const dir = join(config.DATA_DIR, "artifacts", request.params.projectId); await mkdir(dir, { recursive: true }); const storagePath = join(dir, id); await writeFile(storagePath, content, { flag: "wx" });
+  const sha256 = createHash("sha256").update(content).digest("hex"); const now = new Date().toISOString();
+  db.prepare("INSERT INTO artifacts (id,project_id,run_id,name,mime_type,size_bytes,sha256,storage_path,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(id,request.params.projectId,request.body.runId ?? null,name,mimeType,content.length,sha256,storagePath,now);
+  return reply.code(201).send({ id, projectId: request.params.projectId, runId: request.body.runId ?? null, name, mimeType, sizeBytes: content.length, sha256, createdAt: now });
 });
 
 app.setErrorHandler((error, _request, reply) => { app.log.error(error); return reply.code(500).send({ error: "INTERNAL_ERROR" }); });
