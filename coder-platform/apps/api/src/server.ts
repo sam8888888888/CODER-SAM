@@ -6,12 +6,11 @@ import { mkdirSync } from "node:fs";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
 import { db } from "./db.js";
-import { MockEngine, UnconfiguredEngine, type AgentEngine } from "./engine-adapter.js";
-import { PrimeRpcEngine } from "./prime-rpc-engine.js";
+import { engine } from "./engine.js";
+import { createExecution, recordAudit, runExecution, scheduleNextRun } from "./workflow-engine.js";
 import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
 
 const app = Fastify({ logger: true, trustProxy: false });
-const engine: AgentEngine = config.MOCK_ENGINE ? new MockEngine() : config.PRIME_AGENT_BIN ? new PrimeRpcEngine({ binary: config.PRIME_AGENT_BIN, rootDir: config.ENGINE_ROOT_DIR }) : new UnconfiguredEngine();
 type Subscriber = (event: { type: string; data: unknown }) => void;
 const subscribers = new Map<string, Set<Subscriber>>();
 function publishRunEvent(runId: string, type: string, data: unknown) {
@@ -20,7 +19,51 @@ function publishRunEvent(runId: string, type: string, data: unknown) {
 }
 function subscribeRun(runId: string, send: Subscriber) { const set = subscribers.get(runId) ?? new Set<Subscriber>(); set.add(send); subscribers.set(runId, set); return () => { set.delete(send); if (!set.size) subscribers.delete(runId); }; }
 function membershipRole(workspaceId: string, userId: string) { return (db.prepare("SELECT role FROM memberships WHERE workspace_id=? AND user_id=?").get(workspaceId,userId) as { role: string } | undefined)?.role; }
+function workflowAccess(workflowId: string, userId: string) {
+  const row = db.prepare("SELECT w.id, w.project_id AS projectId, w.name, w.description, w.status, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(workflowId) as any;
+  if (!row) return null;
+  const role = membershipRole(row.workspaceId, userId);
+  return role ? { ...row, role } : null;
+}
+
+/** Runs one workflow prompt step through the configured agent engine. */
+async function runWorkflowPrompt(prompt: string) {
+  const runId = randomUUID();
+  let text = "";
+  for await (const event of engine.run({ runId, sessionId: runId, prompt })) {
+    if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+    if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
+  }
+  return text;
+}
+
+function startWorkflowExecution(executionId: string) {
+  setImmediate(() => { void runExecution(executionId, runWorkflowPrompt).catch((error) => app.log.error(error)); });
+}
+
+/** Interval scheduler: starts due workflow executions once per minute. */
+function startWorkflowScheduler() {
+  const timer = setInterval(() => {
+    try {
+      const due = db.prepare("SELECT id, schedule_interval_minutes AS intervalMinutes FROM workflows WHERE schedule_enabled=1 AND status='published' AND next_run_at IS NOT NULL AND next_run_at <= ?").all(new Date().toISOString()) as any[];
+      for (const workflow of due) {
+        const executionId = createExecution(workflow.id, "scheduled run", null);
+        scheduleNextRun(workflow.id, workflow.intervalMinutes ?? null);
+        if (executionId) startWorkflowExecution(executionId);
+      }
+    } catch (error) { app.log.error(error); }
+  }, 60_000);
+  timer.unref?.();
+}
+
 await app.register(cookie);
+
+// Empty bodies are valid for action endpoints (publish/cancel/retry); malformed JSON stays a 400.
+app.addContentTypeParser("application/json", { parseAs: "string" }, (_request, body, done) => {
+  const text = typeof body === "string" ? body.trim() : "";
+  if (!text) return done(null, {});
+  try { done(null, JSON.parse(text)); } catch { const error = new Error("INVALID_JSON") as Error & { statusCode?: number }; error.statusCode = 400; done(error); }
+});
 
 app.get("/health", async () => ({ status: "ok", service: "coder-api", time: new Date().toISOString() }));
 app.get("/ready", async (_request, reply) => {
@@ -210,7 +253,7 @@ app.post<{ Body: { token?: string } }>("/api/v1/invitations/accept", { preHandle
 app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/workflows", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
-  return db.prepare("SELECT id, project_id AS projectId, name, description, steps_json AS stepsJson, status, created_at AS createdAt, updated_at AS updatedAt FROM workflows WHERE project_id=? ORDER BY updated_at DESC").all(request.params.projectId).map((w: any) => ({ ...w, steps: JSON.parse(w.stepsJson), stepsJson: undefined }));
+  return db.prepare("SELECT id, project_id AS projectId, name, description, steps_json AS stepsJson, status, schedule_enabled AS scheduleEnabled, schedule_interval_minutes AS intervalMinutes, next_run_at AS nextRunAt, last_run_at AS lastRunAt, created_at AS createdAt, updated_at AS updatedAt FROM workflows WHERE project_id=? ORDER BY updated_at DESC").all(request.params.projectId).map((w: any) => ({ ...w, steps: JSON.parse(w.stepsJson), stepsJson: undefined, scheduleEnabled: Boolean(w.scheduleEnabled) }));
 });
 app.post<{ Params: { projectId: string }; Body: { name?: string; description?: string; steps?: unknown[] } }>("/api/v1/projects/:projectId/workflows", { preHandler: requireUser }, async (request: any, reply) => {
   const project = db.prepare("SELECT workspace_id AS workspaceId FROM projects WHERE id=?").get(request.params.projectId) as { workspaceId: string } | undefined;
@@ -226,26 +269,105 @@ app.post<{ Params: { projectId: string }; Body: { name?: string; description?: s
 app.post<{ Params: { executionId: string }; Body: { decision?: string } }>("/api/v1/workflow-executions/:executionId/approval", { preHandler: requireUser }, async (request: any, reply) => {
   const execution = db.prepare("SELECT e.*, p.workspace_id AS workspaceId FROM workflow_executions e JOIN projects p ON p.id=e.project_id WHERE e.id=?").get(request.params.executionId) as any;
   if (!execution || !membershipRole(execution.workspaceId, request.user!.id)) return reply.code(404).send({ error: "EXECUTION_NOT_FOUND" });
-  if (execution.approval_status !== "pending") return reply.code(409).send({ error: "APPROVAL_NOT_PENDING" });
+  if (execution.approval_status !== "pending" || execution.status !== "awaiting_approval") return reply.code(409).send({ error: "APPROVAL_NOT_PENDING" });
   const decision = request.body?.decision; if (decision !== "approved" && decision !== "rejected") return reply.code(400).send({ error: "INVALID_DECISION" });
-  const now = new Date().toISOString(); const status = decision === "approved" ? "completed" : "failed"; const output = decision === "approved" ? JSON.stringify({ input: execution.input, approved: true }) : "";
-  db.prepare("UPDATE workflow_executions SET status=?, approval_status=?, approved_by=?, output=?, error=?, finished_at=? WHERE id=?").run(status,decision,request.user!.id,output,decision === "rejected" ? "Approval rejected" : null,now,execution.id);
-  return { id: execution.id, status, approvalStatus: decision };
+  const now = new Date().toISOString();
+  db.prepare("UPDATE workflow_executions SET approval_status=?, approved_by=? WHERE id=?").run(decision, request.user!.id, execution.id);
+  db.prepare("UPDATE workflow_execution_steps SET status=?, finished_at=? WHERE execution_id=? AND step_index=?").run(decision === "approved" ? "completed" : "rejected", now, execution.id, execution.current_step);
+  recordAudit(execution.workspaceId, request.user!.id, `workflow.execution.approval.${decision}`, { executionId: execution.id });
+  if (decision === "rejected") {
+    db.prepare("UPDATE workflow_executions SET status='failed', error='Approval rejected', finished_at=? WHERE id=?").run(now, execution.id);
+    return { id: execution.id, status: "failed", approvalStatus: decision };
+  }
+  db.prepare("UPDATE workflow_executions SET status='running', current_step=?, cancel_requested=0 WHERE id=?").run((execution.current_step ?? 0) + 1, execution.id);
+  startWorkflowExecution(execution.id);
+  return { id: execution.id, status: "running", approvalStatus: decision };
+});
+
+app.get<{ Params: { executionId: string } }>("/api/v1/workflow-executions/:executionId", { preHandler: requireUser }, async (request: any, reply) => {
+  const execution = db.prepare("SELECT e.*, p.workspace_id AS workspaceId FROM workflow_executions e JOIN projects p ON p.id=e.project_id WHERE e.id=?").get(request.params.executionId) as any;
+  if (!execution || !membershipRole(execution.workspaceId, request.user!.id)) return reply.code(404).send({ error: "EXECUTION_NOT_FOUND" });
+  const steps = db.prepare("SELECT id, step_index AS stepIndex, step_id AS stepId, type, status, input, output, error, started_at AS startedAt, finished_at AS finishedAt FROM workflow_execution_steps WHERE execution_id=? ORDER BY step_index ASC").all(request.params.executionId);
+  return {
+    id: execution.id, workflowId: execution.workflow_id, projectId: execution.project_id, status: execution.status,
+    approvalStatus: execution.approval_status, attempt: execution.attempt, currentStep: execution.current_step,
+    input: execution.input, output: execution.output, error: execution.error, createdAt: execution.created_at, steps,
+  };
+});
+
+app.post<{ Params: { executionId: string } }>("/api/v1/workflow-executions/:executionId/cancel", { preHandler: requireUser }, async (request: any, reply) => {
+  const execution = db.prepare("SELECT e.*, p.workspace_id AS workspaceId FROM workflow_executions e JOIN projects p ON p.id=e.project_id WHERE e.id=?").get(request.params.executionId) as any;
+  if (!execution || !membershipRole(execution.workspaceId, request.user!.id)) return reply.code(404).send({ error: "EXECUTION_NOT_FOUND" });
+  if (["completed", "failed", "cancelled"].includes(execution.status)) return reply.code(409).send({ error: "EXECUTION_ALREADY_FINISHED" });
+  const now = new Date().toISOString();
+  db.prepare("UPDATE workflow_executions SET cancel_requested=1, status='cancelled', approval_status=CASE WHEN approval_status='pending' THEN 'cancelled' ELSE approval_status END, finished_at=? WHERE id=?").run(now, execution.id);
+  recordAudit(execution.workspaceId, request.user!.id, "workflow.execution.cancel_requested", { executionId: execution.id });
+  return { id: execution.id, status: "cancelled" };
+});
+
+app.post<{ Params: { executionId: string } }>("/api/v1/workflow-executions/:executionId/retry", { preHandler: requireUser }, async (request: any, reply) => {
+  const execution = db.prepare("SELECT e.*, p.workspace_id AS workspaceId FROM workflow_executions e JOIN projects p ON p.id=e.project_id WHERE e.id=?").get(request.params.executionId) as any;
+  if (!execution || !membershipRole(execution.workspaceId, request.user!.id)) return reply.code(404).send({ error: "EXECUTION_NOT_FOUND" });
+  if (execution.status === "running" || execution.status === "awaiting_approval") return reply.code(409).send({ error: "EXECUTION_STILL_ACTIVE" });
+  const attempt = Number(execution.attempt ?? 1) + 1;
+  const id = createExecution(execution.workflow_id, execution.input, request.user!.id);
+  if (!id) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  db.prepare("UPDATE workflow_executions SET attempt=? WHERE id=?").run(attempt, id);
+  recordAudit(execution.workspaceId, request.user!.id, "workflow.execution.retried", { previousExecutionId: execution.id, executionId: id, attempt });
+  startWorkflowExecution(id);
+  return reply.code(202).send({ id, workflowId: execution.workflow_id, attempt, status: "queued" });
 });
 
 app.get<{ Params: { workflowId: string } }>("/api/v1/workflows/:workflowId/executions", { preHandler: requireUser }, async (request: any, reply) => {
-  const row = db.prepare("SELECT w.project_id AS projectId, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(request.params.workflowId) as any;
-  if (!row || !membershipRole(row.workspaceId, request.user!.id)) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  return db.prepare("SELECT id, workflow_id AS workflowId, project_id AS projectId, status, approval_status AS approvalStatus, input, output, error, started_at AS startedAt, finished_at AS finishedAt, created_at AS createdAt FROM workflow_executions WHERE workflow_id=? ORDER BY created_at DESC").all(request.params.workflowId);
+  const access = workflowAccess(request.params.workflowId, request.user!.id);
+  if (!access) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  return db.prepare("SELECT id, workflow_id AS workflowId, project_id AS projectId, status, approval_status AS approvalStatus, attempt, current_step AS currentStep, input, output, error, started_at AS startedAt, finished_at AS finishedAt, created_at AS createdAt FROM workflow_executions WHERE workflow_id=? ORDER BY created_at DESC LIMIT 100").all(request.params.workflowId);
 });
+
 app.post<{ Params: { workflowId: string }; Body: { input?: string } }>("/api/v1/workflows/:workflowId/execute", { preHandler: requireUser }, async (request: any, reply) => {
-  const row = db.prepare("SELECT w.id, w.project_id AS projectId, w.steps_json AS stepsJson, w.status, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(request.params.workflowId) as any;
-  if (!row || !membershipRole(row.workspaceId, request.user!.id)) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  if (row.status !== "published") return reply.code(409).send({ error: "WORKFLOW_NOT_PUBLISHED" });
-  const id = randomUUID(); const now = new Date().toISOString(); const input = String(request.body?.input ?? "");
-  db.prepare("INSERT INTO workflow_executions (id,workflow_id,project_id,status,input,created_at) VALUES (?,?,?,?,?,?)").run(id,row.id,row.projectId,"queued",input,now);
-  setImmediate(() => { const started = new Date().toISOString(); try { const steps = JSON.parse(row.stepsJson); const approval = steps.find((step: any) => step?.type === "approval"); if (approval) { db.prepare("UPDATE workflow_executions SET status='queued', approval_status='pending', started_at=? WHERE id=?").run(started,id); return; } const output = JSON.stringify({ input, steps, completedSteps: steps.length }); db.prepare("UPDATE workflow_executions SET status='completed', output=?, started_at=?, finished_at=? WHERE id=?").run(output,started,new Date().toISOString(),id); } catch (error) { db.prepare("UPDATE workflow_executions SET status='failed', error=?, started_at=?, finished_at=? WHERE id=?").run(String(error),started,new Date().toISOString(),id); } });
-  return reply.code(202).send({ id, workflowId: row.id, projectId: row.projectId, status: "queued", createdAt: now });
+  const access = workflowAccess(request.params.workflowId, request.user!.id);
+  if (!access) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  if (access.role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  if (access.status !== "published") return reply.code(409).send({ error: "WORKFLOW_NOT_PUBLISHED" });
+  const input = String(request.body?.input ?? "");
+  const id = createExecution(access.id, input, request.user!.id);
+  if (!id) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  startWorkflowExecution(id);
+  return reply.code(202).send({ id, workflowId: access.id, projectId: access.projectId, status: "queued", createdAt: new Date().toISOString() });
+});
+
+app.put<{ Params: { workflowId: string }; Body: { name?: string; description?: string; steps?: unknown[] } }>("/api/v1/workflows/:workflowId", { preHandler: requireUser }, async (request: any, reply) => {
+  const access = workflowAccess(request.params.workflowId, request.user!.id);
+  if (!access) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  if (access.role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const steps = request.body?.steps;
+  if (steps !== undefined && (!Array.isArray(steps) || steps.length > 50 || steps.some((step) => !step || typeof step !== "object"))) return reply.code(400).send({ error: "INVALID_WORKFLOW" });
+  const name = request.body?.name?.trim() || access.name;
+  const description = request.body?.description?.trim() ?? access.description ?? "";
+  const now = new Date().toISOString();
+  db.prepare("UPDATE workflows SET name=?, description=?, steps_json=COALESCE(?,steps_json), updated_at=? WHERE id=?").run(name, description, steps ? JSON.stringify(steps) : null, now, access.id);
+  return { id: access.id, name, description, steps, updatedAt: now };
+});
+
+app.post<{ Params: { workflowId: string }; Body: { intervalMinutes?: number; enabled?: boolean } }>("/api/v1/workflows/:workflowId/schedule", { preHandler: requireUser }, async (request: any, reply) => {
+  const access = workflowAccess(request.params.workflowId, request.user!.id);
+  if (!access) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  if (access.role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const interval = request.body?.intervalMinutes === null || request.body?.intervalMinutes === undefined ? null : Number(request.body.intervalMinutes);
+  const enabled = Boolean(request.body?.enabled);
+  if (enabled && (!interval || Number.isNaN(interval) || interval < 1 || interval > 20_160)) return reply.code(400).send({ error: "INVALID_SCHEDULE" });
+  const now = new Date();
+  const next = enabled && interval ? new Date(now.getTime() + interval * 60_000).toISOString() : null;
+  db.prepare("UPDATE workflows SET schedule_enabled=?, schedule_interval_minutes=?, next_run_at=?, updated_at=? WHERE id=?").run(enabled ? 1 : 0, interval, next, now.toISOString(), access.id);
+  recordAudit(access.workspaceId, request.user!.id, "workflow.schedule.updated", { workflowId: access.id, enabled, intervalMinutes: interval });
+  return { id: access.id, scheduleEnabled: enabled, intervalMinutes: interval, nextRunAt: next };
+});
+
+app.get<{ Params: { workspaceId: string }; Querystring: { limit?: string } }>("/api/v1/workspaces/:workspaceId/audit", { preHandler: requireUser }, async (request: any, reply) => {
+  const role = membershipRole(request.params.workspaceId, request.user!.id);
+  if (!role) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  const limit = Math.min(Math.max(Number(request.query?.limit ?? 100), 1), 500);
+  return db.prepare("SELECT id, action, actor_user_id AS actorUserId, metadata_json AS metadata, created_at AS createdAt FROM audit_events WHERE workspace_id=? ORDER BY created_at DESC LIMIT ?").all(request.params.workspaceId, limit).map((row: any) => ({ ...row, metadata: JSON.parse(row.metadata) }));
 });
 
 app.post<{ Params: { workflowId: string } }>("/api/v1/workflows/:workflowId/publish", { preHandler: requireUser }, async (request: any, reply) => {
@@ -320,6 +442,7 @@ app.setNotFoundHandler(async (request, reply) => {
 });
 
 mkdirSync(config.DATA_DIR, { recursive: true });
+startWorkflowScheduler();
 await app.listen({ host: config.HOST, port: config.PORT });
 
 const stop = async () => { await app.close(); db.close(); process.exit(0); };

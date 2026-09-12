@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS run_events (
 CREATE TABLE IF NOT EXISTS workflow_executions (
  id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','cancelled')), input TEXT NOT NULL DEFAULT '', output TEXT NOT NULL DEFAULT '', error TEXT, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS workflow_execution_steps (
+ id TEXT PRIMARY KEY, execution_id TEXT NOT NULL REFERENCES workflow_executions(id) ON DELETE CASCADE,
+ step_index INTEGER NOT NULL, step_id TEXT, type TEXT NOT NULL, status TEXT NOT NULL,
+ input TEXT NOT NULL DEFAULT '', output TEXT NOT NULL DEFAULT '', error TEXT,
+ started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wf_steps_execution ON workflow_execution_steps(execution_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_workflow_executions_workflow ON workflow_executions(workflow_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS workspace_invitations (
  id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, email TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('owner','admin','member','viewer')), token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, accepted_at TEXT, created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
@@ -84,5 +91,53 @@ CREATE INDEX IF NOT EXISTS idx_audit_workspace_created ON audit_events(workspace
 // Additive migration for workflow human approval without touching existing data.
 try { db.exec("ALTER TABLE workflow_executions ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'not_required'"); } catch {}
 try { db.exec("ALTER TABLE workflow_executions ADD COLUMN approved_by TEXT"); } catch {}
+// Additive migration for the workflow engine (step runner, cancel, retry, schedule).
+for (const statement of [
+  "ALTER TABLE workflow_executions ADD COLUMN current_step INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE workflow_executions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE workflow_executions ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'",
+  "ALTER TABLE workflow_executions ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE workflows ADD COLUMN schedule_enabled INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE workflows ADD COLUMN schedule_interval_minutes INTEGER",
+  "ALTER TABLE workflows ADD COLUMN next_run_at TEXT",
+  "ALTER TABLE workflows ADD COLUMN last_run_at TEXT",
+]) { try { db.exec(statement); } catch { /* column already exists */ } }
+
+/**
+ * Rebuilds workflow_executions so the status CHECK also allows awaiting_approval and scheduled.
+ * SQLite cannot change a CHECK constraint in place. Existing rows are copied, then verified.
+ */
+function migrateExecutionStatuses() {
+  const table = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_executions'").get() as { sql: string } | undefined;
+  if (!table || table.sql.includes("awaiting_approval")) return;
+  const before = (db.prepare("SELECT COUNT(*) AS total FROM workflow_executions").get() as { total: number }).total;
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.exec(`
+BEGIN;
+CREATE TABLE workflow_executions_new (
+ id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+ project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+ status TEXT NOT NULL CHECK(status IN ('queued','running','awaiting_approval','scheduled','completed','failed','cancelled')),
+ input TEXT NOT NULL DEFAULT '', output TEXT NOT NULL DEFAULT '', error TEXT,
+ started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL,
+ approval_status TEXT NOT NULL DEFAULT 'not_required', approved_by TEXT,
+ current_step INTEGER NOT NULL DEFAULT 0, cancel_requested INTEGER NOT NULL DEFAULT 0,
+ context_json TEXT NOT NULL DEFAULT '{}', attempt INTEGER NOT NULL DEFAULT 1
+);
+INSERT INTO workflow_executions_new (id,workflow_id,project_id,status,input,output,error,started_at,finished_at,created_at,approval_status,approved_by,current_step,cancel_requested,context_json,attempt)
+ SELECT id,workflow_id,project_id,status,input,output,error,started_at,finished_at,created_at,approval_status,approved_by,current_step,cancel_requested,context_json,attempt FROM workflow_executions;
+DROP TABLE workflow_executions;
+ALTER TABLE workflow_executions_new RENAME TO workflow_executions;
+CREATE INDEX IF NOT EXISTS idx_workflow_executions_workflow ON workflow_executions(workflow_id, created_at DESC);
+COMMIT;
+`);
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
+  const after = (db.prepare("SELECT COUNT(*) AS total FROM workflow_executions").get() as { total: number }).total;
+  if (after !== before) throw new Error(`WORKFLOW_EXECUTION_MIGRATION_LOST_ROWS:${before}->${after}`);
+}
+migrateExecutionStatuses();
 
 export function closeDatabase() { db.close(); }
