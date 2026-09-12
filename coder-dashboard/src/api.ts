@@ -63,5 +63,6 @@ export const api = {
   usage: (projectId: string, days = 30) => request<{ totals: { runs: number; inputTokens: number; outputTokens: number; costMicros: number; estimatedRuns: number }; byModel: { model: string; runs: number; inputTokens: number; outputTokens: number; costMicros: number }[]; daily: { day: string; runs: number; inputTokens: number; outputTokens: number }[] }>(`/v1/projects/${projectId}/usage?days=${days}`),
   auditEvents: (workspaceId: string) => request<AuditEvent[]>(`/v1/workspaces/${workspaceId}/audit`),
   decideApproval: (executionId: string, decision: 'approved'|'rejected') => request(`/v1/workflow-executions/${executionId}/approval`, { method: 'POST', body: JSON.stringify({ decision }) }),
-  sendMessage: (id: string, content: string) => request<{ message: Message; run: { id: string } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content }) }),
+  sendMessage: (id: string, content: string, model?: string) => request<{ message: Message; run: { id: string } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content, model }) }),
+  models: () => request<{ available: boolean; error?: string; default: { model: string | null; provider: string | null }; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[] }>('/v1/models'),
 };

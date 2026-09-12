@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import cookie from "@fastify/cookie";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { extname, join, normalize } from "node:path";
 import { mkdirSync } from "node:fs";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
@@ -166,6 +167,19 @@ function withKnowledge(prompt: string, knowledge?: KnowledgeContext) {
  * Stores token usage for a finished run. Usage reported by the engine is stored as-is;
  * when the engine reports nothing, the numbers are marked estimated = 1.
  */
+let modelCache: { at: number; names: string[] } = { at: 0, names: [] };
+/** Accepts a model only when the engine catalogue lists it; the catalogue is cached for five minutes. */
+function isKnownModel(model: string): boolean {
+  if (Date.now() - modelCache.at > 300_000) modelCache = { at: Date.now(), names: engineModelCatalogue().models.map((row) => row.model) };
+  if (!modelCache.names.length) return true;
+  return modelCache.names.includes(model);
+}
+
+function providerForModel(model: string): string | undefined {
+  const catalogue = engineModelCatalogue();
+  return catalogue.models.find((row) => row.model === model)?.provider ?? config.PRIME_AGENT_PROVIDER;
+}
+
 function recordRunUsage(runId: string, projectId: string, prompt: string, answer: string, usage: any) {
   const reported = usage && typeof usage === "object" ? usage : null;
   const hasTokens = typeof reported?.inputTokens === "number" || typeof reported?.outputTokens === "number";
@@ -177,7 +191,7 @@ function recordRunUsage(runId: string, projectId: string, prompt: string, answer
     .run(randomUUID(), runId, projectId, model, config.PRIME_AGENT_PROVIDER ?? null, inputTokens, outputTokens, costMicros, hasTokens ? 0 : 1, reported ? JSON.stringify(reported.raw ?? null).slice(0, 4000) : null, new Date().toISOString());
 }
 
-async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext) {
+async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext, model?: string) {
   const startedAt = new Date().toISOString();
   db.prepare("UPDATE runs SET status='running', started_at=? WHERE id=?").run(startedAt, runId);
   let text = "";
@@ -185,7 +199,7 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
     if (knowledge?.hits?.length) publishRunEvent(runId, "knowledge", { hits: knowledge.hits });
     // The conversation id is the engine session id, so follow-up questions keep the earlier turns.
     let usage: any = null;
-    for await (const event of engine.run({ runId, sessionId: conversationId ?? runId, prompt: withKnowledge(prompt, knowledge) })) {
+    for await (const event of engine.run({ runId, sessionId: conversationId ?? runId, prompt: withKnowledge(prompt, knowledge), model: model || config.PRIME_AGENT_MODEL, provider: model ? providerForModel(model) : config.PRIME_AGENT_PROVIDER })) {
       if (event.type !== "completed") publishRunEvent(runId, event.type, event.data);
       if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
       if (event.type === "completed") usage = (event.data as { usage?: unknown })?.usage ?? null;
@@ -202,32 +216,38 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
   }
 }
 
-app.post<{ Params: { conversationId: string }; Body: { content?: string } }>("/api/v1/conversations/:conversationId/messages", { preHandler: requireUser }, async (request: any, reply) => {
+app.post<{ Params: { conversationId: string }; Body: { content?: string; model?: string } }>("/api/v1/conversations/:conversationId/messages", { preHandler: requireUser }, async (request: any, reply) => {
   const content = request.body?.content?.trim();
+  const model = request.body?.model?.trim() || undefined;
   if (!content || content.length > 100_000) return reply.code(400).send({ error: "INVALID_MESSAGE" });
-  const conversation = db.prepare("SELECT c.id, c.project_id AS projectId FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; projectId: string } | undefined;
+  if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
+  const conversation = db.prepare("SELECT c.id, c.project_id AS projectId, m.role AS role FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; projectId: string; role: string } | undefined;
   if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  if (conversation.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
   const runId = randomUUID(); const messageId = randomUUID(); const now = new Date().toISOString();
   const retrieved = buildKnowledgeContext(conversation.projectId, content);
   const knowledge: KnowledgeContext | undefined = retrieved.hits.length ? { text: retrieved.text, hits: retrieved.hits.map((hit) => ({ documentId: hit.documentId, title: hit.title, chunkIndex: hit.chunkIndex })) } : undefined;
   const transaction = db.transaction(() => {
-    db.prepare("INSERT INTO runs (id,project_id,status,prompt,created_at) VALUES (?,?,?,?,?)").run(runId, conversation.projectId, "queued", content, now);
+    db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(runId, conversation.projectId, "queued", content, model ?? config.PRIME_AGENT_MODEL, now);
     db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(messageId, conversation.id, "user", content, runId, now);
     db.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversation.id);
   }); transaction();
-  void executeRun(runId, conversation.projectId, content, conversation.id, knowledge);
+  void executeRun(runId, conversation.projectId, content, conversation.id, knowledge, model);
   return reply.code(202).send({ message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now }, run: { id: runId, status: "queued" } });
 });
 
-app.post<{ Params: { projectId: string }; Body: { prompt?: string } }>("/api/v1/projects/:projectId/runs", { preHandler: requireUser }, async (request: any, reply) => {
+app.post<{ Params: { projectId: string }; Body: { prompt?: string; model?: string } }>("/api/v1/projects/:projectId/runs", { preHandler: requireUser }, async (request: any, reply) => {
   const prompt = request.body?.prompt?.trim();
+  const model = request.body?.model?.trim() || undefined;
   if (!prompt || prompt.length > 100_000) return reply.code(400).send({ error: "INVALID_PROMPT" });
-  const project = db.prepare("SELECT p.id, p.workspace_id AS workspaceId FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id) as { id: string; workspaceId: string } | undefined;
+  if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
+  const project = db.prepare("SELECT p.id, p.workspace_id AS workspaceId, m.role AS role FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id) as { id: string; workspaceId: string; role: string } | undefined;
   if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  if (project.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
   const id = randomUUID(); const createdAt = new Date().toISOString();
-  db.prepare("INSERT INTO runs (id,project_id,status,prompt,created_at) VALUES (?,?,?,?,?)").run(id, project.id, "queued", prompt, createdAt);
-  void executeRun(id, project.id, prompt);
-  return reply.code(202).send({ id, projectId: project.id, status: "queued", prompt, createdAt });
+  db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(id, project.id, "queued", prompt, model ?? config.PRIME_AGENT_MODEL, createdAt);
+  void executeRun(id, project.id, prompt, undefined, undefined, model);
+  return reply.code(202).send({ id, projectId: project.id, status: "queued", prompt, model: model ?? config.PRIME_AGENT_MODEL ?? null, createdAt });
 });
 
 app.get<{ Params: { runId: string } }>("/api/v1/runs/:runId/events", { preHandler: requireUser }, async (request: any, reply) => {
@@ -245,7 +265,7 @@ app.get<{ Params: { runId: string } }>("/api/v1/runs/:runId/events", { preHandle
 });
 
 app.get<{ Params: { runId: string } }>("/api/v1/runs/:runId", { preHandler: requireUser }, async (request: any, reply) => {
-  const run = db.prepare("SELECT r.id, r.project_id AS projectId, r.status, r.prompt, r.result, r.error_code AS errorCode, r.started_at AS startedAt, r.finished_at AS finishedAt, r.created_at AS createdAt FROM runs r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE r.id=? AND m.user_id=?").get(request.params.runId, request.user!.id);
+  const run = db.prepare("SELECT r.id, r.project_id AS projectId, r.status, r.prompt, r.result, r.model, r.error_code AS errorCode, r.started_at AS startedAt, r.finished_at AS finishedAt, r.created_at AS createdAt FROM runs r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE r.id=? AND m.user_id=?").get(request.params.runId, request.user!.id);
   if (!run) return reply.code(404).send({ error: "RUN_NOT_FOUND" });
   return run;
 });
@@ -606,6 +626,31 @@ app.get<{ Params: { projectId: string }; Querystring: { days?: string } }>("/api
   const byModel = db.prepare("SELECT COALESCE(model,'unknown') AS model, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cost_micros),0) AS costMicros FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY COALESCE(model,'unknown') ORDER BY runs DESC").all(request.params.projectId, since);
   const daily = db.prepare("SELECT substr(created_at,1,10) AS day, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day DESC LIMIT 60").all(request.params.projectId, since);
   return { days, since, totals, byModel, daily };
+});
+
+/** Runs the engine CLI once and returns its model catalogue. Never invents models. */
+function engineModelCatalogue(): { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string } {
+  try {
+    const binary = config.PRIME_AGENT_BIN ?? "prime-agent";
+    const result = spawnSync(binary, ["model", "list"], { encoding: "utf8", timeout: 20_000 });
+    if (result.error) return { available: false, models: [], error: String(result.error.message ?? result.error) };
+    // The engine CLI writes the table to stderr, so both streams are parsed.
+    const lines = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.split("\n").map((line) => line.trimEnd()).filter(Boolean);
+    const header = lines.findIndex((line) => /^provider\s+model\b/.test(line));
+    const body = (header >= 0 ? lines.slice(header + 1) : lines).filter((line) => !/^provider\s+model\b/.test(line));
+    const models = body.map((line) => line.trim()).filter(Boolean).map((line) => {
+      const parts = line.split(/\s{2,}/);
+      return { provider: parts[0] ?? "", model: parts[1] ?? "", context: parts[2] ?? "", maxOutput: parts[3] ?? "", thinking: parts[4] === "yes", images: parts[5] === "yes" };
+    }).filter((row) => row.model);
+    return { available: models.length > 0, models };
+  } catch (error) {
+    return { available: false, models: [], error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+app.get("/api/v1/models", { preHandler: requireUser }, async () => {
+  const catalogue = engineModelCatalogue();
+  return { ...catalogue, default: { model: config.PRIME_AGENT_MODEL ?? null, provider: config.PRIME_AGENT_PROVIDER ?? null } };
 });
 
 app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/artifacts", { preHandler: requireUser }, async (request: any, reply) => {

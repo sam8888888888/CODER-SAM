@@ -55,3 +55,8 @@
 .upload-button input{display:none}
 .composer-actions button.stop{background:#7f1d1d;color:#fee2e2;border-radius:999px;padding:6px 12px;font-size:11px}
 .stat{background:#111a2e;border:1px solid #24304d;border-radius:12px;padding:10px 14px;display:flex;flex-direction:column;gap:2px}.stat b{color:#e0f2fe;font-size:16px}
+
+/* Model picker in the composer: compact select that stays out of the way. */
+.model-picker { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line, #2a2f3a); border-radius: 10px; padding: 2px 6px; color: inherit; font-size: 12px; }
+.model-picker select { background: transparent; border: 0; color: inherit; font-size: 12px; max-width: 190px; outline: none; }
+.model-picker select option { color: #111; }

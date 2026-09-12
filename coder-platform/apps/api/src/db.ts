@@ -185,6 +185,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(content, chun
 try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN filename TEXT"); } catch {}
 try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN model TEXT"); } catch {}
 
 // Runs after the additive columns exist, because it copies them.
 migrateKnowledgeSourceTypes();
