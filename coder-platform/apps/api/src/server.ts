@@ -629,7 +629,7 @@ app.get<{ Params: { projectId: string }; Querystring: { days?: string } }>("/api
 });
 
 /** Runs the engine CLI once and returns its model catalogue. Never invents models. */
-function engineModelCatalogue(): { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string } {
+function engineModelCatalogue(): { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string; note?: string } {
   try {
     const binary = config.PRIME_AGENT_BIN ?? "prime-agent";
     const result = spawnSync(binary, ["model", "list"], { encoding: "utf8", timeout: 20_000 });
@@ -642,7 +642,9 @@ function engineModelCatalogue(): { available: boolean; models: { provider: strin
       const parts = line.split(/\s{2,}/);
       return { provider: parts[0] ?? "", model: parts[1] ?? "", context: parts[2] ?? "", maxOutput: parts[3] ?? "", thinking: parts[4] === "yes", images: parts[5] === "yes" };
     }).filter((row) => row.model);
-    return { available: models.length > 0, models };
+    // An empty catalogue usually means the engine has no provider credential yet; keep its message.
+    const note = models.length ? undefined : lines.find((line) => line.trim().length > 0)?.trim().slice(0, 300);
+    return { available: models.length > 0, models, note };
   } catch (error) {
     return { available: false, models: [], error: error instanceof Error ? error.message : String(error) };
   }
