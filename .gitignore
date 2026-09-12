@@ -1,0 +1,48 @@
+# rahasia & konfigurasi lokal
+.env
+.env.*
+*.env
+runtime.env
+*token*
+*credential*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# data runtime & berkas user (JANGAN pernah di-commit)
+data/
+users.json
+login-sessions.json
+sessions.json
+audit.jsonl
+artifact-meta.json
+benchmark.json
+shadow.json
+learnings.json
+safety.json
+workspace/
+sessions/
+session-leases/
+daemon-workers/
+
+# cadangan & berkas sementara
+*.bak
+*.bak_*
+*.bak.*
+*.pre_*
+*_backup_*
+*.backup
+*.orig
+*.log
+*.tmp
+_trash_*/
+backups/
+
+# dependensi & build
+node_modules/
+vendor/
+dist/
+build/
+__pycache__/
+*.pyc
