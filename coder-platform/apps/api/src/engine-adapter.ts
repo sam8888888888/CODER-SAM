@@ -1,6 +1,11 @@
 export type EngineRunRequest = {
   runId: string; sessionId: string; prompt: string; model?: string; provider?: string;
 };
+/**
+ * EngineEvent.data for "completed" may carry the raw usage object reported by the engine.
+ * The shape is engine-defined, so it is stored as reported and never invented.
+ */
+export type EngineUsage = { raw?: unknown; inputTokens?: number; outputTokens?: number; costMicros?: number; model?: string };
 export type EngineEvent = { type: "text" | "tool" | "completed" | "failed"; data: unknown };
 
 /** Product-owned seam. Prime Agent is an implementation detail behind this interface. */

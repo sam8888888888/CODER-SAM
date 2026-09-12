@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS knowledge_documents (
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_search USING fts5(title, content, document_id UNINDEXED);
 CREATE INDEX IF NOT EXISTS idx_knowledge_project_updated ON knowledge_documents(project_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS run_usage (
+ id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+ model TEXT, provider TEXT, input_tokens INTEGER, output_tokens INTEGER, cost_micros INTEGER, estimated INTEGER NOT NULL DEFAULT 0,
+ raw_json TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_usage_project ON run_usage(project_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS artifacts (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, run_id TEXT REFERENCES runs(id) ON DELETE SET NULL, name TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, storage_path TEXT NOT NULL, created_at TEXT NOT NULL
 );
@@ -177,6 +184,7 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document ON knowledge_chunks(doc
 CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(content, chunk_id UNINDEXED, document_id UNINDEXED, project_id UNINDEXED, tokenize='porter');`);
 try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN filename TEXT"); } catch {}
 try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch {}
 
 // Runs after the additive columns exist, because it copies them.
 migrateKnowledgeSourceTypes();

@@ -138,7 +138,7 @@ app.post<{ Params: { workspaceId: string }; Body: { name?: string; slug?: string
 app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/conversations", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
-  return db.prepare("SELECT id, project_id AS projectId, title, created_at AS createdAt, updated_at AS updatedAt FROM conversations WHERE project_id=? ORDER BY updated_at DESC").all(request.params.projectId);
+  return db.prepare("SELECT id, project_id AS projectId, title, pinned, created_at AS createdAt, updated_at AS updatedAt FROM conversations WHERE project_id=? ORDER BY pinned DESC, updated_at DESC").all(request.params.projectId);
 });
 app.post<{ Params: { projectId: string }; Body: { title?: string } }>("/api/v1/projects/:projectId/conversations", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
@@ -162,6 +162,21 @@ function withKnowledge(prompt: string, knowledge?: KnowledgeContext) {
   return `Gunakan konteks pengetahuan proyek berikut bila relevan. Rujuk sumbernya dengan penanda [1], [2].\n\n${knowledge.text}\n\n---\n\nPertanyaan pengguna:\n${prompt}`;
 }
 
+/**
+ * Stores token usage for a finished run. Usage reported by the engine is stored as-is;
+ * when the engine reports nothing, the numbers are marked estimated = 1.
+ */
+function recordRunUsage(runId: string, projectId: string, prompt: string, answer: string, usage: any) {
+  const reported = usage && typeof usage === "object" ? usage : null;
+  const hasTokens = typeof reported?.inputTokens === "number" || typeof reported?.outputTokens === "number";
+  const inputTokens = hasTokens ? Math.round(reported.inputTokens ?? 0) : Math.ceil(prompt.length / 4);
+  const outputTokens = hasTokens ? Math.round(reported.outputTokens ?? 0) : Math.ceil(answer.length / 4);
+  const costMicros = typeof reported?.costMicros === "number" ? Math.round(reported.costMicros) : null;
+  const model = typeof reported?.model === "string" ? reported.model : (config.PRIME_AGENT_MODEL ?? null);
+  db.prepare("INSERT INTO run_usage (id,run_id,project_id,model,provider,input_tokens,output_tokens,cost_micros,estimated,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+    .run(randomUUID(), runId, projectId, model, config.PRIME_AGENT_PROVIDER ?? null, inputTokens, outputTokens, costMicros, hasTokens ? 0 : 1, reported ? JSON.stringify(reported.raw ?? null).slice(0, 4000) : null, new Date().toISOString());
+}
+
 async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext) {
   const startedAt = new Date().toISOString();
   db.prepare("UPDATE runs SET status='running', started_at=? WHERE id=?").run(startedAt, runId);
@@ -169,11 +184,14 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
   try {
     if (knowledge?.hits?.length) publishRunEvent(runId, "knowledge", { hits: knowledge.hits });
     // The conversation id is the engine session id, so follow-up questions keep the earlier turns.
+    let usage: any = null;
     for await (const event of engine.run({ runId, sessionId: conversationId ?? runId, prompt: withKnowledge(prompt, knowledge) })) {
       if (event.type !== "completed") publishRunEvent(runId, event.type, event.data);
       if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+      if (event.type === "completed") usage = (event.data as { usage?: unknown })?.usage ?? null;
       if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
     }
+    recordRunUsage(runId, projectId, prompt, text, usage);
     db.prepare("UPDATE runs SET status='completed', result=?, finished_at=? WHERE id=?").run(text || null, new Date().toISOString(), runId);
     publishRunEvent(runId, "completed", { result: text });
     if (conversationId) db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(randomUUID(),conversationId,"assistant",text || "",runId,new Date().toISOString());
@@ -528,6 +546,67 @@ app.delete<{ Params: { projectId: string; documentId: string } }>("/api/v1/proje
   recordAudit(project!.workspaceId, request.user!.id, "knowledge.document.deleted", { documentId: request.params.documentId });
   return { deleted: true, id: request.params.documentId };
 });;
+
+app.patch<{ Params: { conversationId: string }; Body: { title?: string; pinned?: boolean } }>("/api/v1/conversations/:conversationId", { preHandler: requireUser }, async (request: any, reply) => {
+  const conversation = db.prepare("SELECT c.id, c.title, c.pinned FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; title: string; pinned: number } | undefined;
+  if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  const title = request.body?.title === undefined ? conversation.title : String(request.body.title).trim().slice(0, 120);
+  if (!title) return reply.code(400).send({ error: "INVALID_TITLE" });
+  const pinned = request.body?.pinned === undefined ? conversation.pinned : request.body.pinned ? 1 : 0;
+  db.prepare("UPDATE conversations SET title=?, pinned=?, updated_at=? WHERE id=?").run(title, pinned, new Date().toISOString(), conversation.id);
+  return { id: conversation.id, title, pinned: Boolean(pinned) };
+});
+
+app.delete<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversationId", { preHandler: requireUser }, async (request: any, reply) => {
+  const conversation = db.prepare("SELECT c.id, p.workspace_id AS workspaceId FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; workspaceId: string } | undefined;
+  if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  db.transaction(() => {
+    db.prepare("DELETE FROM messages WHERE conversation_id=?").run(conversation.id);
+    db.prepare("DELETE FROM conversations WHERE id=?").run(conversation.id);
+  })();
+  recordAudit(conversation.workspaceId, request.user!.id, "conversation.deleted", { conversationId: conversation.id });
+  return { deleted: true, id: conversation.id };
+});
+
+app.get<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversationId/export", { preHandler: requireUser }, async (request: any, reply) => {
+  const conversation = db.prepare("SELECT c.id, c.title, c.created_at AS createdAt, c.updated_at AS updatedAt, p.id AS projectId FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as Record<string, unknown> | undefined;
+  if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  const messages = db.prepare("SELECT role, content, created_at AS createdAt FROM messages WHERE conversation_id=? ORDER BY created_at").all(conversation.id);
+  return { format: "coblai.conversation.v1", exportedAt: new Date().toISOString(), conversation, messages };
+});
+
+app.post<{ Params: { projectId: string }; Body: { conversation?: { title?: string; messages?: unknown } } }>("/api/v1/projects/:projectId/conversations/import", { preHandler: requireUser }, async (request: any, reply) => {
+  const project = db.prepare("SELECT p.workspace_id AS workspaceId FROM projects p WHERE p.id=?").get(request.params.projectId) as { workspaceId: string } | undefined;
+  const role = project ? membershipRole(project.workspaceId, request.user!.id) : undefined;
+  if (!role) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  if (role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const payload = request.body?.conversation;
+  const rawMessages = Array.isArray(payload?.messages) ? payload!.messages as { role?: unknown; content?: unknown; createdAt?: unknown }[] : null;
+  if (!payload || !rawMessages) return reply.code(400).send({ error: "INVALID_IMPORT_PAYLOAD" });
+  const rows = rawMessages.filter((message) => (message.role === "user" || message.role === "assistant") && typeof message.content === "string")
+    .slice(0, 500).map((message) => ({ role: message.role as string, content: String(message.content).slice(0, 100_000), createdAt: typeof message.createdAt === "string" ? message.createdAt : new Date().toISOString() }));
+  const conversationId = randomUUID();
+  const title = String(payload.title ?? "Imported conversation").trim().slice(0, 120) || "Imported conversation";
+  const transaction = db.transaction(() => {
+    db.prepare("INSERT INTO conversations (id,project_id,title,created_at,updated_at) VALUES (?,?,?,?,?)").run(conversationId, request.params.projectId, title, new Date().toISOString(), new Date().toISOString());
+    const insert = db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)");
+    for (const row of rows) insert.run(randomUUID(), conversationId, row.role, row.content, null, row.createdAt);
+  });
+  transaction();
+  recordAudit(project!.workspaceId, request.user!.id, "conversation.imported", { conversationId, messages: rows.length });
+  return reply.code(201).send({ conversation: { id: conversationId, projectId: request.params.projectId, title, messages: rows.length } });
+});
+
+app.get<{ Params: { projectId: string }; Querystring: { days?: string } }>("/api/v1/projects/:projectId/usage", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const days = Math.min(Math.max(Number(request.query?.days ?? 30) || 30, 1), 365);
+  const since = new Date(Date.now() - days * 86_400_000).toISOString();
+  const totals = db.prepare("SELECT COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cost_micros),0) AS costMicros, COALESCE(SUM(estimated),0) AS estimatedRuns FROM run_usage WHERE project_id=? AND created_at>=?").get(request.params.projectId, since);
+  const byModel = db.prepare("SELECT COALESCE(model,'unknown') AS model, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cost_micros),0) AS costMicros FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY COALESCE(model,'unknown') ORDER BY runs DESC").all(request.params.projectId, since);
+  const daily = db.prepare("SELECT substr(created_at,1,10) AS day, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day DESC LIMIT 60").all(request.params.projectId, since);
+  return { days, since, totals, byModel, daily };
+});
 
 app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/artifacts", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);

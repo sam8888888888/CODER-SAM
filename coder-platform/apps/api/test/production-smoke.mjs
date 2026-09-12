@@ -143,5 +143,21 @@ check("invitation revoked", revoke.status === 200 && revoke.json.revoked === tru
 const artifacts = await call("GET", `/api/v1/projects/${projectId}/artifacts`);
 check("artifact list works", artifacts.status === 200 && Array.isArray(artifacts.json), JSON.stringify(artifacts.json)?.slice(0, 160));
 
+// Conversation management and usage tracking
+const exportable = await call("POST", `/api/v1/projects/${projectId}/conversations`, { title: "Smoke chat" });
+const exportId = exportable.json.conversation.id;
+const rename = await call("PATCH", `/api/v1/conversations/${exportId}`, { title: "Smoke chat renamed", pinned: true });
+check("conversation renamed and pinned", rename.status === 200 && rename.json.pinned === true && rename.json.title === "Smoke chat renamed", JSON.stringify(rename.json));
+const conversationList = await call("GET", `/api/v1/projects/${projectId}/conversations`);
+check("conversation list exposes pinned", conversationList.json.some((row) => row.id === exportId && row.pinned === 1), JSON.stringify(conversationList.json)?.slice(0, 160));
+const exportedConversation = await call("GET", `/api/v1/conversations/${exportId}/export`);
+check("conversation export works", exportedConversation.status === 200 && exportedConversation.json.format === "coblai.conversation.v1", JSON.stringify(exportedConversation.json)?.slice(0, 160));
+const importedConversation = await call("POST", `/api/v1/projects/${projectId}/conversations/import`, { conversation: { title: "Smoke imported", messages: [{ role: "user", content: "halo" }, { role: "assistant", content: "hai" }] } });
+check("conversation import works", importedConversation.status === 201 && importedConversation.json.conversation.messages === 2, JSON.stringify(importedConversation.json));
+const usage = await call("GET", `/api/v1/projects/${projectId}/usage?days=30`);
+check("usage endpoint responds", usage.status === 200 && typeof usage.json.totals.runs === "number", JSON.stringify(usage.json)?.slice(0, 200));
+const deletedConversation = await call("DELETE", `/api/v1/conversations/${exportId}`);
+check("conversation deleted", deletedConversation.status === 200 && deletedConversation.json.deleted === true, JSON.stringify(deletedConversation.json));
+
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

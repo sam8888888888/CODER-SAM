@@ -45,6 +45,28 @@ export class PrimeRpcEngine implements AgentEngine {
 }
 
 /** Extracts the last assistant message text from an agent_end frame, used as a safety net for streamed text. */
+/**
+ * Reads the usage object from an agent_end frame. Only numeric token fields that the engine
+ * actually reports are kept; anything else stays undefined so callers can mark the run estimated.
+ */
+function extractUsage(event: any): { raw: unknown; inputTokens?: number; outputTokens?: number; costMicros?: number; model?: string } | null {
+  const candidates = [event?.usage, event?.totalUsage, event?.usageMetadata, event?.data?.usage];
+  const usage = candidates.find((value) => value && typeof value === "object");
+  if (!usage) return null;
+  const number = (...keys: string[]) => { for (const key of keys) { const value = (usage as any)[key]; if (typeof value === "number" && Number.isFinite(value)) return value; } return undefined; };
+  const input = number("inputTokens", "input_tokens", "promptTokens", "prompt_tokens");
+  const output = number("outputTokens", "output_tokens", "completionTokens", "completion_tokens");
+  const cost = number("costMicros", "cost_micros");
+  const costUsd = number("cost", "totalCost", "total_cost");
+  return {
+    raw: usage,
+    inputTokens: input,
+    outputTokens: output,
+    costMicros: cost ?? (costUsd === undefined ? undefined : Math.round(costUsd * 1_000_000)),
+    model: typeof (usage as any).model === "string" ? (usage as any).model : undefined,
+  };
+}
+
 function lastAssistantText(event: any): string {
   const messages = Array.isArray(event?.messages) ? event.messages : [];
   for (let index = messages.length - 1; index >= 0; index -= 1) {

@@ -14,7 +14,7 @@ function newStep(type: WorkflowStep['type']): WorkflowStep {
 }
 
 export function Tools({ projectId, workspaceId, onClose }: { projectId: string; workspaceId: string | null; onClose: () => void }) {
-  const [tab, setTab] = useState<'knowledge' | 'workflow' | 'team' | 'artifacts' | 'audit'>('knowledge');
+  const [tab, setTab] = useState<'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit'>('knowledge');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -46,6 +46,10 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
   // Artifact state
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
 
+  // Usage state
+  const [usage, setUsage] = useState<{ runs: number; inputTokens: number; outputTokens: number; costMicros: number; estimatedRuns: number } | null>(null);
+  const [usageModels, setUsageModels] = useState<{ model: string; runs: number; inputTokens: number; outputTokens: number }[]>([]);
+
   // Audit state
   const [audit, setAudit] = useState<AuditEvent[]>([]);
 
@@ -65,6 +69,7 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
   async function loadAudit() { if (workspaceId) setAudit(await api.auditEvents(workspaceId)); }
   async function loadTeam() { if (!workspaceId) return; setMembers(await api.members(workspaceId)); setInvitations(await api.invitations(workspaceId)); }
   async function loadArtifacts() { setArtifacts(await api.artifacts(projectId)); }
+  async function loadUsage() { const data = await api.usage(projectId, 30); setUsage(data.totals); setUsageModels(data.byModel); }
 
   /** Reads a picked file as Base64 and uploads it as a knowledge document. */
   async function uploadDocument(file: File) {
@@ -93,6 +98,7 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
       else if (tab === 'workflow') await loadWorkflows();
       else if (tab === 'team') await loadTeam();
       else if (tab === 'artifacts') await loadArtifacts();
+      else if (tab === 'usage') await loadUsage();
       else await loadAudit();
     });
   }, [tab, projectId, workspaceId]);
@@ -369,6 +375,31 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
     </div>
   );
 
+  const usageTab = (
+    <div className="tool-body">
+      {usage ? (
+        <>
+          <div className="tool-row wrap">
+            <div className="stat"><b>{usage.runs}</b><small>run 30 hari</small></div>
+            <div className="stat"><b>{usage.inputTokens.toLocaleString('id-ID')}</b><small>token masuk</small></div>
+            <div className="stat"><b>{usage.outputTokens.toLocaleString('id-ID')}</b><small>token keluar</small></div>
+            <div className="stat"><b>{(usage.costMicros / 1_000_000).toFixed(4)}</b><small>biaya ($, bila dilaporkan)</small></div>
+            <div className="stat"><b>{usage.estimatedRuns}</b><small>run dengan estimasi</small></div>
+          </div>
+          <small>Angka bertanda estimasi dihitung dari panjang teks karena engine tidak melaporkan token.</small>
+          <div className="tool-list">
+            {usageModels.map((row) => (
+              <div key={row.model}>
+                <b>{row.model}</b>
+                <small>{row.runs} run · {row.inputTokens.toLocaleString('id-ID')} masuk · {row.outputTokens.toLocaleString('id-ID')} keluar</small>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : <small>Belum ada data pemakaian.</small>}
+    </div>
+  );
+
   const auditTab = (
     <div className="tool-body">
       <div className="tool-list">
@@ -390,11 +421,12 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
           <button type="button" className={tab === 'workflow' ? 'active' : ''} onClick={() => setTab('workflow')}>Workflow</button>
           <button type="button" className={tab === 'team' ? 'active' : ''} onClick={() => setTab('team')}>Tim</button>
           <button type="button" className={tab === 'artifacts' ? 'active' : ''} onClick={() => setTab('artifacts')}>Artifact</button>
+          <button type="button" className={tab === 'usage' ? 'active' : ''} onClick={() => setTab('usage')}>Pemakaian</button>
           <button type="button" className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>Audit</button>
         </div>
-        <h2>{tab === 'knowledge' ? 'Knowledge Base' : tab === 'workflow' ? 'Workflow Builder' : tab === 'team' ? 'Tim Workspace' : tab === 'artifacts' ? 'Artifact Project' : 'Audit Workspace'}</h2>
+        <h2>{tab === 'knowledge' ? 'Knowledge Base' : tab === 'workflow' ? 'Workflow Builder' : tab === 'team' ? 'Tim Workspace' : tab === 'artifacts' ? 'Artifact Project' : tab === 'usage' ? 'Pemakaian Token' : 'Audit Workspace'}</h2>
         {message && <p className="notice" onClick={() => setMessage('')}>{message}</p>}
-        {tab === 'knowledge' ? knowledgeTab : tab === 'workflow' ? workflowTab : tab === 'team' ? teamTab : tab === 'artifacts' ? artifactTab : auditTab}
+        {tab === 'knowledge' ? knowledgeTab : tab === 'workflow' ? workflowTab : tab === 'team' ? teamTab : tab === 'artifacts' ? artifactTab : tab === 'usage' ? usageTab : auditTab}
       </section>
     </div>
   );

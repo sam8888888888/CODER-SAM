@@ -45,3 +45,13 @@
 .tool-list a.download:hover{background:#22d3ee18}
 .tool-list select{flex:none;padding:8px 10px}
 .notice-toast{background:#a5f3fc;color:#083344;bottom:84px}
+.session-row{display:flex;align-items:center;gap:2px}
+.session-row .session{flex:1;min-width:0}
+.session-actions{display:flex;gap:2px;opacity:0;transition:opacity .15s}
+.session-row:hover .session-actions,.session-row.active .session-actions{opacity:1}
+.session-actions button{background:transparent;border:0;color:#94a3b8;font-size:11px;padding:4px 5px;cursor:pointer;border-radius:6px}
+.session-actions button:hover{color:#e0f2fe;background:#1e293b}
+.upload-button{cursor:pointer}
+.upload-button input{display:none}
+.composer-actions button.stop{background:#7f1d1d;color:#fee2e2;border-radius:999px;padding:6px 12px;font-size:11px}
+.stat{background:#111a2e;border:1px solid #24304d;border-radius:12px;padding:10px 14px;display:flex;flex-direction:column;gap:2px}.stat b{color:#e0f2fe;font-size:16px}

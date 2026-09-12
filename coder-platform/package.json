@@ -10,7 +10,9 @@
     "restore": "tsx apps/api/src/restore.ts",
     "start": "node dist/api/server.js",
     "test:workflow": "tsx apps/api/test/workflow-engine.e2e.ts",
-    "test:migration": "tsx apps/api/test/migration-check.ts"
+    "test:migration": "tsx apps/api/test/migration-check.ts",
+    "test:session": "tsx apps/api/test/session-usage.e2e.ts",
+    "test:knowledge": "tsx apps/api/test/knowledge-team.e2e.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^10.0.1",
