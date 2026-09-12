@@ -13,11 +13,13 @@ db.pragma("busy_timeout = 5000");
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
  id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL,
- password_hash TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ password_hash TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ mfa_secret TEXT, mfa_enabled INTEGER NOT NULL DEFAULT 0, mfa_recovery_codes TEXT
 );
 CREATE TABLE IF NOT EXISTS auth_sessions (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
- token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+ token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
+ last_seen_at TEXT, user_agent TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -186,6 +188,11 @@ try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN filename TEXT"); } cat
 try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE runs ADD COLUMN model TEXT"); } catch {}
+try { db.exec("ALTER TABLE auth_sessions ADD COLUMN last_seen_at TEXT"); } catch {}
+try { db.exec("ALTER TABLE auth_sessions ADD COLUMN user_agent TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN mfa_secret TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN mfa_recovery_codes TEXT"); } catch {}
 
 // Runs after the additive columns exist, because it copies them.
 migrateKnowledgeSourceTypes();

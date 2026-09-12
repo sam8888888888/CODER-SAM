@@ -35,15 +35,35 @@ export function setSessionCookie(reply: FastifyReply, token: string, production:
 export function clearSessionCookie(reply: FastifyReply, production: boolean) {
   reply.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: "lax", secure: production, path: "/" });
 }
-export function createSession(userId: string) {
+export function createSession(userId: string, userAgent?: string) {
   const token = randomBytes(32).toString("base64url"); const now = new Date(); const expires = new Date(now.getTime() + SESSION_DAYS * 86400000);
-  db.prepare("INSERT INTO auth_sessions (id,user_id,token_hash,expires_at,created_at) VALUES (?,?,?,?,?)").run(randomUUID(), userId, tokenDigest(token), expires.toISOString(), now.toISOString());
+  db.prepare("INSERT INTO auth_sessions (id,user_id,token_hash,expires_at,created_at,last_seen_at,user_agent) VALUES (?,?,?,?,?,?,?)").run(randomUUID(), userId, tokenDigest(token), expires.toISOString(), now.toISOString(), now.toISOString(), (userAgent ?? "").slice(0, 200));
   return token;
 }
+export function sessionIdForToken(token: string): string | null {
+  const row = db.prepare("SELECT id FROM auth_sessions WHERE token_hash=?").get(tokenDigest(token)) as { id: string } | undefined;
+  return row?.id ?? null;
+}
+export function currentSessionId(request: FastifyRequest): string | null {
+  const token = request.cookies[SESSION_COOKIE]; return token ? sessionIdForToken(token) : null;
+}
+export function touchSession(sessionId: string) {
+  try { db.prepare("UPDATE auth_sessions SET last_seen_at=? WHERE id=?").run(new Date().toISOString(), sessionId); } catch { /* never break a request for this */ }
+}
+
+export function revokeOtherSessions(userId: string, keepSessionId: string | null) {
+  if (keepSessionId) db.prepare("DELETE FROM auth_sessions WHERE user_id=? AND id<>?").run(userId, keepSessionId);
+  else db.prepare("DELETE FROM auth_sessions WHERE user_id=?").run(userId);
+}
+const lastSeenWrite = new Map<string, number>();
 export function getSessionUser(request: FastifyRequest): AuthUser | null {
   const token = request.cookies[SESSION_COOKIE]; if (!token) return null;
-  const row = db.prepare("SELECT u.id, u.email, u.display_name AS displayName FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? ").get(tokenDigest(token), new Date().toISOString()) as AuthUser | undefined;
-  return row ?? null;
+  const row = db.prepare("SELECT u.id, u.email, u.display_name AS displayName, s.id AS sessionId FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? ").get(tokenDigest(token), new Date().toISOString()) as (AuthUser & { sessionId: string }) | undefined;
+  if (!row) return null;
+  // "Last seen" is refreshed at most once per ten minutes to keep requests read only.
+  const previous = lastSeenWrite.get(row.sessionId) ?? 0;
+  if (Date.now() - previous > 600_000) { lastSeenWrite.set(row.sessionId, Date.now()); touchSession(row.sessionId); }
+  return { id: row.id, email: row.email, displayName: row.displayName };
 }
 export async function requireUser(request: AuthRequest, reply: FastifyReply) {
   const user = getSessionUser(request); if (!user) return reply.code(401).send({ error: "AUTH_REQUIRED" });

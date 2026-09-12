@@ -159,6 +159,11 @@ check("usage endpoint responds", usage.status === 200 && typeof usage.json.total
 const deletedConversation = await call("DELETE", `/api/v1/conversations/${exportId}`);
 check("conversation deleted", deletedConversation.status === 200 && deletedConversation.json.deleted === true, JSON.stringify(deletedConversation.json));
 
+const authSessions = await call("GET", "/api/v1/auth/sessions");
+check("session list responds", authSessions.status === 200 && Array.isArray(authSessions.json) && authSessions.json.some((row) => row.current === true), JSON.stringify(authSessions.json)?.slice(0, 160));
+const mfaStatus = await call("GET", "/api/v1/auth/mfa");
+check("mfa status responds", mfaStatus.status === 200 && typeof mfaStatus.json.enabled === "boolean", JSON.stringify(mfaStatus.json));
+
 const catalogue = await call("GET", "/api/v1/models");
 check("model catalogue responds", catalogue.status === 200 && Array.isArray(catalogue.json.models), JSON.stringify(catalogue.json)?.slice(0, 120));
 if (catalogue.json.models.length > 0) {

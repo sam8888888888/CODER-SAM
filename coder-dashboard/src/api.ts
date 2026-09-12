@@ -22,12 +22,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 export const api = {
   me: () => request<{ user: User }>('/v1/auth/me'),
-  login: (username: string, password: string) => request<{ user: User }>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: username, password }) }),
+  login: (username: string, password: string, code?: string) => request<{ user: User; mfaEnabled?: boolean }>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: username, password, code }) }),
   register: (username: string, password: string, name: string) => request<{ user: User; workspace: Workspace }>('/v1/auth/register', { method: 'POST', body: JSON.stringify({ email: username, password, displayName: name }) }),
   logout: () => request('/v1/auth/logout', { method: 'POST' }),
   workspaces: () => request<Workspace[]>('/v1/workspaces'),
   projects: (workspaceId: string) => request<Project[]>(`/v1/workspaces/${workspaceId}/projects`),
-  sessions: (projectId: string) => request<Session[]>(`/v1/projects/${projectId}/conversations`),
+  chatSessions: (projectId: string) => request<Session[]>(`/v1/projects/${projectId}/conversations`),
   createSession: (projectId: string, title = 'Percakapan baru') => request<{ conversation: Session }>(`/v1/projects/${projectId}/conversations`, { method: 'POST', body: JSON.stringify({ title }) }),
   messages: (id: string) => request<{ messages: Message[] }>(`/v1/conversations/${encodeURIComponent(id)}/messages`),
   uploadKnowledge: (projectId: string, filename: string, contentBase64: string, title?: string) => request<KnowledgeDocument>(`/v1/projects/${projectId}/knowledge/upload`, { method: 'POST', body: JSON.stringify({ filename, contentBase64, title }) }),
@@ -64,5 +64,12 @@ export const api = {
   auditEvents: (workspaceId: string) => request<AuditEvent[]>(`/v1/workspaces/${workspaceId}/audit`),
   decideApproval: (executionId: string, decision: 'approved'|'rejected') => request(`/v1/workflow-executions/${executionId}/approval`, { method: 'POST', body: JSON.stringify({ decision }) }),
   sendMessage: (id: string, content: string, model?: string) => request<{ message: Message; run: { id: string } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content, model }) }),
+  sessions: () => request<{ id: string; createdAt: string; lastSeenAt: string | null; expiresAt: string; userAgent: string | null; current: boolean }[]>('/v1/auth/sessions'),
+  revokeSession: (id: string) => request<{ revoked: boolean }>(`/v1/auth/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  changePassword: (currentPassword: string, newPassword: string) => request<{ changed: boolean }>('/v1/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) }),
+  mfaStatus: () => request<{ enabled: boolean; pendingSetup: boolean }>('/v1/auth/mfa'),
+  mfaSetup: () => request<{ secret: string; otpauthUrl: string }>('/v1/auth/mfa/setup', { method: 'POST' }),
+  mfaEnable: (code: string) => request<{ enabled: boolean; recoveryCodes: string[] }>('/v1/auth/mfa/enable', { method: 'POST', body: JSON.stringify({ code }) }),
+  mfaDisable: (password: string, code: string) => request<{ enabled: boolean }>('/v1/auth/mfa/disable', { method: 'POST', body: JSON.stringify({ password, code }) }),
   models: () => request<{ available: boolean; error?: string; default: { model: string | null; provider: string | null }; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[] }>('/v1/models'),
 };

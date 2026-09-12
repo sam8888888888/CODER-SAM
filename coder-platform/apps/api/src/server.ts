@@ -8,7 +8,9 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
 import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
 import { extractText } from "./text-extract.js";
+import { generateTotpSecret, otpAuthUrl, verifyTotp } from "./totp.js";
 import { db } from "./db.js";
+import { currentSessionId, revokeOtherSessions, sessionIdForToken, touchSession } from "./auth.js";
 import { engine } from "./engine.js";
 import { createExecution, recordAudit, runExecution, scheduleNextRun } from "./workflow-engine.js";
 import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
@@ -95,15 +97,79 @@ app.post<{ Body: { email?: string; password?: string; displayName?: string } }>(
     return reply.code(201).send({ user: { id: userId, email, displayName }, workspace: { id: workspaceId, slug } });
   } catch (error) { if (String(error).includes("UNIQUE")) return reply.code(409).send({ error: "EMAIL_EXISTS" }); throw error; }
 });
-app.post<{ Body: { email?: string; password?: string } }>("/api/v1/auth/login", async (request, reply) => {
-  const email = request.body?.email?.trim().toLowerCase(); const password = request.body?.password ?? "";
+app.post<{ Body: { email?: string; password?: string; code?: string } }>("/api/v1/auth/login", async (request, reply) => {
+  const email = request.body?.email?.trim().toLowerCase(); const password = request.body?.password ?? ""; const code = request.body?.code?.trim();
   const key = `${request.ip}:${email ?? "unknown"}`; if (!allowLoginAttempt(key)) return reply.code(429).send({ error: "LOGIN_RATE_LIMITED" });
-  const row = email ? db.prepare("SELECT id,email,display_name AS displayName,password_hash AS passwordHash FROM users WHERE email=?").get(email) as { id:string; email:string; displayName:string; passwordHash:string|null }|undefined : undefined;
+  const row = email ? db.prepare("SELECT id,email,display_name AS displayName,password_hash AS passwordHash, mfa_enabled AS mfaEnabled, mfa_secret AS mfaSecret, mfa_recovery_codes AS recoveryCodes FROM users WHERE email=?").get(email) as { id:string; email:string; displayName:string; passwordHash:string|null; mfaEnabled:number; mfaSecret:string|null; recoveryCodes:string|null }|undefined : undefined;
   if (!row?.passwordHash || !(await verifyPassword(password,row.passwordHash))) return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
-  const token = createSession(row.id); setSessionCookie(reply, token, config.NODE_ENV === "production");
-  return { user: { id: row.id, email: row.email, displayName: row.displayName } };
+  if (row.mfaEnabled) {
+    if (!code) return reply.code(401).send({ error: "MFA_REQUIRED" });
+    if (!consumeSecondFactor(row, code)) return reply.code(401).send({ error: "MFA_INVALID_CODE" });
+  }
+  const token = createSession(row.id, String(request.headers["user-agent"] ?? "")); setSessionCookie(reply, token, config.NODE_ENV === "production");
+  return { user: { id: row.id, email: row.email, displayName: row.displayName }, mfaEnabled: Boolean(row.mfaEnabled) };
 });
 app.post("/api/v1/auth/logout", async (request, reply) => { deleteSession(request); clearSessionCookie(reply, config.NODE_ENV === "production"); return { ok: true }; });
+
+/** Accepts a TOTP code or a single use recovery code. */
+function consumeSecondFactor(row: { id: string; mfaSecret: string | null; recoveryCodes: string | null }, code: string): boolean {
+  if (row.mfaSecret && verifyTotp(row.mfaSecret, code)) return true;
+  const stored: string[] = row.recoveryCodes ? JSON.parse(row.recoveryCodes) : [];
+  const digest = createHash("sha256").update(code).digest("hex");
+  if (stored.includes(digest)) {
+    db.prepare("UPDATE users SET mfa_recovery_codes=?, updated_at=? WHERE id=?").run(JSON.stringify(stored.filter((entry) => entry !== digest)), new Date().toISOString(), row.id);
+    return true;
+  }
+  return false;
+}
+
+app.get("/api/v1/auth/sessions", { preHandler: requireUser }, async (request: any) => {
+  const current = currentSessionId(request);
+  const rows = db.prepare("SELECT id, created_at AS createdAt, last_seen_at AS lastSeenAt, expires_at AS expiresAt, user_agent AS userAgent FROM auth_sessions WHERE user_id=? AND expires_at>? ORDER BY created_at DESC").all(request.user!.id, new Date().toISOString()) as { id: string }[];
+  return rows.map((row) => ({ ...row, current: row.id === current }));
+});
+app.delete<{ Params: { sessionId: string } }>("/api/v1/auth/sessions/:sessionId", { preHandler: requireUser }, async (request: any, reply) => {
+  const result = db.prepare("DELETE FROM auth_sessions WHERE id=? AND user_id=?").run(request.params.sessionId, request.user!.id);
+  if (!result.changes) return reply.code(404).send({ error: "SESSION_NOT_FOUND" });
+  return { revoked: true, id: request.params.sessionId };
+});
+app.post<{ Body: { currentPassword?: string; newPassword?: string } }>("/api/v1/auth/password", { preHandler: requireUser }, async (request: any, reply) => {
+  const currentPassword = request.body?.currentPassword ?? ""; const newPassword = request.body?.newPassword ?? "";
+  if (newPassword.length < 10 || newPassword.length > 200) return reply.code(400).send({ error: "INVALID_PASSWORD" });
+  const row = db.prepare("SELECT password_hash AS passwordHash FROM users WHERE id=?").get(request.user!.id) as { passwordHash: string | null } | undefined;
+  if (!row?.passwordHash || !(await verifyPassword(currentPassword, row.passwordHash))) return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
+  if (currentPassword === newPassword) return reply.code(400).send({ error: "PASSWORD_UNCHANGED" });
+  db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?").run(await hashPassword(newPassword), new Date().toISOString(), request.user!.id);
+  revokeOtherSessions(request.user!.id, currentSessionId(request));
+  recordAudit(null, request.user!.id, "auth.password_changed", { userId: request.user!.id });
+  return { changed: true, otherSessionsRevoked: true };
+});
+app.post("/api/v1/auth/mfa/setup", { preHandler: requireUser }, async (request: any, reply) => {
+  const secret = generateTotpSecret();
+  db.prepare("UPDATE users SET mfa_secret=?, updated_at=? WHERE id=?").run(secret, new Date().toISOString(), request.user!.id);
+  return { secret, otpauthUrl: otpAuthUrl(secret, request.user!.email), digits: 6, periodSeconds: 30, enabled: false };
+});
+app.post<{ Body: { code?: string } }>("/api/v1/auth/mfa/enable", { preHandler: requireUser }, async (request: any, reply) => {
+  const row = db.prepare("SELECT mfa_secret AS secret FROM users WHERE id=?").get(request.user!.id) as { secret: string | null } | undefined;
+  if (!row?.secret) return reply.code(400).send({ error: "MFA_SETUP_REQUIRED" });
+  if (!verifyTotp(row.secret, request.body?.code ?? "")) return reply.code(400).send({ error: "MFA_INVALID_CODE" });
+  const recovery = Array.from({ length: 6 }, () => randomBytes(5).toString("hex"));
+  db.prepare("UPDATE users SET mfa_enabled=1, mfa_recovery_codes=?, updated_at=? WHERE id=?").run(JSON.stringify(recovery.map((entry) => createHash("sha256").update(entry).digest("hex"))), new Date().toISOString(), request.user!.id);
+  recordAudit(null, request.user!.id, "auth.mfa_enabled", { userId: request.user!.id });
+  return { enabled: true, recoveryCodes: recovery };
+});
+app.post<{ Body: { password?: string; code?: string } }>("/api/v1/auth/mfa/disable", { preHandler: requireUser }, async (request: any, reply) => {
+  const row = db.prepare("SELECT password_hash AS passwordHash, mfa_enabled AS mfaEnabled, mfa_secret AS mfaSecret, mfa_recovery_codes AS recoveryCodes FROM users WHERE id=?").get(request.user!.id) as { passwordHash: string | null; mfaEnabled: number; mfaSecret: string | null; recoveryCodes: string | null } | undefined;
+  if (!row?.passwordHash || !(await verifyPassword(request.body?.password ?? "", row.passwordHash))) return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
+  if (row.mfaEnabled && !consumeSecondFactor({ id: request.user!.id, mfaSecret: row.mfaSecret, recoveryCodes: row.recoveryCodes }, request.body?.code ?? "")) return reply.code(400).send({ error: "MFA_INVALID_CODE" });
+  db.prepare("UPDATE users SET mfa_enabled=0, mfa_secret=NULL, mfa_recovery_codes=NULL, updated_at=? WHERE id=?").run(new Date().toISOString(), request.user!.id);
+  recordAudit(null, request.user!.id, "auth.mfa_disabled", { userId: request.user!.id });
+  return { enabled: false };
+});
+app.get("/api/v1/auth/mfa", { preHandler: requireUser }, async (request: any) => {
+  const row = db.prepare("SELECT mfa_enabled AS enabled, mfa_secret AS secret FROM users WHERE id=?").get(request.user!.id) as { enabled: number; secret: string | null } | undefined;
+  return { enabled: Boolean(row?.enabled), pendingSetup: Boolean(row?.secret && !row?.enabled) };
+});
 
 app.get("/api/v1/workspaces", { preHandler: requireUser }, async (request: any) => db.prepare("SELECT w.id, w.name, w.slug, w.created_at AS createdAt, w.updated_at AS updatedAt FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=? ORDER BY w.created_at DESC").all(request.user!.id));
 app.post<{ Body: { name?: string; slug?: string } }>("/api/v1/workspaces", { preHandler: requireUser }, async (request: any, reply) => {
