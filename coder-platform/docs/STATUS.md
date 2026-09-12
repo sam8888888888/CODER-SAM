@@ -1,6 +1,8 @@
 # Status implementasi
 
 ## Selesai
+- Registration, login, logout, `/me`, hashed password (scrypt), and httpOnly session cookie.
+- Workspace listing and project routes are scoped to authenticated membership.
 - Monorepo platform baru dibuat.
 - API Fastify minimal berjalan.
 - SQLite schema workspace/project/run/audit dibuat.
@@ -9,7 +11,7 @@
 - Dependency audit production: 0 vulnerabilities setelah `@fastify/static` dihapus.
 
 ## Belum selesai
-- Auth, session, RBAC, CSRF, rate limiting.
+- RBAC per route, CSRF strategy, rate limiting, MFA.
 - Prime Agent RPC adapter nyata.
 - Frontend baru dipindahkan ke apps/web.
 - Queue/run orchestration.
