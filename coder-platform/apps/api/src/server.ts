@@ -223,6 +223,16 @@ app.post<{ Params: { projectId: string }; Body: { name?: string; description?: s
   db.prepare("INSERT INTO workflows (id,project_id,name,description,steps_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id, request.params.projectId, name, description, JSON.stringify(steps), "draft", now, now);
   return reply.code(201).send({ id, projectId: request.params.projectId, name, description, steps, status: "draft", createdAt: now, updatedAt: now });
 });
+app.post<{ Params: { executionId: string }; Body: { decision?: string } }>("/api/v1/workflow-executions/:executionId/approval", { preHandler: requireUser }, async (request: any, reply) => {
+  const execution = db.prepare("SELECT e.*, p.workspace_id AS workspaceId FROM workflow_executions e JOIN projects p ON p.id=e.project_id WHERE e.id=?").get(request.params.executionId) as any;
+  if (!execution || !membershipRole(execution.workspaceId, request.user!.id)) return reply.code(404).send({ error: "EXECUTION_NOT_FOUND" });
+  if (execution.approval_status !== "pending") return reply.code(409).send({ error: "APPROVAL_NOT_PENDING" });
+  const decision = request.body?.decision; if (decision !== "approved" && decision !== "rejected") return reply.code(400).send({ error: "INVALID_DECISION" });
+  const now = new Date().toISOString(); const status = decision === "approved" ? "completed" : "failed"; const output = decision === "approved" ? JSON.stringify({ input: execution.input, approved: true }) : "";
+  db.prepare("UPDATE workflow_executions SET status=?, approval_status=?, approved_by=?, output=?, error=?, finished_at=? WHERE id=?").run(status,decision,request.user!.id,output,decision === "rejected" ? "Approval rejected" : null,now,execution.id);
+  return { id: execution.id, status, approvalStatus: decision };
+});
+
 app.get<{ Params: { workflowId: string } }>("/api/v1/workflows/:workflowId/executions", { preHandler: requireUser }, async (request: any, reply) => {
   const row = db.prepare("SELECT w.project_id AS projectId, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(request.params.workflowId) as any;
   if (!row || !membershipRole(row.workspaceId, request.user!.id)) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
@@ -234,7 +244,7 @@ app.post<{ Params: { workflowId: string }; Body: { input?: string } }>("/api/v1/
   if (row.status !== "published") return reply.code(409).send({ error: "WORKFLOW_NOT_PUBLISHED" });
   const id = randomUUID(); const now = new Date().toISOString(); const input = String(request.body?.input ?? "");
   db.prepare("INSERT INTO workflow_executions (id,workflow_id,project_id,status,input,created_at) VALUES (?,?,?,?,?,?)").run(id,row.id,row.projectId,"queued",input,now);
-  setImmediate(() => { const started = new Date().toISOString(); try { const steps = JSON.parse(row.stepsJson); const output = JSON.stringify({ input, steps, completedSteps: steps.length }); db.prepare("UPDATE workflow_executions SET status='completed', output=?, started_at=?, finished_at=? WHERE id=?").run(output,started,new Date().toISOString(),id); } catch (error) { db.prepare("UPDATE workflow_executions SET status='failed', error=?, started_at=?, finished_at=? WHERE id=?").run(String(error),started,new Date().toISOString(),id); } });
+  setImmediate(() => { const started = new Date().toISOString(); try { const steps = JSON.parse(row.stepsJson); const approval = steps.find((step: any) => step?.type === "approval"); if (approval) { db.prepare("UPDATE workflow_executions SET status='queued', approval_status='pending', started_at=? WHERE id=?").run(started,id); return; } const output = JSON.stringify({ input, steps, completedSteps: steps.length }); db.prepare("UPDATE workflow_executions SET status='completed', output=?, started_at=?, finished_at=? WHERE id=?").run(output,started,new Date().toISOString(),id); } catch (error) { db.prepare("UPDATE workflow_executions SET status='failed', error=?, started_at=?, finished_at=? WHERE id=?").run(String(error),started,new Date().toISOString(),id); } });
   return reply.code(202).send({ id, workflowId: row.id, projectId: row.projectId, status: "queued", createdAt: now });
 });
 

@@ -81,4 +81,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_project_created ON runs(project_id, created_
 CREATE INDEX IF NOT EXISTS idx_audit_workspace_created ON audit_events(workspace_id, created_at DESC);
 `);
 
+// Additive migration for workflow human approval without touching existing data.
+try { db.exec("ALTER TABLE workflow_executions ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'not_required'"); } catch {}
+try { db.exec("ALTER TABLE workflow_executions ADD COLUMN approved_by TEXT"); } catch {}
+
 export function closeDatabase() { db.close(); }
