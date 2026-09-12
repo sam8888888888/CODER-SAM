@@ -7,10 +7,11 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
 import { db } from "./db.js";
 import { MockEngine, UnconfiguredEngine, type AgentEngine } from "./engine-adapter.js";
+import { PrimeRpcEngine } from "./prime-rpc-engine.js";
 import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
 
 const app = Fastify({ logger: true, trustProxy: false });
-const engine: AgentEngine = config.MOCK_ENGINE ? new MockEngine() : new UnconfiguredEngine();
+const engine: AgentEngine = config.MOCK_ENGINE ? new MockEngine() : config.PRIME_AGENT_BIN ? new PrimeRpcEngine({ binary: config.PRIME_AGENT_BIN, rootDir: config.ENGINE_ROOT_DIR }) : new UnconfiguredEngine();
 type Subscriber = (event: { type: string; data: unknown }) => void;
 const subscribers = new Map<string, Set<Subscriber>>();
 function publishRunEvent(runId: string, type: string, data: unknown) {

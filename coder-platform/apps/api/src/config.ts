@@ -7,6 +7,8 @@ const Env = z.object({
   PUBLIC_DIR: z.string().default("./public"),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   MOCK_ENGINE: z.coerce.boolean().default(false),
+  PRIME_AGENT_BIN: z.string().optional(),
+  ENGINE_ROOT_DIR: z.string().default("./data/engine-sessions"),
 });
 
 export const config = Env.parse(process.env);

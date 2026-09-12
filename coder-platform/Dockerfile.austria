@@ -1,0 +1,12 @@
+# Build on Austria, where coder-agent-engine:0.9.4 already exists.
+FROM coder-agent-engine:0.9.4
+USER root
+WORKDIR /app
+COPY coder-platform/package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY coder-platform/dist/api ./dist/api
+COPY coder-platform/public ./public
+RUN mkdir -p /app/data /app/backups /app/engine-sessions
+ENV NODE_ENV=production HOST=0.0.0.0 PORT=3402 DATA_DIR=/app/data PUBLIC_DIR=/app/public PRIME_AGENT_BIN=prime-agent ENGINE_ROOT_DIR=/app/engine-sessions
+EXPOSE 3402
+CMD ["node", "dist/api/server.js"]

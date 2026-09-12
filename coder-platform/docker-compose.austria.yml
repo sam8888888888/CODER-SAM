@@ -1,0 +1,33 @@
+services:
+  coder-platform-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.austria
+    image: coder-platform-app:0.1.0
+    container_name: coder-platform-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:3402:3402"
+    volumes:
+      - coder-platform-data:/app/data
+      - coder-platform-backups:/app/backups
+      - coder-platform-agent-data:/root/.prime
+      - coder-platform-workspace:/workspace
+    networks:
+      - coder-net
+
+volumes:
+  coder-platform-data:
+    name: coder-platform-data
+  coder-platform-backups:
+    name: coder-platform-backups
+  coder-platform-agent-data:
+    name: coder-platform-agent-data
+  coder-platform-workspace:
+    name: coder-platform-workspace
+
+networks:
+  coder-net:
+    external: true
