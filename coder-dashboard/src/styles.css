@@ -38,3 +38,10 @@
 .step-result pre{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;color:#94a3b8;font-size:11px;max-height:180px;overflow:auto}
 .notice{margin:6px 0;color:#a5f3fc;font-size:12px;cursor:pointer}
 @media(max-width:760px){.tool-row{flex-wrap:wrap}.tool-card{width:100%;padding:20px}}
+
+.file-picker{display:inline-flex;flex-direction:column;gap:4px;font-size:11px;color:#94a3b8;border:1px dashed #38405e;border-radius:12px;padding:10px 12px;flex:1;min-width:220px}
+.file-picker input[type=file]{font-size:11px;color:#cbd5e1;background:transparent;border:0;padding:0}
+.tool-list a.download{color:#a5f3fc;font-size:12px;text-decoration:none;border:1px solid #22d3ee55;border-radius:9px;padding:8px 12px}
+.tool-list a.download:hover{background:#22d3ee18}
+.tool-list select{flex:none;padding:8px 10px}
+.notice-toast{background:#a5f3fc;color:#083344;bottom:84px}

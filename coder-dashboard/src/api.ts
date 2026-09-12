@@ -1,11 +1,15 @@
 import type { ApiError, Message, Session, User } from './types';
 export type Workspace = { id: string; name: string; slug: string };
 export type Project = { id: string; workspaceId: string; name: string; slug: string };
-export type Knowledge = { id: string; title: string; checksum: string; updatedAt: string };
 export type WorkflowStep = { id?: string; name?: string; type: 'prompt'|'condition'|'branch'|'approval'|'delay'; prompt?: string; value?: string; field?: string; op?: string; goto?: string; cases?: { field?: string; op?: string; value?: string; goto?: string }[]; default?: string; seconds?: number };
 export type Workflow = { id: string; name: string; description: string; steps: WorkflowStep[]; status: string; scheduleEnabled?: boolean; intervalMinutes?: number | null; nextRunAt?: string | null; lastRunAt?: string | null };
 export type ExecutionStep = { id: string; stepIndex: number; stepId: string; type: string; status: string; input: string; output: string; error?: string | null; startedAt?: string; finishedAt?: string };
 export type ExecutionDetail = { id: string; workflowId: string; status: string; approvalStatus: string; attempt: number; currentStep: number; input: string; output: string; error?: string | null; createdAt: string; steps: ExecutionStep[] };
+export type KnowledgeDocument = { id: string; projectId: string; title: string; sourceType: string; filename?: string | null; checksum: string; chunkCount?: number; createdAt: string; updatedAt: string };
+export type KnowledgeHit = { documentId: string; title: string; chunkIndex: number; content: string; score: number };
+export type Member = { userId: string; email: string; displayName: string; role: string; joinedAt: string };
+export type Invitation = { id: string; email: string; role: string; expiresAt: string; acceptedAt: string | null; createdAt: string };
+export type Artifact = { id: string; projectId: string; runId?: string | null; name: string; mimeType: string; sizeBytes: number; sha256: string; createdAt: string };
 export type AuditEvent = { id: string; action: string; actorUserId?: string | null; metadata: Record<string, unknown>; createdAt: string };
 export type WorkflowExecution = { id: string; workflowId: string; status: string; approvalStatus: string; attempt: number; currentStep: number; input: string; output: string; error?: string; createdAt: string };
 
@@ -26,7 +30,20 @@ export const api = {
   sessions: (projectId: string) => request<Session[]>(`/v1/projects/${projectId}/conversations`),
   createSession: (projectId: string, title = 'Percakapan baru') => request<{ conversation: Session }>(`/v1/projects/${projectId}/conversations`, { method: 'POST', body: JSON.stringify({ title }) }),
   messages: (id: string) => request<{ messages: Message[] }>(`/v1/conversations/${encodeURIComponent(id)}/messages`),
-  knowledge: (projectId: string) => request<Knowledge[]>(`/v1/projects/${projectId}/knowledge`),
+  uploadKnowledge: (projectId: string, filename: string, contentBase64: string, title?: string) => request<KnowledgeDocument>(`/v1/projects/${projectId}/knowledge/upload`, { method: 'POST', body: JSON.stringify({ filename, contentBase64, title }) }),
+  searchKnowledge: (projectId: string, query: string) => request<KnowledgeHit[]>(`/v1/projects/${projectId}/knowledge/search?q=${encodeURIComponent(query)}`),
+  document: (projectId: string, documentId: string) => request<{ document: KnowledgeDocument; chunks: { chunkIndex: number; preview: string }[] }>(`/v1/projects/${projectId}/knowledge/${documentId}`),
+  deleteKnowledge: (projectId: string, documentId: string) => request(`/v1/projects/${projectId}/knowledge/${documentId}`, { method: 'DELETE' }),
+  members: (workspaceId: string) => request<Member[]>(`/v1/workspaces/${workspaceId}/members`),
+  updateMemberRole: (workspaceId: string, userId: string, role: string) => request(`/v1/workspaces/${workspaceId}/members/${userId}`, { method: 'PATCH', body: JSON.stringify({ role }) }),
+  removeMember: (workspaceId: string, userId: string) => request(`/v1/workspaces/${workspaceId}/members/${userId}`, { method: 'DELETE' }),
+  invite: (workspaceId: string, email: string, role: string) => request<{ id: string; token: string; email: string }>(`/v1/workspaces/${workspaceId}/invitations`, { method: 'POST', body: JSON.stringify({ email, role }) }),
+  invitations: (workspaceId: string) => request<Invitation[]>(`/v1/workspaces/${workspaceId}/invitations`),
+  acceptInvitation: (token: string) => request<{ accepted: boolean; workspaceId: string; role: string }>('/v1/invitations/accept', { method: 'POST', body: JSON.stringify({ token }) }),
+  revokeInvitation: (invitationId: string) => request(`/v1/invitations/${invitationId}`, { method: 'DELETE' }),
+  artifacts: (projectId: string) => request<Artifact[]>(`/v1/projects/${projectId}/artifacts`),
+  uploadArtifact: (projectId: string, name: string, mimeType: string, contentBase64: string) => request(`/v1/projects/${projectId}/artifacts`, { method: 'POST', body: JSON.stringify({ name, mimeType, contentBase64 }) }),
+  knowledge: (projectId: string) => request<KnowledgeDocument[]>(`/v1/projects/${projectId}/knowledge`),
   addKnowledge: (projectId: string, title: string, content: string) => request(`/v1/projects/${projectId}/knowledge`, { method: 'POST', body: JSON.stringify({ title, content }) }),
   workflows: (projectId: string) => request<Workflow[]>(`/v1/projects/${projectId}/workflows`),
   addWorkflow: (projectId: string, name: string, steps: unknown[]) => request(`/v1/projects/${projectId}/workflows`, { method: 'POST', body: JSON.stringify({ name, steps }) }),

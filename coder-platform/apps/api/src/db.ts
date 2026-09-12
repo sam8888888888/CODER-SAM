@@ -140,4 +140,46 @@ COMMIT;
 }
 migrateExecutionStatuses();
 
+
+/** Rebuilds knowledge_documents so extracted document kinds (pdf, docx) are allowed as source types. */
+function migrateKnowledgeSourceTypes() {
+  const table = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='knowledge_documents'").get() as { sql: string } | undefined;
+  if (!table || table.sql.includes("docx")) return;
+  const before = (db.prepare("SELECT COUNT(*) AS total FROM knowledge_documents").get() as { total: number }).total;
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.exec(`
+BEGIN;
+CREATE TABLE knowledge_documents_new (
+ id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, title TEXT NOT NULL,
+ source_type TEXT NOT NULL CHECK(source_type IN ('text','artifact','pdf','docx','url')), content TEXT NOT NULL,
+ checksum TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, filename TEXT, chunk_count INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO knowledge_documents_new (id,project_id,title,source_type,content,checksum,created_at,updated_at,filename,chunk_count)
+ SELECT id,project_id,title,source_type,content,checksum,created_at,updated_at,filename,chunk_count FROM knowledge_documents;
+DROP TABLE knowledge_documents;
+ALTER TABLE knowledge_documents_new RENAME TO knowledge_documents;
+CREATE INDEX IF NOT EXISTS idx_knowledge_project_updated ON knowledge_documents(project_id, updated_at DESC);
+COMMIT;
+`);
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
+  const after = (db.prepare("SELECT COUNT(*) AS total FROM knowledge_documents").get() as { total: number }).total;
+  if (after !== before) throw new Error(`KNOWLEDGE_MIGRATION_LOST_ROWS:${before}->${after}`);
+}
+
+// Knowledge chunks give search and prompt context a stable granularity.
+db.exec(`CREATE TABLE IF NOT EXISTS knowledge_chunks (
+ id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+ project_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document ON knowledge_chunks(document_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(content, chunk_id UNINDEXED, document_id UNINDEXED, project_id UNINDEXED, tokenize='porter');`);
+try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN filename TEXT"); } catch {}
+try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"); } catch {}
+
+// Runs after the additive columns exist, because it copies them.
+migrateKnowledgeSourceTypes();
+
+
 export function closeDatabase() { db.close(); }

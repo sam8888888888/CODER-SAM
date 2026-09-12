@@ -5,6 +5,8 @@ import { extname, join, normalize } from "node:path";
 import { mkdirSync } from "node:fs";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
+import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
+import { extractText } from "./text-extract.js";
 import { db } from "./db.js";
 import { engine } from "./engine.js";
 import { createExecution, recordAudit, runExecution, scheduleNextRun } from "./workflow-engine.js";
@@ -152,12 +154,22 @@ app.get<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversa
   return { messages };
 });
 
-async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string) {
+type KnowledgeContext = { text: string; hits: { documentId: string; title: string; chunkIndex: number }[] };
+
+/** Wraps a user prompt with retrieved project knowledge, so answers can cite the project documents. */
+function withKnowledge(prompt: string, knowledge?: KnowledgeContext) {
+  if (!knowledge?.text) return prompt;
+  return `Gunakan konteks pengetahuan proyek berikut bila relevan. Rujuk sumbernya dengan penanda [1], [2].\n\n${knowledge.text}\n\n---\n\nPertanyaan pengguna:\n${prompt}`;
+}
+
+async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext) {
   const startedAt = new Date().toISOString();
   db.prepare("UPDATE runs SET status='running', started_at=? WHERE id=?").run(startedAt, runId);
   let text = "";
   try {
-    for await (const event of engine.run({ runId, sessionId: runId, prompt })) {
+    if (knowledge?.hits?.length) publishRunEvent(runId, "knowledge", { hits: knowledge.hits });
+    // The conversation id is the engine session id, so follow-up questions keep the earlier turns.
+    for await (const event of engine.run({ runId, sessionId: conversationId ?? runId, prompt: withKnowledge(prompt, knowledge) })) {
       if (event.type !== "completed") publishRunEvent(runId, event.type, event.data);
       if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
       if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
@@ -178,12 +190,14 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string } }>("/a
   const conversation = db.prepare("SELECT c.id, c.project_id AS projectId FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; projectId: string } | undefined;
   if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
   const runId = randomUUID(); const messageId = randomUUID(); const now = new Date().toISOString();
+  const retrieved = buildKnowledgeContext(conversation.projectId, content);
+  const knowledge: KnowledgeContext | undefined = retrieved.hits.length ? { text: retrieved.text, hits: retrieved.hits.map((hit) => ({ documentId: hit.documentId, title: hit.title, chunkIndex: hit.chunkIndex })) } : undefined;
   const transaction = db.transaction(() => {
     db.prepare("INSERT INTO runs (id,project_id,status,prompt,created_at) VALUES (?,?,?,?,?)").run(runId, conversation.projectId, "queued", content, now);
     db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(messageId, conversation.id, "user", content, runId, now);
     db.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversation.id);
   }); transaction();
-  void executeRun(runId, conversation.projectId, content, conversation.id);
+  void executeRun(runId, conversation.projectId, content, conversation.id, knowledge);
   return reply.code(202).send({ message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now }, run: { id: runId, status: "queued" } });
 });
 
@@ -242,6 +256,67 @@ app.post<{ Params: { workspaceId: string }; Body: { email?: string; role?: "owne
   db.prepare("INSERT INTO workspace_invitations (id,workspace_id,email,role,token_hash,expires_at,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)").run(id,request.params.workspaceId,email,role,createHash("sha256").update(token).digest("hex"),expires,request.user!.id,now.toISOString());
   return reply.code(201).send({ id, workspaceId: request.params.workspaceId, email, role, expiresAt: expires, token });
 });
+app.get<{ Params: { workspaceId: string } }>("/api/v1/workspaces/:workspaceId/members", { preHandler: requireUser }, async (request: any, reply) => {
+  const role = membershipRole(request.params.workspaceId, request.user!.id);
+  if (!role) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  return db.prepare(`SELECT m.user_id AS userId, u.email, u.display_name AS displayName, m.role, m.created_at AS joinedAt
+    FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.workspace_id=? ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'member' THEN 2 ELSE 3 END, u.email`).all(request.params.workspaceId);
+});
+
+/** Changes a member role. Only owners and admins may do this, and the last owner cannot be demoted. */
+app.patch<{ Params: { workspaceId: string; userId: string }; Body: { role?: string } }>("/api/v1/workspaces/:workspaceId/members/:userId", { preHandler: requireUser }, async (request: any, reply) => {
+  const actorRole = membershipRole(request.params.workspaceId, request.user!.id);
+  if (!actorRole) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (!["owner", "admin"].includes(actorRole)) return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const nextRole = String(request.body?.role ?? "");
+  if (!["owner", "admin", "member", "viewer"].includes(nextRole)) return reply.code(400).send({ error: "INVALID_ROLE" });
+  if (nextRole === "owner" && actorRole !== "owner") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const target = db.prepare("SELECT role FROM memberships WHERE workspace_id=? AND user_id=?").get(request.params.workspaceId, request.params.userId) as { role: string } | undefined;
+  if (!target) return reply.code(404).send({ error: "MEMBER_NOT_FOUND" });
+  if (target.role === "owner" && nextRole !== "owner") {
+    const owners = (db.prepare("SELECT COUNT(*) AS total FROM memberships WHERE workspace_id=? AND role='owner'").get(request.params.workspaceId) as { total: number }).total;
+    if (owners <= 1) return reply.code(409).send({ error: "LAST_OWNER_CANNOT_BE_DEMOTED" });
+  }
+  db.prepare("UPDATE memberships SET role=? WHERE workspace_id=? AND user_id=?").run(nextRole, request.params.workspaceId, request.params.userId);
+  recordAudit(request.params.workspaceId, request.user!.id, "member.role_updated", { userId: request.params.userId, from: target.role, to: nextRole });
+  return { userId: request.params.userId, role: nextRole };
+});
+
+app.delete<{ Params: { workspaceId: string; userId: string } }>("/api/v1/workspaces/:workspaceId/members/:userId", { preHandler: requireUser }, async (request: any, reply) => {
+  const actorRole = membershipRole(request.params.workspaceId, request.user!.id);
+  if (!actorRole) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (!["owner", "admin"].includes(actorRole)) return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const target = db.prepare("SELECT role FROM memberships WHERE workspace_id=? AND user_id=?").get(request.params.workspaceId, request.params.userId) as { role: string } | undefined;
+  if (!target) return reply.code(404).send({ error: "MEMBER_NOT_FOUND" });
+  if (target.role === "owner" && actorRole !== "owner") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  if (target.role === "owner") {
+    const owners = (db.prepare("SELECT COUNT(*) AS total FROM memberships WHERE workspace_id=? AND role='owner'").get(request.params.workspaceId) as { total: number }).total;
+    if (owners <= 1) return reply.code(409).send({ error: "LAST_OWNER_CANNOT_BE_REMOVED" });
+  }
+  db.prepare("DELETE FROM memberships WHERE workspace_id=? AND user_id=?").run(request.params.workspaceId, request.params.userId);
+  recordAudit(request.params.workspaceId, request.user!.id, "member.removed", { userId: request.params.userId, role: target.role });
+  return { removed: true, userId: request.params.userId };
+});
+
+app.get<{ Params: { workspaceId: string } }>("/api/v1/workspaces/:workspaceId/invitations", { preHandler: requireUser }, async (request: any, reply) => {
+  const actorRole = membershipRole(request.params.workspaceId, request.user!.id);
+  if (!actorRole) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (!["owner", "admin"].includes(actorRole)) return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  return db.prepare("SELECT id, email, role, expires_at AS expiresAt, accepted_at AS acceptedAt, created_at AS createdAt FROM workspace_invitations WHERE workspace_id=? ORDER BY created_at DESC LIMIT 100").all(request.params.workspaceId);
+});
+
+app.delete<{ Params: { invitationId: string } }>("/api/v1/invitations/:invitationId", { preHandler: requireUser }, async (request: any, reply) => {
+  const invitation = db.prepare("SELECT id, workspace_id AS workspaceId, email, accepted_at AS acceptedAt FROM workspace_invitations WHERE id=?").get(request.params.invitationId) as { id: string; workspaceId: string; email: string; acceptedAt: string | null } | undefined;
+  if (!invitation) return reply.code(404).send({ error: "INVITATION_NOT_FOUND" });
+  const actorRole = membershipRole(invitation.workspaceId, request.user!.id);
+  if (!actorRole) return reply.code(404).send({ error: "INVITATION_NOT_FOUND" });
+  if (!["owner", "admin"].includes(actorRole)) return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  if (invitation.acceptedAt) return reply.code(409).send({ error: "INVITATION_ALREADY_ACCEPTED" });
+  db.prepare("DELETE FROM workspace_invitations WHERE id=?").run(invitation.id);
+  recordAudit(invitation.workspaceId, request.user!.id, "invitation.revoked", { invitationId: invitation.id, email: invitation.email });
+  return { revoked: true, id: invitation.id };
+});
+
 app.post<{ Body: { token?: string } }>("/api/v1/invitations/accept", { preHandler: requireUser }, async (request: any, reply) => {
   const token = request.body?.token?.trim(); if (!token) return reply.code(400).send({ error: "TOKEN_REQUIRED" });
   const invitation = db.prepare("SELECT * FROM workspace_invitations WHERE token_hash=? AND accepted_at IS NULL").get(createHash("sha256").update(token).digest("hex")) as any;
@@ -393,20 +468,66 @@ app.post<{ Params: { projectId: string }; Body: { title?: string; content?: stri
   const title = request.body?.title?.trim(); const content = request.body?.content;
   if (!title || typeof content !== "string" || !content.trim() || content.length > 2_000_000) return reply.code(400).send({ error: "INVALID_KNOWLEDGE_DOCUMENT" });
   const id = randomUUID(); const now = new Date().toISOString(); const checksum = createHash("sha256").update(content).digest("hex");
-  const transaction = db.transaction(() => {
-    db.prepare("INSERT INTO knowledge_documents (id,project_id,title,source_type,content,checksum,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id,request.params.projectId,title,"text",content,checksum,now,now);
-    db.prepare("INSERT INTO knowledge_search (title,content,document_id) VALUES (?,?,?)").run(title,content,id);
-  }); transaction();
-  return reply.code(201).send({ id, projectId: request.params.projectId, title, sourceType: "text", checksum, createdAt: now, updatedAt: now });
+  db.prepare("INSERT INTO knowledge_documents (id,project_id,title,source_type,content,checksum,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id,request.params.projectId,title,"text",content,checksum,now,now);
+  db.prepare("INSERT INTO knowledge_search (title,content,document_id) VALUES (?,?,?)").run(title,content,id);
+  const chunkCount = indexDocument(id, request.params.projectId, `${title}\n\n${content}`);
+  return reply.code(201).send({ id, projectId: request.params.projectId, title, sourceType: "text", checksum, chunkCount, createdAt: now, updatedAt: now });
 });
 app.get<{ Params: { projectId: string }; Querystring: { q?: string; limit?: string } }>("/api/v1/projects/:projectId/knowledge/search", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
-  const q = request.query?.q?.trim(); const limit = Math.min(Math.max(Number(request.query?.limit ?? 10) || 10, 1), 50);
-  if (!q) return reply.code(400).send({ error: "QUERY_REQUIRED" });
-  const rows = db.prepare("SELECT d.id, d.title, d.project_id AS projectId, snippet(knowledge_search, 1, '<mark>', '</mark>', '…', 24) AS snippet FROM knowledge_search JOIN knowledge_documents d ON d.id=knowledge_search.document_id WHERE d.project_id=? AND knowledge_search MATCH ? ORDER BY rank LIMIT ?").all(request.params.projectId, q.replace(/[\"']/g, " "), limit);
-  return { query: q, results: rows };
+  const q = request.query?.q?.trim(); if (!q) return reply.code(400).send({ error: "QUERY_REQUIRED" });
+  const limit = Math.min(Math.max(Number(request.query?.limit ?? 8) || 8, 1), 20);
+  return searchChunks(request.params.projectId, q, limit);
 });
+
+/** Uploads a document (txt, md, csv, json, pdf, docx) as Base64, extracts the text and indexes chunks. */
+app.post<{ Params: { projectId: string }; Body: { title?: string; filename?: string; contentBase64?: string } }>("/api/v1/projects/:projectId/knowledge/upload", { preHandler: requireUser }, async (request: any, reply) => {
+  const project = db.prepare("SELECT p.workspace_id AS workspaceId FROM projects p WHERE p.id=?").get(request.params.projectId) as { workspaceId: string } | undefined;
+  const role = project ? membershipRole(project.workspaceId, request.user!.id) : undefined;
+  if (!role) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  if (role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const filename = String(request.body?.filename ?? "").trim();
+  const base64 = request.body?.contentBase64;
+  if (!filename || typeof base64 !== "string" || !base64) return reply.code(400).send({ error: "INVALID_UPLOAD" });
+  if (!/^[A-Za-z0-9+/=]+$/.test(base64)) return reply.code(400).send({ error: "INVALID_BASE64" });
+  const buffer = Buffer.from(base64, "base64");
+  if (!buffer.length || buffer.length > 10 * 1024 * 1024) return reply.code(400).send({ error: "FILE_TOO_LARGE" });
+  let extracted;
+  try { extracted = await extractText(buffer, filename); }
+  catch (error) { return reply.code(400).send({ error: String((error as Error).message || "EXTRACTION_FAILED") }); }
+  if (!extracted.text.trim()) return reply.code(400).send({ error: "DOCUMENT_HAS_NO_TEXT" });
+  const title = request.body?.title?.trim() || filename;
+  const id = randomUUID(); const now = new Date().toISOString(); const checksum = contentChecksum(extracted.text);
+  const duplicate = db.prepare("SELECT id, title FROM knowledge_documents WHERE project_id=? AND checksum=?").get(request.params.projectId, checksum) as { id: string; title: string } | undefined;
+  if (duplicate) return reply.code(409).send({ error: "DOCUMENT_ALREADY_EXISTS", documentId: duplicate.id, title: duplicate.title });
+  db.prepare("INSERT INTO knowledge_documents (id,project_id,title,source_type,content,checksum,filename,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").run(id, request.params.projectId, title, extracted.kind, extracted.text, checksum, filename, now, now);
+  db.prepare("INSERT INTO knowledge_search (title,content,document_id) VALUES (?,?,?)").run(title, extracted.text, id);
+  const chunkCount = indexDocument(id, request.params.projectId, `${title}\n\n${extracted.text}`);
+  recordAudit(project!.workspaceId, request.user!.id, "knowledge.document.uploaded", { documentId: id, filename, kind: extracted.kind, chunkCount, bytes: buffer.length });
+  return reply.code(201).send({ id, projectId: request.params.projectId, title, sourceType: extracted.kind, filename, checksum, chunkCount, characters: extracted.text.length, createdAt: now, updatedAt: now });
+});
+
+app.get<{ Params: { projectId: string; documentId: string } }>("/api/v1/projects/:projectId/knowledge/:documentId", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const document = db.prepare("SELECT id, project_id AS projectId, title, source_type AS sourceType, filename, checksum, chunk_count AS chunkCount, length(content) AS characters, created_at AS createdAt, updated_at AS updatedAt FROM knowledge_documents WHERE id=? AND project_id=?").get(request.params.documentId, request.params.projectId);
+  if (!document) return reply.code(404).send({ error: "DOCUMENT_NOT_FOUND" });
+  const chunks = db.prepare("SELECT chunk_index AS chunkIndex, substr(content, 1, 400) AS preview FROM knowledge_chunks WHERE document_id=? ORDER BY chunk_index LIMIT 50").all(request.params.documentId);
+  return { document, chunks };
+});
+
+app.delete<{ Params: { projectId: string; documentId: string } }>("/api/v1/projects/:projectId/knowledge/:documentId", { preHandler: requireUser }, async (request: any, reply) => {
+  const project = db.prepare("SELECT p.workspace_id AS workspaceId FROM projects p WHERE p.id=?").get(request.params.projectId) as { workspaceId: string } | undefined;
+  const role = project ? membershipRole(project.workspaceId, request.user!.id) : undefined;
+  if (!role) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  if (role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const existing = db.prepare("SELECT id FROM knowledge_documents WHERE id=? AND project_id=?").get(request.params.documentId, request.params.projectId);
+  if (!existing) return reply.code(404).send({ error: "DOCUMENT_NOT_FOUND" });
+  deleteDocument(request.params.documentId);
+  recordAudit(project!.workspaceId, request.user!.id, "knowledge.document.deleted", { documentId: request.params.documentId });
+  return { deleted: true, id: request.params.documentId };
+});;
 
 app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/artifacts", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);

@@ -110,5 +110,38 @@ check("audit records approval decision", actions.includes("workflow.execution.ap
 check("audit records cancel", actions.includes("workflow.execution.cancel_requested"), JSON.stringify(actions.slice(0, 8)));
 check("audit records schedule change", actions.includes("workflow.schedule.updated"), JSON.stringify(actions.slice(0, 8)));
 
+// Knowledge base: upload, index, search, delete
+const token = `TOKEN-${Date.now()}`;
+const document = await call("POST", `/api/v1/projects/${projectId}/knowledge/upload`, {
+  filename: "catatan-live.txt",
+  contentBase64: Buffer.from(`Catatan rilis produksi.\n\n${"Baris pengisi untuk pengujian chunking dokumen produksi. ".repeat(60)}\n\nToken produksi adalah ${token}.`).toString("base64"),
+});
+check("knowledge upload works", document.status === 201 && document.json.chunkCount > 1, JSON.stringify(document.json)?.slice(0, 200));
+const knowledgeSearch = await call("GET", `/api/v1/projects/${projectId}/knowledge/search?q=${encodeURIComponent(token)}`);
+check("knowledge search finds the uploaded text", Array.isArray(knowledgeSearch.json) && knowledgeSearch.json.some((hit) => hit.content.includes(token)), JSON.stringify(knowledgeSearch.json)?.slice(0, 200));
+const duplicateDocument = await call("POST", `/api/v1/projects/${projectId}/knowledge/upload`, {
+  filename: "catatan-live.txt",
+  contentBase64: Buffer.from(`Catatan rilis produksi.\n\n${"Baris pengisi untuk pengujian chunking dokumen produksi. ".repeat(60)}\n\nToken produksi adalah ${token}.`).toString("base64"),
+});
+check("duplicate knowledge upload rejected", duplicateDocument.status === 409, JSON.stringify(duplicateDocument.json));
+const documentDetail = await call("GET", `/api/v1/projects/${projectId}/knowledge/${document.json.id}`);
+check("knowledge document detail exposes chunks", documentDetail.status === 200 && documentDetail.json.chunks.length > 0, JSON.stringify(documentDetail.json)?.slice(0, 160));
+const documentDelete = await call("DELETE", `/api/v1/projects/${projectId}/knowledge/${document.json.id}`);
+check("knowledge document deleted", documentDelete.status === 200 && documentDelete.json.deleted === true, JSON.stringify(documentDelete.json));
+const searchAfterDelete = await call("GET", `/api/v1/projects/${projectId}/knowledge/search?q=${encodeURIComponent(token)}`);
+check("deleted knowledge leaves no search hit", Array.isArray(searchAfterDelete.json) && !searchAfterDelete.json.some((hit) => hit.content.includes(token)), JSON.stringify(searchAfterDelete.json)?.slice(0, 160));
+
+// Team: members, invitation, revoke
+const members = await call("GET", `/api/v1/workspaces/${workspaceId}/members`);
+check("member list works", members.status === 200 && members.json.some((member) => member.role === "owner"), JSON.stringify(members.json)?.slice(0, 200));
+const invite = await call("POST", `/api/v1/workspaces/${workspaceId}/invitations`, { email: `smoke-${Date.now()}@example.test`, role: "viewer" });
+check("invitation created", invite.status === 201 && Boolean(invite.json.token), JSON.stringify(invite.json)?.slice(0, 160));
+const inviteList = await call("GET", `/api/v1/workspaces/${workspaceId}/invitations`);
+check("invitation listed", inviteList.status === 200 && inviteList.json.some((row) => row.id === invite.json.id), JSON.stringify(inviteList.json)?.slice(0, 160));
+const revoke = await call("DELETE", `/api/v1/invitations/${invite.json.id}`);
+check("invitation revoked", revoke.status === 200 && revoke.json.revoked === true, JSON.stringify(revoke.json));
+const artifacts = await call("GET", `/api/v1/projects/${projectId}/artifacts`);
+check("artifact list works", artifacts.status === 200 && Array.isArray(artifacts.json), JSON.stringify(artifacts.json)?.slice(0, 160));
+
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

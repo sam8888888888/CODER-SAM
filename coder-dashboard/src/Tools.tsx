@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, type AuditEvent, type ExecutionDetail, type Knowledge, type Workflow, type WorkflowExecution, type WorkflowStep } from './api';
+import { api, type Artifact, type AuditEvent, type ExecutionDetail, type Invitation, type KnowledgeDocument, type KnowledgeHit, type Member, type Workflow, type WorkflowExecution, type WorkflowStep } from './api';
 
 const STEP_TYPES: WorkflowStep['type'][] = ['prompt', 'condition', 'branch', 'approval', 'delay'];
 const TERMINAL = ['completed', 'failed', 'cancelled'];
@@ -14,12 +14,15 @@ function newStep(type: WorkflowStep['type']): WorkflowStep {
 }
 
 export function Tools({ projectId, workspaceId, onClose }: { projectId: string; workspaceId: string | null; onClose: () => void }) {
-  const [tab, setTab] = useState<'knowledge' | 'workflow' | 'audit'>('knowledge');
+  const [tab, setTab] = useState<'knowledge' | 'workflow' | 'team' | 'artifacts' | 'audit'>('knowledge');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
 
   // Knowledge base state
-  const [documents, setDocuments] = useState<Knowledge[]>([]);
+  const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [hits, setHits] = useState<KnowledgeHit[]>([]);
+  const [query, setQuery] = useState('');
   const [docTitle, setDocTitle] = useState('');
   const [docContent, setDocContent] = useState('');
 
@@ -32,6 +35,16 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
   const [executionDetail, setExecutionDetail] = useState<ExecutionDetail | null>(null);
   const [runInput, setRunInput] = useState('');
   const [intervalMinutes, setIntervalMinutes] = useState(60);
+
+  // Team state
+  const [members, setMembers] = useState<Member[]>([]);
+  const [invitations, setInvitations] = useState<Invitation[]>([]);
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteRole, setInviteRole] = useState('member');
+  const [inviteLink, setInviteLink] = useState('');
+
+  // Artifact state
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
 
   // Audit state
   const [audit, setAudit] = useState<AuditEvent[]>([]);
@@ -50,8 +63,39 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
   async function loadKnowledge() { setDocuments(await api.knowledge(projectId)); }
   async function loadWorkflows() { setWorkflows(await api.workflows(projectId)); }
   async function loadAudit() { if (workspaceId) setAudit(await api.auditEvents(workspaceId)); }
+  async function loadTeam() { if (!workspaceId) return; setMembers(await api.members(workspaceId)); setInvitations(await api.invitations(workspaceId)); }
+  async function loadArtifacts() { setArtifacts(await api.artifacts(projectId)); }
 
-  useEffect(() => { void guard(async () => { if (tab === 'knowledge') await loadKnowledge(); else if (tab === 'workflow') await loadWorkflows(); else await loadAudit(); }); }, [tab, projectId, workspaceId]);
+  /** Reads a picked file as Base64 and uploads it as a knowledge document. */
+  async function uploadDocument(file: File) {
+    setUploading(true); setMessage('');
+    try {
+      const base64 = await readBase64(file);
+      const created = await api.uploadKnowledge(projectId, file.name, base64);
+      await loadKnowledge();
+      setMessage(`${created.title} tersimpan (${created.chunkCount ?? 0} bagian, ${created.sourceType}).`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+    finally { setUploading(false); }
+  }
+
+  async function uploadArtifactFile(file: File) {
+    setUploading(true); setMessage('');
+    try {
+      await api.uploadArtifact(projectId, file.name, file.type || 'application/octet-stream', await readBase64(file));
+      await loadArtifacts(); setMessage(`${file.name} diunggah sebagai artifact.`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+    finally { setUploading(false); }
+  }
+
+  useEffect(() => {
+    void guard(async () => {
+      if (tab === 'knowledge') await loadKnowledge();
+      else if (tab === 'workflow') await loadWorkflows();
+      else if (tab === 'team') await loadTeam();
+      else if (tab === 'artifacts') await loadArtifacts();
+      else await loadAudit();
+    });
+  }, [tab, projectId, workspaceId]);
 
   function pickWorkflow(workflow: Workflow) {
     setSelectedId(workflow.id);
@@ -74,19 +118,45 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
 
   const knowledgeTab = (
     <div className="tool-body">
+      <div className="tool-row wrap">
+        <label className="file-picker">Pilih dokumen (txt, md, csv, json, pdf, docx)
+          <input type="file" accept=".txt,.md,.markdown,.csv,.tsv,.json,.log,.yaml,.yml,.pdf,.docx" disabled={uploading} onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadDocument(file); event.target.value = ''; }} />
+        </label>
+        {uploading && <small>Mengunggah dan mengekstrak…</small>}
+      </div>
       <div className="tool-row">
-        <input value={docTitle} onChange={(event) => setDocTitle(event.target.value)} placeholder="Judul dokumen" />
+        <input value={docTitle} onChange={(event) => setDocTitle(event.target.value)} placeholder="Judul dokumen teks" />
         <button type="button" className="primary" disabled={busy || !docTitle.trim()} onClick={() => void guard(async () => {
           await api.addKnowledge(projectId, docTitle.trim(), docContent);
-          setDocTitle(''); setDocContent(''); await loadKnowledge(); setMessage('Dokumen tersimpan.');
-        })}>Simpan dokumen</button>
+          setDocTitle(''); setDocContent(''); await loadKnowledge(); setMessage('Catatan teks tersimpan dan diindeks.');
+        })}>Simpan catatan</button>
       </div>
-      <textarea value={docContent} onChange={(event) => setDocContent(event.target.value)} rows={5} placeholder="Isi dokumen (teks)" />
+      <textarea value={docContent} onChange={(event) => setDocContent(event.target.value)} rows={4} placeholder="Isi catatan teks (juga dipakai sebagai konteks AI)" />
+      <div className="tool-row">
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Cari di knowledge base" />
+        <button type="button" disabled={busy || !query.trim()} onClick={() => void guard(async () => setHits(await api.searchKnowledge(projectId, query.trim())))}>Cari</button>
+      </div>
+      {hits.length > 0 && (
+        <div className="tool-list">
+          {hits.map((hit) => (
+            <div key={`${hit.documentId}-${hit.chunkIndex}`}>
+              <b>{hit.title} · bagian {hit.chunkIndex + 1}</b>
+              <small>{hit.content.slice(0, 220)}…</small>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="tool-list">
         {documents.map((document) => (
-          <div key={document.id}><b>{document.title}</b><small>{String(document.checksum).slice(0, 12)}…</small></div>
+          <div key={document.id}>
+            <b>{document.title}</b>
+            <small>{document.sourceType} · {document.chunkCount ?? 0} bagian · {String(document.checksum).slice(0, 10)}…</small>
+            <button type="button" disabled={busy} onClick={() => void guard(async () => {
+              await api.deleteKnowledge(projectId, document.id); await loadKnowledge(); setMessage('Dokumen dihapus.');
+            })}>Hapus</button>
+          </div>
         ))}
-        {!documents.length && <small>Belum ada dokumen.</small>}
+        {!documents.length && <small>Belum ada dokumen. Unggah PDF, DOCX, atau teks.</small>}
       </div>
     </div>
   );
@@ -233,6 +303,72 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
     </div>
   );
 
+  const teamTab = (
+    <div className="tool-body">
+      <div className="tool-row wrap">
+        <input value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="email anggota baru" />
+        <select value={inviteRole} onChange={(event) => setInviteRole(event.target.value)}>
+          {['owner', 'admin', 'member', 'viewer'].map((role) => <option key={role} value={role}>{role}</option>)}
+        </select>
+        <button type="button" className="primary" disabled={busy || !inviteEmail.trim()} onClick={() => void guard(async () => {
+          const invitation = await api.invite(workspaceId!, inviteEmail.trim(), inviteRole);
+          setInviteEmail(''); await loadTeam();
+          setInviteLink(`${location.origin}/?invitation=${invitation.token}`);
+          setMessage('Undangan dibuat. Kirim tautan di bawah ke anggota.');
+        })}>Undang</button>
+      </div>
+      {inviteLink && <div className="tool-row"><input readOnly value={inviteLink} /><button type="button" onClick={() => void navigator.clipboard?.writeText(inviteLink)}>Salin</button></div>}
+      <div className="tool-list">
+        {members.map((member) => (
+          <div key={member.userId}>
+            <b>{member.displayName}</b>
+            <small>{member.email}</small>
+            <select value={member.role} disabled={busy} onChange={(event) => void guard(async () => {
+              await api.updateMemberRole(workspaceId!, member.userId, event.target.value); await loadTeam(); setMessage('Peran diperbarui.');
+            })}>
+              {['owner', 'admin', 'member', 'viewer'].map((role) => <option key={role} value={role}>{role}</option>)}
+            </select>
+            <button type="button" disabled={busy} onClick={() => void guard(async () => {
+              await api.removeMember(workspaceId!, member.userId); await loadTeam(); setMessage('Anggota dihapus.');
+            })}>Keluarkan</button>
+          </div>
+        ))}
+      </div>
+      <div className="tool-list">
+        {invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => (
+          <div key={invitation.id}>
+            <b>{invitation.email}</b>
+            <small>{invitation.role} · kedaluwarsa {new Date(invitation.expiresAt).toLocaleDateString('id-ID')}</small>
+            <button type="button" disabled={busy} onClick={() => void guard(async () => {
+              await api.revokeInvitation(invitation.id); await loadTeam(); setMessage('Undangan dibatalkan.');
+            })}>Batalkan</button>
+          </div>
+        ))}
+        {!invitations.length && <small>Belum ada undangan aktif.</small>}
+      </div>
+    </div>
+  );
+
+  const artifactTab = (
+    <div className="tool-body">
+      <div className="tool-row wrap">
+        <label className="file-picker">Unggah artifact
+          <input type="file" disabled={uploading} onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadArtifactFile(file); event.target.value = ''; }} />
+        </label>
+      </div>
+      <div className="tool-list">
+        {artifacts.map((artifact) => (
+          <div key={artifact.id}>
+            <b>{artifact.name}</b>
+            <small>{artifact.mimeType} · {(artifact.sizeBytes / 1024).toFixed(1)} KB · {artifact.sha256.slice(0, 10)}…</small>
+            <a className="download" href={`/api/v1/artifacts/${artifact.id}/download`} target="_blank" rel="noreferrer">Unduh</a>
+          </div>
+        ))}
+        {!artifacts.length && <small>Belum ada artifact di project ini.</small>}
+      </div>
+    </div>
+  );
+
   const auditTab = (
     <div className="tool-body">
       <div className="tool-list">
@@ -252,11 +388,13 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
         <div className="tool-tabs">
           <button type="button" className={tab === 'knowledge' ? 'active' : ''} onClick={() => setTab('knowledge')}>Knowledge</button>
           <button type="button" className={tab === 'workflow' ? 'active' : ''} onClick={() => setTab('workflow')}>Workflow</button>
+          <button type="button" className={tab === 'team' ? 'active' : ''} onClick={() => setTab('team')}>Tim</button>
+          <button type="button" className={tab === 'artifacts' ? 'active' : ''} onClick={() => setTab('artifacts')}>Artifact</button>
           <button type="button" className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>Audit</button>
         </div>
-        <h2>{tab === 'knowledge' ? 'Knowledge Base' : tab === 'workflow' ? 'Workflow Builder' : 'Audit Workspace'}</h2>
+        <h2>{tab === 'knowledge' ? 'Knowledge Base' : tab === 'workflow' ? 'Workflow Builder' : tab === 'team' ? 'Tim Workspace' : tab === 'artifacts' ? 'Artifact Project' : 'Audit Workspace'}</h2>
         {message && <p className="notice" onClick={() => setMessage('')}>{message}</p>}
-        {tab === 'knowledge' ? knowledgeTab : tab === 'workflow' ? workflowTab : auditTab}
+        {tab === 'knowledge' ? knowledgeTab : tab === 'workflow' ? workflowTab : tab === 'team' ? teamTab : tab === 'artifacts' ? artifactTab : auditTab}
       </section>
     </div>
   );
@@ -279,5 +417,15 @@ function patchCaseSteps(steps: WorkflowStep[], index: number, caseIndex: number,
     const cases = [...(step.cases ?? [])];
     cases[caseIndex] = { ...cases[caseIndex], ...patch };
     return { ...step, cases };
+  });
+}
+
+/** Reads a File as Base64 without the data URL prefix. */
+function readBase64(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => { const result = String(reader.result ?? ''); resolve(result.includes(',') ? result.split(',')[1] : result); };
+    reader.onerror = () => reject(new Error('FILE_READ_FAILED'));
+    reader.readAsDataURL(file);
   });
 }
