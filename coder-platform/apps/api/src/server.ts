@@ -223,6 +223,21 @@ app.post<{ Params: { projectId: string }; Body: { name?: string; description?: s
   db.prepare("INSERT INTO workflows (id,project_id,name,description,steps_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id, request.params.projectId, name, description, JSON.stringify(steps), "draft", now, now);
   return reply.code(201).send({ id, projectId: request.params.projectId, name, description, steps, status: "draft", createdAt: now, updatedAt: now });
 });
+app.get<{ Params: { workflowId: string } }>("/api/v1/workflows/:workflowId/executions", { preHandler: requireUser }, async (request: any, reply) => {
+  const row = db.prepare("SELECT w.project_id AS projectId, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(request.params.workflowId) as any;
+  if (!row || !membershipRole(row.workspaceId, request.user!.id)) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  return db.prepare("SELECT id, workflow_id AS workflowId, project_id AS projectId, status, input, output, error, started_at AS startedAt, finished_at AS finishedAt, created_at AS createdAt FROM workflow_executions WHERE workflow_id=? ORDER BY created_at DESC").all(request.params.workflowId);
+});
+app.post<{ Params: { workflowId: string }; Body: { input?: string } }>("/api/v1/workflows/:workflowId/execute", { preHandler: requireUser }, async (request: any, reply) => {
+  const row = db.prepare("SELECT w.id, w.project_id AS projectId, w.steps_json AS stepsJson, w.status, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(request.params.workflowId) as any;
+  if (!row || !membershipRole(row.workspaceId, request.user!.id)) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  if (row.status !== "published") return reply.code(409).send({ error: "WORKFLOW_NOT_PUBLISHED" });
+  const id = randomUUID(); const now = new Date().toISOString(); const input = String(request.body?.input ?? "");
+  db.prepare("INSERT INTO workflow_executions (id,workflow_id,project_id,status,input,created_at) VALUES (?,?,?,?,?,?)").run(id,row.id,row.projectId,"queued",input,now);
+  setImmediate(() => { const started = new Date().toISOString(); try { const steps = JSON.parse(row.stepsJson); const output = JSON.stringify({ input, steps, completedSteps: steps.length }); db.prepare("UPDATE workflow_executions SET status='completed', output=?, started_at=?, finished_at=? WHERE id=?").run(output,started,new Date().toISOString(),id); } catch (error) { db.prepare("UPDATE workflow_executions SET status='failed', error=?, started_at=?, finished_at=? WHERE id=?").run(String(error),started,new Date().toISOString(),id); } });
+  return reply.code(202).send({ id, workflowId: row.id, projectId: row.projectId, status: "queued", createdAt: now });
+});
+
 app.post<{ Params: { workflowId: string } }>("/api/v1/workflows/:workflowId/publish", { preHandler: requireUser }, async (request: any, reply) => {
   const row = db.prepare("SELECT w.id, w.project_id AS projectId, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(request.params.workflowId) as any;
   const role = row ? membershipRole(row.workspaceId, request.user!.id) : undefined;
