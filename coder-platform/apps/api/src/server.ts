@@ -228,8 +228,10 @@ app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/conversa
   return db.prepare("SELECT id, project_id AS projectId, title, pinned, created_at AS createdAt, updated_at AS updatedAt FROM conversations WHERE project_id=? ORDER BY pinned DESC, updated_at DESC").all(request.params.projectId);
 });
 app.post<{ Params: { projectId: string }; Body: { title?: string } }>("/api/v1/projects/:projectId/conversations", { preHandler: requireUser }, async (request: any, reply) => {
-  const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
+  const allowed = db.prepare("SELECT m.role AS role FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id) as { role: string } | undefined;
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  // Read-only members may not add content to a project.
+  if (allowed.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
   const title = request.body?.title?.trim() || "New conversation"; const id = randomUUID(); const now = new Date().toISOString();
   db.prepare("INSERT INTO conversations (id,project_id,title,created_at,updated_at) VALUES (?,?,?,?,?)").run(id,request.params.projectId,title,now,now);
   return reply.code(201).send({ conversation: { id, projectId: request.params.projectId, title, createdAt: now, updatedAt: now } });
@@ -659,8 +661,9 @@ app.delete<{ Params: { projectId: string; documentId: string } }>("/api/v1/proje
 });;
 
 app.patch<{ Params: { conversationId: string }; Body: { title?: string; pinned?: boolean } }>("/api/v1/conversations/:conversationId", { preHandler: requireUser }, async (request: any, reply) => {
-  const conversation = db.prepare("SELECT c.id, c.title, c.pinned FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; title: string; pinned: number } | undefined;
+  const conversation = db.prepare("SELECT c.id, c.title, c.pinned, m.role AS role FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; title: string; pinned: number; role: string } | undefined;
   if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  if (conversation.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
   const title = request.body?.title === undefined ? conversation.title : String(request.body.title).trim().slice(0, 120);
   if (!title) return reply.code(400).send({ error: "INVALID_TITLE" });
   const pinned = request.body?.pinned === undefined ? conversation.pinned : request.body.pinned ? 1 : 0;
@@ -669,8 +672,9 @@ app.patch<{ Params: { conversationId: string }; Body: { title?: string; pinned?:
 });
 
 app.delete<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversationId", { preHandler: requireUser }, async (request: any, reply) => {
-  const conversation = db.prepare("SELECT c.id, p.workspace_id AS workspaceId FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; workspaceId: string } | undefined;
+  const conversation = db.prepare("SELECT c.id, p.workspace_id AS workspaceId, m.role AS role FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; workspaceId: string; role: string } | undefined;
   if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  if (conversation.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
   db.transaction(() => {
     db.prepare("DELETE FROM messages WHERE conversation_id=?").run(conversation.id);
     db.prepare("DELETE FROM conversations WHERE id=?").run(conversation.id);
