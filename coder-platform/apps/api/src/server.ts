@@ -6,6 +6,7 @@ import { extname, join, normalize } from "node:path";
 import { mkdirSync } from "node:fs";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
+import { estimateCostMicros } from "./model-prices.js";
 import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
 import { extractText } from "./text-extract.js";
 import { generateTotpSecret, otpAuthUrl, verifyTotp } from "./totp.js";
@@ -251,10 +252,15 @@ function recordRunUsage(runId: string, projectId: string, prompt: string, answer
   const hasTokens = typeof reported?.inputTokens === "number" || typeof reported?.outputTokens === "number";
   const inputTokens = hasTokens ? Math.round(reported.inputTokens ?? 0) : Math.ceil(prompt.length / 4);
   const outputTokens = hasTokens ? Math.round(reported.outputTokens ?? 0) : Math.ceil(answer.length / 4);
-  const costMicros = typeof reported?.costMicros === "number" ? Math.round(reported.costMicros) : null;
+  const cacheReadTokens = hasTokens ? Math.round(reported.cacheReadTokens ?? 0) : 0;
+  const cacheWriteTokens = hasTokens ? Math.round(reported.cacheWriteTokens ?? 0) : 0;
+  const totalTokens = typeof reported?.totalTokens === "number" ? Math.round(reported.totalTokens) : inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
   const model = typeof reported?.model === "string" ? reported.model : (config.PRIME_AGENT_MODEL ?? null);
-  db.prepare("INSERT INTO run_usage (id,run_id,project_id,model,provider,input_tokens,output_tokens,cost_micros,estimated,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
-    .run(randomUUID(), runId, projectId, model, config.PRIME_AGENT_PROVIDER ?? null, inputTokens, outputTokens, costMicros, hasTokens ? 0 : 1, reported ? JSON.stringify(reported.raw ?? null).slice(0, 4000) : null, new Date().toISOString());
+  // Cost is only reported when the engine sent real tokens; the price table resolves the rest.
+  const costMicros = hasTokens ? (typeof reported?.costMicros === "number" ? Math.round(reported.costMicros) : estimateCostMicros(model, { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens })) : null;
+  const provider = model ? providerForModel(model) : config.PRIME_AGENT_PROVIDER ?? null;
+  db.prepare("INSERT INTO run_usage (id,run_id,project_id,model,provider,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost_micros,estimated,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run(randomUUID(), runId, projectId, model, provider, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, costMicros, hasTokens ? 0 : 1, reported ? JSON.stringify(reported.raw ?? null).slice(0, 4000) : null, new Date().toISOString());
 }
 
 async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext, model?: string) {
@@ -688,10 +694,18 @@ app.get<{ Params: { projectId: string }; Querystring: { days?: string } }>("/api
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
   const days = Math.min(Math.max(Number(request.query?.days ?? 30) || 30, 1), 365);
   const since = new Date(Date.now() - days * 86_400_000).toISOString();
-  const totals = db.prepare("SELECT COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cost_micros),0) AS costMicros, COALESCE(SUM(estimated),0) AS estimatedRuns FROM run_usage WHERE project_id=? AND created_at>=?").get(request.params.projectId, since);
-  const byModel = db.prepare("SELECT COALESCE(model,'unknown') AS model, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cost_micros),0) AS costMicros FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY COALESCE(model,'unknown') ORDER BY runs DESC").all(request.params.projectId, since);
-  const daily = db.prepare("SELECT substr(created_at,1,10) AS day, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day DESC LIMIT 60").all(request.params.projectId, since);
-  return { days, since, totals, byModel, daily };
+  const totals = db.prepare("SELECT COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens, COALESCE(SUM(cache_write_tokens),0) AS cacheWriteTokens, COALESCE(SUM(total_tokens),0) AS totalTokens, COALESCE(SUM(cost_micros),0) AS costMicros, COALESCE(SUM(estimated),0) AS estimatedRuns, COUNT(*) - COALESCE(SUM(estimated),0) AS measuredRuns, SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END) AS unpricedRuns FROM run_usage WHERE project_id=? AND created_at>=?").get(request.params.projectId, since) as any;
+  const byModel = db.prepare("SELECT COALESCE(model,'unknown') AS model, COALESCE(provider,'unknown') AS provider, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens, COALESCE(SUM(cost_micros),0) AS costMicros FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY COALESCE(model,'unknown'), COALESCE(provider,'unknown') ORDER BY runs DESC").all(request.params.projectId, since) as any[];
+  const daily = db.prepare("SELECT substr(created_at,1,10) AS day, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cost_micros),0) AS costMicros FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day DESC LIMIT 60").all(request.params.projectId, since) as any[];
+  // Keeps sub-cent costs visible: eight decimal places of a US dollar.
+  const toUsd = (micros: number | null | undefined) => Number(((micros ?? 0) / 1e6).toFixed(8));
+  return {
+    days, since,
+    totals: { ...totals, costUsd: toUsd(totals.costMicros) },
+    byModel: byModel.map((row) => ({ ...row, costUsd: toUsd(row.costMicros) })),
+    daily: daily.map((row) => ({ ...row, costUsd: toUsd(row.costMicros) })),
+    note: "Tokens come from the engine; runs without engine tokens are estimated from text length (estimatedRuns). Cost uses the published price table and stays null when the model price is unknown (unpricedRuns).",
+  };
 });
 
 /** Runs the engine CLI once and returns its model catalogue. Never invents models. */

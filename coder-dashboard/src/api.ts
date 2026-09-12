@@ -60,7 +60,12 @@ export const api = {
   exportSession: (id: string) => request<{ format: string; conversation: { title: string }; messages: Message[] }>(`/v1/conversations/${encodeURIComponent(id)}/export`),
   importSession: (projectId: string, payload: { title: string; messages: Message[] }) => request<{ conversation: { id: string; title: string } }>(`/v1/projects/${projectId}/conversations/import`, { method: 'POST', body: JSON.stringify({ conversation: payload }) }),
   cancelRun: (runId: string) => request(`/v1/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }),
-  usage: (projectId: string, days = 30) => request<{ totals: { runs: number; inputTokens: number; outputTokens: number; costMicros: number; estimatedRuns: number }; byModel: { model: string; runs: number; inputTokens: number; outputTokens: number; costMicros: number }[]; daily: { day: string; runs: number; inputTokens: number; outputTokens: number }[] }>(`/v1/projects/${projectId}/usage?days=${days}`),
+  usage: (projectId: string, days = 30) => request<{
+    totals: { runs: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; totalTokens: number; costMicros: number; costUsd: number; estimatedRuns: number; measuredRuns: number; unpricedRuns: number | null };
+    byModel: { model: string; provider: string; runs: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; costMicros: number; costUsd: number }[];
+    daily: { day: string; runs: number; inputTokens: number; outputTokens: number; costUsd: number }[];
+    note: string;
+  }>(`/v1/projects/${projectId}/usage?days=${days}`),
   auditEvents: (workspaceId: string) => request<AuditEvent[]>(`/v1/workspaces/${workspaceId}/audit`),
   decideApproval: (executionId: string, decision: 'approved'|'rejected') => request(`/v1/workflow-executions/${executionId}/approval`, { method: 'POST', body: JSON.stringify({ decision }) }),
   sendMessage: (id: string, content: string, model?: string) => request<{ message: Message; run: { id: string } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content, model }) }),

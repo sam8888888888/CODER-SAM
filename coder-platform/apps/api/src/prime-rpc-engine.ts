@@ -2,7 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { AgentEngine, EngineEvent, EngineRunRequest } from "./engine-adapter.js";
+import type { AgentEngine, EngineEvent, EngineRunRequest, EngineUsage } from "./engine-adapter.js";
+import { estimateCostMicros } from "./model-prices.js";
 
 type Active = { process: ChildProcessWithoutNullStreams; cancel: () => void };
 
@@ -29,7 +30,7 @@ export class PrimeRpcEngine implements AgentEngine {
       if (line.length > 16 * 1024 * 1024) { push({ type: "failed", data: { code: "RPC_FRAME_TOO_LARGE" } }); cancel(); return; }
       let event: any; try { event = JSON.parse(line); } catch { return; }
       if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") { const delta = String(event.assistantMessageEvent.delta ?? ""); if (delta) { streamed = true; push({ type: "text", data: delta }); } }
-      else if (event.type === "agent_end") { if (!streamed) { const text = lastAssistantText(event); if (text) push({ type: "text", data: text }); } push({ type: "completed", data: null }); finish(); }
+      else if (event.type === "agent_end") { if (!streamed) { const text = lastAssistantText(event); if (text) push({ type: "text", data: text }); } push({ type: "completed", data: { usage: extractUsage(event, request.model ?? this.options.model) } }); finish(); }
       else if (event.type === "error" || event.success === false) push({ type: "failed", data: { code: "ENGINE_ERROR", message: event.error ?? event.message ?? "Prime Agent error" } });
     });
     child.on("error", (error) => { push({ type: "failed", data: { code: "ENGINE_START_FAILED", message: error.message } }); finish(); });
@@ -46,25 +47,35 @@ export class PrimeRpcEngine implements AgentEngine {
 
 /** Extracts the last assistant message text from an agent_end frame, used as a safety net for streamed text. */
 /**
- * Reads the usage object from an agent_end frame. Only numeric token fields that the engine
- * actually reports are kept; anything else stays undefined so callers can mark the run estimated.
+ * Reads the token usage that the engine reports on agent_end.
+ *
+ * The validated frame shape is agent_end.messages[].usage = { input, output, cacheRead,
+ * cacheWrite, totalTokens, cost }. Only fields the engine really reports are used. When the
+ * engine reports no cost (the provider often sends zeros), the cost is computed from the
+ * published price table for that model; an unknown model leaves the cost undefined.
  */
-function extractUsage(event: any): { raw: unknown; inputTokens?: number; outputTokens?: number; costMicros?: number; model?: string } | null {
-  const candidates = [event?.usage, event?.totalUsage, event?.usageMetadata, event?.data?.usage];
-  const usage = candidates.find((value) => value && typeof value === "object");
-  if (!usage) return null;
-  const number = (...keys: string[]) => { for (const key of keys) { const value = (usage as any)[key]; if (typeof value === "number" && Number.isFinite(value)) return value; } return undefined; };
-  const input = number("inputTokens", "input_tokens", "promptTokens", "prompt_tokens");
-  const output = number("outputTokens", "output_tokens", "completionTokens", "completion_tokens");
-  const cost = number("costMicros", "cost_micros");
-  const costUsd = number("cost", "totalCost", "total_cost");
-  return {
-    raw: usage,
-    inputTokens: input,
-    outputTokens: output,
-    costMicros: cost ?? (costUsd === undefined ? undefined : Math.round(costUsd * 1_000_000)),
-    model: typeof (usage as any).model === "string" ? (usage as any).model : undefined,
+function extractUsage(event: any, fallbackModel?: string): EngineUsage | null {
+  const messages = Array.isArray(event?.messages) ? event.messages : [];
+  const lastAssistant = [...messages].reverse().find((message: any) => message?.role === "assistant");
+  const reported = [lastAssistant?.usage, event?.usage, event?.totalUsage].find((value) => value && typeof value === "object") as any;
+  if (!reported) return null;
+  const pick = (source: any, keys: string[]) => {
+    for (const key of keys) {
+      const value = source?.[key];
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+    }
+    return undefined;
   };
+  const inputTokens = pick(reported, ["input", "inputTokens", "input_tokens", "promptTokens", "prompt_tokens"]);
+  const outputTokens = pick(reported, ["output", "outputTokens", "output_tokens", "completionTokens", "completion_tokens"]);
+  const cacheReadTokens = pick(reported, ["cacheRead", "cacheReadTokens", "cache_read_input_tokens"]);
+  const cacheWriteTokens = pick(reported, ["cacheWrite", "cacheWriteTokens", "cache_creation_input_tokens"]);
+  const totalTokens = pick(reported, ["totalTokens", "total_tokens"]) ?? (inputTokens ?? 0) + (outputTokens ?? 0) + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0);
+  const model = typeof lastAssistant?.model === "string" ? lastAssistant.model : (typeof reported.model === "string" ? reported.model : fallbackModel);
+  const costFromUsage = typeof reported.cost === "object" && reported.cost !== null ? pick(reported.cost, ["total"]) : reported.cost;
+  const reportedMicros = typeof reported.costMicros === "number" ? reported.costMicros : typeof costFromUsage === "number" && costFromUsage > 0 ? Math.round(costFromUsage * 1_000_000) : undefined;
+  const costMicros = reportedMicros ?? estimateCostMicros(model, { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }) ?? undefined;
+  return { raw: reported, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, costMicros, model, estimated: false };
 }
 
 function lastAssistantText(event: any): string {

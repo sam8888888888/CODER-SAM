@@ -47,8 +47,9 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
 
   // Usage state
-  const [usage, setUsage] = useState<{ runs: number; inputTokens: number; outputTokens: number; costMicros: number; estimatedRuns: number } | null>(null);
-  const [usageModels, setUsageModels] = useState<{ model: string; runs: number; inputTokens: number; outputTokens: number }[]>([]);
+  const [usage, setUsage] = useState<UsageTotals | null>(null);
+  const [usageModels, setUsageModels] = useState<UsageByModel[]>([]);
+  const [usageNote, setUsageNote] = useState('');
 
   // Audit state
   const [audit, setAudit] = useState<AuditEvent[]>([]);
@@ -69,7 +70,7 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
   async function loadAudit() { if (workspaceId) setAudit(await api.auditEvents(workspaceId)); }
   async function loadTeam() { if (!workspaceId) return; setMembers(await api.members(workspaceId)); setInvitations(await api.invitations(workspaceId)); }
   async function loadArtifacts() { setArtifacts(await api.artifacts(projectId)); }
-  async function loadUsage() { const data = await api.usage(projectId, 30); setUsage(data.totals); setUsageModels(data.byModel); }
+  async function loadUsage() { const data = await api.usage(projectId, 30); setUsage(data.totals); setUsageModels(data.byModel); setUsageNote(data.note); }
 
   /** Reads a picked file as Base64 and uploads it as a knowledge document. */
   async function uploadDocument(file: File) {
@@ -383,15 +384,18 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
             <div className="stat"><b>{usage.runs}</b><small>run 30 hari</small></div>
             <div className="stat"><b>{usage.inputTokens.toLocaleString('id-ID')}</b><small>token masuk</small></div>
             <div className="stat"><b>{usage.outputTokens.toLocaleString('id-ID')}</b><small>token keluar</small></div>
-            <div className="stat"><b>{(usage.costMicros / 1_000_000).toFixed(4)}</b><small>biaya ($, bila dilaporkan)</small></div>
-            <div className="stat"><b>{usage.estimatedRuns}</b><small>run dengan estimasi</small></div>
+            <div className="stat"><b>{(usage.cacheReadTokens ?? 0).toLocaleString('id-ID')}</b><small>token dari cache</small></div>
+            <div className="stat"><b>{usage.totalTokens.toLocaleString('id-ID')}</b><small>total token</small></div>
+            <div className="stat"><b>${(usage.costUsd ?? 0).toFixed(6)}</b><small>biaya (USD, dari daftar harga)</small></div>
+            <div className="stat"><b>{usage.measuredRuns}</b><small>run terukur (angka engine)</small></div>
+            <div className="stat"><b>{usage.estimatedRuns}</b><small>run dengan estimasi teks</small></div>
           </div>
-          <small>Angka bertanda estimasi dihitung dari panjang teks karena engine tidak melaporkan token.</small>
+          <small>{usageNote || 'Token dari engine; run tanpa angka engine ditandai estimasi.'}</small>
           <div className="tool-list">
             {usageModels.map((row) => (
-              <div key={row.model}>
+              <div key={`${row.provider}-${row.model}`}>
                 <b>{row.model}</b>
-                <small>{row.runs} run · {row.inputTokens.toLocaleString('id-ID')} masuk · {row.outputTokens.toLocaleString('id-ID')} keluar</small>
+                <small>{row.provider} · {row.runs} run · {row.inputTokens.toLocaleString('id-ID')} masuk · {row.outputTokens.toLocaleString('id-ID')} keluar · ${(row.costUsd ?? 0).toFixed(6)}</small>
               </div>
             ))}
           </div>
@@ -461,3 +465,9 @@ function readBase64(file: File) {
     reader.readAsDataURL(file);
   });
 }
+
+
+/** Usage shapes are derived from the API client so the panel cannot drift from the endpoint. */
+type UsagePayload = Awaited<ReturnType<typeof api.usage>>;
+type UsageTotals = UsagePayload['totals'];
+type UsageByModel = UsagePayload['byModel'][number];

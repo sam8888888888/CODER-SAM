@@ -78,8 +78,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_search USING fts5(title, content, d
 CREATE INDEX IF NOT EXISTS idx_knowledge_project_updated ON knowledge_documents(project_id, updated_at DESC);
 CREATE TABLE IF NOT EXISTS run_usage (
  id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
- model TEXT, provider TEXT, input_tokens INTEGER, output_tokens INTEGER, cost_micros INTEGER, estimated INTEGER NOT NULL DEFAULT 0,
- raw_json TEXT, created_at TEXT NOT NULL
+ model TEXT, provider TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, total_tokens INTEGER,
+ cost_micros INTEGER, estimated INTEGER NOT NULL DEFAULT 0, raw_json TEXT, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_run_usage_project ON run_usage(project_id, created_at DESC);
 
@@ -187,6 +187,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(content, chun
 try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN filename TEXT"); } catch {}
 try { db.exec("ALTER TABLE knowledge_documents ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE run_usage ADD COLUMN cache_read_tokens INTEGER"); } catch {}
+try { db.exec("ALTER TABLE run_usage ADD COLUMN cache_write_tokens INTEGER"); } catch {}
+try { db.exec("ALTER TABLE run_usage ADD COLUMN total_tokens INTEGER"); } catch {}
 try { db.exec("ALTER TABLE runs ADD COLUMN model TEXT"); } catch {}
 try { db.exec("ALTER TABLE auth_sessions ADD COLUMN last_seen_at TEXT"); } catch {}
 try { db.exec("ALTER TABLE auth_sessions ADD COLUMN user_agent TEXT"); } catch {}
