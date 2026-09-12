@@ -17,3 +17,14 @@ export class UnconfiguredEngine implements AgentEngine {
   async cancel(): Promise<void> {}
   async health() { return { available: false }; }
 }
+
+
+export class MockEngine implements AgentEngine {
+  async *run(request: EngineRunRequest): AsyncIterable<EngineEvent> {
+    yield { type: "text", data: `[mock:${request.runId.slice(0, 8)}] ` };
+    yield { type: "text", data: `Received: ${request.prompt}` };
+    yield { type: "completed", data: null };
+  }
+  async cancel(_runId: string): Promise<void> {}
+  async health() { return { available: true, version: "mock" }; }
+}

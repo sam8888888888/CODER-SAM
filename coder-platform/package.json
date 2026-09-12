@@ -7,7 +7,8 @@
     "dev:api": "tsx apps/api/src/server.ts",
     "build:api": "tsc -p apps/api/tsconfig.json",
     "backup": "tsx apps/api/src/backup.ts",
-    "restore": "tsx apps/api/src/restore.ts"
+    "restore": "tsx apps/api/src/restore.ts",
+    "start": "node dist/api/server.js"
   },
   "dependencies": {
     "@fastify/cookie": "^10.0.1",

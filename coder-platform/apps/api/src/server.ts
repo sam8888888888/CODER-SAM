@@ -1,14 +1,16 @@
 import Fastify from "fastify";
 import cookie from "@fastify/cookie";
 import { randomUUID } from "node:crypto";
+import { extname, join, normalize } from "node:path";
 import { mkdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { config } from "./config.js";
 import { db } from "./db.js";
-import { UnconfiguredEngine, type AgentEngine } from "./engine-adapter.js";
-import { clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
+import { MockEngine, UnconfiguredEngine, type AgentEngine } from "./engine-adapter.js";
+import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
 
 const app = Fastify({ logger: true, trustProxy: false });
-const engine: AgentEngine = new UnconfiguredEngine();
+const engine: AgentEngine = config.MOCK_ENGINE ? new MockEngine() : new UnconfiguredEngine();
 await app.register(cookie);
 
 app.get("/health", async () => ({ status: "ok", service: "coder-api", time: new Date().toISOString() }));
@@ -40,6 +42,7 @@ app.post<{ Body: { email?: string; password?: string; displayName?: string } }>(
 });
 app.post<{ Body: { email?: string; password?: string } }>("/api/v1/auth/login", async (request, reply) => {
   const email = request.body?.email?.trim().toLowerCase(); const password = request.body?.password ?? "";
+  const key = `${request.ip}:${email ?? "unknown"}`; if (!allowLoginAttempt(key)) return reply.code(429).send({ error: "LOGIN_RATE_LIMITED" });
   const row = email ? db.prepare("SELECT id,email,display_name AS displayName,password_hash AS passwordHash FROM users WHERE email=?").get(email) as { id:string; email:string; displayName:string; passwordHash:string|null }|undefined : undefined;
   if (!row?.passwordHash || !(await verifyPassword(password,row.passwordHash))) return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
   const token = createSession(row.id); setSessionCookie(reply, token, config.NODE_ENV === "production");
@@ -119,6 +122,16 @@ app.post<{ Params: { runId: string } }>("/api/v1/runs/:runId/cancel", { preHandl
 });
 
 app.setErrorHandler((error, _request, reply) => { app.log.error(error); return reply.code(500).send({ error: "INTERNAL_ERROR" }); });
+
+const contentTypes: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
+app.setNotFoundHandler(async (request, reply) => {
+  if (request.method !== "GET" || request.url.startsWith("/api/")) return reply.code(404).send({ error: "NOT_FOUND" });
+  const publicDir = normalize(config.PUBLIC_DIR); const requested = decodeURIComponent(request.url.split("?")[0]);
+  const relative = requested === "/" ? "index.html" : requested.replace(/^\/+/, ""); const candidate = normalize(join(publicDir, relative));
+  if (!candidate.startsWith(publicDir)) return reply.code(404).send({ error: "NOT_FOUND" });
+  try { const data = await readFile(candidate); return reply.type(contentTypes[extname(candidate)] ?? "application/octet-stream").send(data); }
+  catch { try { const data = await readFile(join(publicDir, "index.html")); return reply.type("text/html; charset=utf-8").send(data); } catch { return reply.code(404).send({ error: "NOT_FOUND" }); } }
+});
 
 mkdirSync(config.DATA_DIR, { recursive: true });
 await app.listen({ host: config.HOST, port: config.PORT });

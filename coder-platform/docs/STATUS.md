@@ -13,8 +13,9 @@
 ## Belum selesai
 - RBAC per route, CSRF strategy, rate limiting, MFA.
 - Project run lifecycle (`queued`, `running`, `completed`, `failed`, `cancelled`) dan cancel endpoint.
-- Prime Agent RPC adapter nyata.
+- Prime Agent RPC adapter nyata (interface + mock mode selesai; wire protocol nyata belum divalidasi).
 - Frontend baru dipindahkan ke apps/web.
 - Queue/run orchestration (lifecycle dasar sudah ada; worker persisten belum).
+- Mock engine untuk functional test lokal dan static web fallback pada API container.
 - Knowledge, artifacts, workflow, billing.
-- Dockerfile dan deployment VPS.
+- Dockerfile dan deployment VPS (Dockerfile/compose sudah dibuat; belum dijalankan di VPS).

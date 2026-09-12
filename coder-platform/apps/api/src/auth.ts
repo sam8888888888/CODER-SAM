@@ -7,6 +7,12 @@ const derive = (password: string, salt: Buffer, length: number, options: { N: nu
 const SESSION_COOKIE = "coder_session";
 const SESSION_DAYS = 30;
 const SCRYPT_N = 16384, SCRYPT_R = 8, SCRYPT_P = 1;
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+export function allowLoginAttempt(key: string) {
+  const now = Date.now(); const current = loginAttempts.get(key);
+  if (!current || current.resetAt <= now) { loginAttempts.set(key, { count: 1, resetAt: now + 15 * 60_000 }); return true; }
+  if (current.count >= 10) return false; current.count += 1; return true;
+}
 
 export type AuthUser = { id: string; email: string; displayName: string };
 export type AuthRequest = FastifyRequest & { user?: AuthUser };

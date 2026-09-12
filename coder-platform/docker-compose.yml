@@ -1,0 +1,26 @@
+services:
+  coder-app:
+    build:
+      context: ..
+      dockerfile: coder-platform/Dockerfile
+    container_name: coder-platform-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:3400:3400"
+    volumes:
+      - coder-platform-data:/app/data
+      - coder-platform-backups:/app/backups
+    networks:
+      - coder-net
+
+volumes:
+  coder-platform-data:
+    name: coder-platform-data
+  coder-platform-backups:
+    name: coder-platform-backups
+
+networks:
+  coder-net:
+    external: true
