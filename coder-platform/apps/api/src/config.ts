@@ -1,0 +1,10 @@
+import { z } from "zod";
+
+const Env = z.object({
+  HOST: z.string().default("127.0.0.1"),
+  PORT: z.coerce.number().int().min(1).max(65535).default(3400),
+  DATA_DIR: z.string().default("./data"),
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+});
+
+export const config = Env.parse(process.env);
