@@ -236,7 +236,7 @@ app.post<{ Params: { executionId: string }; Body: { decision?: string } }>("/api
 app.get<{ Params: { workflowId: string } }>("/api/v1/workflows/:workflowId/executions", { preHandler: requireUser }, async (request: any, reply) => {
   const row = db.prepare("SELECT w.project_id AS projectId, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(request.params.workflowId) as any;
   if (!row || !membershipRole(row.workspaceId, request.user!.id)) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
-  return db.prepare("SELECT id, workflow_id AS workflowId, project_id AS projectId, status, input, output, error, started_at AS startedAt, finished_at AS finishedAt, created_at AS createdAt FROM workflow_executions WHERE workflow_id=? ORDER BY created_at DESC").all(request.params.workflowId);
+  return db.prepare("SELECT id, workflow_id AS workflowId, project_id AS projectId, status, approval_status AS approvalStatus, input, output, error, started_at AS startedAt, finished_at AS finishedAt, created_at AS createdAt FROM workflow_executions WHERE workflow_id=? ORDER BY created_at DESC").all(request.params.workflowId);
 });
 app.post<{ Params: { workflowId: string }; Body: { input?: string } }>("/api/v1/workflows/:workflowId/execute", { preHandler: requireUser }, async (request: any, reply) => {
   const row = db.prepare("SELECT w.id, w.project_id AS projectId, w.steps_json AS stepsJson, w.status, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(request.params.workflowId) as any;
