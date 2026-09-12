@@ -188,6 +188,31 @@ app.get<{ Params: { artifactId: string } }>("/api/v1/artifacts/:artifactId/downl
   try { const content = await readFile(artifact.storagePath); return reply.header("Content-Disposition", `attachment; filename="${artifact.name.replaceAll('"', "")}"`).type(artifact.mimeType).send(content); }
   catch { return reply.code(404).send({ error: "ARTIFACT_FILE_MISSING" }); }
 });
+app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/workflows", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  return db.prepare("SELECT id, project_id AS projectId, name, description, steps_json AS stepsJson, status, created_at AS createdAt, updated_at AS updatedAt FROM workflows WHERE project_id=? ORDER BY updated_at DESC").all(request.params.projectId).map((w: any) => ({ ...w, steps: JSON.parse(w.stepsJson), stepsJson: undefined }));
+});
+app.post<{ Params: { projectId: string }; Body: { name?: string; description?: string; steps?: unknown[] } }>("/api/v1/projects/:projectId/workflows", { preHandler: requireUser }, async (request: any, reply) => {
+  const project = db.prepare("SELECT workspace_id AS workspaceId FROM projects WHERE id=?").get(request.params.projectId) as { workspaceId: string } | undefined;
+  const role = project ? membershipRole(project.workspaceId, request.user!.id) : undefined;
+  if (!role) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  if (role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const name = request.body?.name?.trim(); const steps = request.body?.steps;
+  if (!name || !Array.isArray(steps) || steps.length > 50 || steps.some((step) => !step || typeof step !== "object")) return reply.code(400).send({ error: "INVALID_WORKFLOW" });
+  const id = randomUUID(); const now = new Date().toISOString(); const description = request.body?.description?.trim() ?? "";
+  db.prepare("INSERT INTO workflows (id,project_id,name,description,steps_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id, request.params.projectId, name, description, JSON.stringify(steps), "draft", now, now);
+  return reply.code(201).send({ id, projectId: request.params.projectId, name, description, steps, status: "draft", createdAt: now, updatedAt: now });
+});
+app.post<{ Params: { workflowId: string } }>("/api/v1/workflows/:workflowId/publish", { preHandler: requireUser }, async (request: any, reply) => {
+  const row = db.prepare("SELECT w.id, w.project_id AS projectId, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(request.params.workflowId) as any;
+  const role = row ? membershipRole(row.workspaceId, request.user!.id) : undefined;
+  if (!row || !role) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  if (role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const now = new Date().toISOString(); db.prepare("UPDATE workflows SET status='published', updated_at=? WHERE id=?").run(now, row.id);
+  return { id: row.id, projectId: row.projectId, status: "published", updatedAt: now };
+});
+
 app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/knowledge", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
