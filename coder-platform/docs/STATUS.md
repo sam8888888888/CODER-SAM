@@ -13,6 +13,7 @@
 ## Belum selesai
 - RBAC per route, CSRF strategy, rate limiting, MFA.
 - Project run lifecycle (`queued`, `running`, `completed`, `failed`, `cancelled`) dan cancel endpoint.
+- Conversation dan message API yang terhubung ke run dan menyimpan respons assistant.
 - Prime Agent RPC adapter nyata (interface + mock mode selesai; wire protocol nyata belum divalidasi).
 - Frontend baru dipindahkan ke apps/web (frontend build saat ini masih di coder-dashboard; container dapat menyalin dist itu).
 - Queue/run orchestration (lifecycle dasar sudah ada; worker persisten belum).
