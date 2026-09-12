@@ -48,7 +48,19 @@ npm ci --silent
 npm run build:api
 rm -rf public && mkdir public
 cp -a ../coder-dashboard/dist/. public/
-cp .env.austria.example .env
+
+# Secrets live in one persistent file outside the release folders, so a deploy never
+# wipes a provider key. Keys added to the example file are appended with their defaults.
+PERSIST="/home/dinda/coder-app/.env"
+if [[ ! -f "\${PERSIST}" ]]; then
+  cp .env.austria.example "\${PERSIST}"
+fi
+while IFS= read -r line; do
+  key="\$(printf '%s' "\${line}" | sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p')"
+  [[ -z "\${key}" ]] && continue
+  grep -q "^\${key}=" "\${PERSIST}" || printf '%s\n' "\${line}" >> "\${PERSIST}"
+done < .env.austria.example
+cp "\${PERSIST}" .env
 
 # Any version number in the image tag is replaced by the version being deployed.
 sed -Ei "s#(image: coder-platform-app:)[0-9][0-9.]*#\1${VERSION}#" docker-compose.austria.yml
