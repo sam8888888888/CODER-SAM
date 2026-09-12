@@ -188,6 +188,34 @@ app.get<{ Params: { artifactId: string } }>("/api/v1/artifacts/:artifactId/downl
   try { const content = await readFile(artifact.storagePath); return reply.header("Content-Disposition", `attachment; filename="${artifact.name.replaceAll('"', "")}"`).type(artifact.mimeType).send(content); }
   catch { return reply.code(404).send({ error: "ARTIFACT_FILE_MISSING" }); }
 });
+app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/knowledge", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  return db.prepare("SELECT id, project_id AS projectId, title, source_type AS sourceType, checksum, created_at AS createdAt, updated_at AS updatedAt FROM knowledge_documents WHERE project_id=? ORDER BY updated_at DESC").all(request.params.projectId);
+});
+app.post<{ Params: { projectId: string }; Body: { title?: string; content?: string } }>("/api/v1/projects/:projectId/knowledge", { preHandler: requireUser }, async (request: any, reply) => {
+  const project = db.prepare("SELECT p.workspace_id AS workspaceId FROM projects p WHERE p.id=?").get(request.params.projectId) as { workspaceId: string } | undefined;
+  const role = project ? membershipRole(project.workspaceId, request.user!.id) : undefined;
+  if (!role) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  if (role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  const title = request.body?.title?.trim(); const content = request.body?.content;
+  if (!title || typeof content !== "string" || !content.trim() || content.length > 2_000_000) return reply.code(400).send({ error: "INVALID_KNOWLEDGE_DOCUMENT" });
+  const id = randomUUID(); const now = new Date().toISOString(); const checksum = createHash("sha256").update(content).digest("hex");
+  const transaction = db.transaction(() => {
+    db.prepare("INSERT INTO knowledge_documents (id,project_id,title,source_type,content,checksum,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id,request.params.projectId,title,"text",content,checksum,now,now);
+    db.prepare("INSERT INTO knowledge_search (title,content,document_id) VALUES (?,?,?)").run(title,content,id);
+  }); transaction();
+  return reply.code(201).send({ id, projectId: request.params.projectId, title, sourceType: "text", checksum, createdAt: now, updatedAt: now });
+});
+app.get<{ Params: { projectId: string }; Querystring: { q?: string; limit?: string } }>("/api/v1/projects/:projectId/knowledge/search", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const q = request.query?.q?.trim(); const limit = Math.min(Math.max(Number(request.query?.limit ?? 10) || 10, 1), 50);
+  if (!q) return reply.code(400).send({ error: "QUERY_REQUIRED" });
+  const rows = db.prepare("SELECT d.id, d.title, d.project_id AS projectId, snippet(knowledge_search, 1, '<mark>', '</mark>', '…', 24) AS snippet FROM knowledge_search JOIN knowledge_documents d ON d.id=knowledge_search.document_id WHERE d.project_id=? AND knowledge_search MATCH ? ORDER BY rank LIMIT ?").all(request.params.projectId, q.replace(/[\"']/g, " "), limit);
+  return { query: q, results: rows };
+});
+
 app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/artifacts", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
