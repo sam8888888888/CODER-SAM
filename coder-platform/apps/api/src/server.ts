@@ -32,19 +32,38 @@ function workflowAccess(workflowId: string, userId: string) {
   return role ? { ...row, role } : null;
 }
 
-/** Runs one workflow prompt step through the configured agent engine. */
-async function runWorkflowPrompt(prompt: string) {
+/**
+ * Runs one workflow prompt step through the configured agent engine.
+ * The step gets its own runs row, so token usage and cost are tracked exactly like a chat run.
+ */
+async function runWorkflowPrompt(prompt: string, projectId?: string) {
   const runId = randomUUID();
+  const startedAt = new Date().toISOString();
+  const model = config.PRIME_AGENT_MODEL ?? null;
+  if (projectId) db.prepare("INSERT INTO runs (id,project_id,status,prompt,started_at,created_at,model) VALUES (?,?,'running',?,?,?,?)").run(runId, projectId, prompt.slice(0, 8000), startedAt, startedAt, model);
   let text = "";
-  for await (const event of engine.run({ runId, sessionId: runId, prompt })) {
-    if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
-    if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
+  let usage: any = null;
+  try {
+    for await (const event of engine.run({ runId, sessionId: runId, prompt, model: model ?? undefined, provider: config.PRIME_AGENT_PROVIDER })) {
+      if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+      if (event.type === "completed") usage = (event.data as { usage?: unknown })?.usage ?? null;
+      if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
+    }
+  } catch (error) {
+    if (projectId) db.prepare("UPDATE runs SET status='failed', error_code='WORKFLOW_STEP_FAILED', finished_at=? WHERE id=?").run(new Date().toISOString(), runId);
+    throw error;
+  }
+  if (projectId) {
+    recordRunUsage(runId, projectId, prompt, text, usage);
+    db.prepare("UPDATE runs SET status='completed', result=?, finished_at=? WHERE id=?").run(text || null, new Date().toISOString(), runId);
   }
   return text;
 }
 
 function startWorkflowExecution(executionId: string) {
-  setImmediate(() => { void runExecution(executionId, runWorkflowPrompt).catch((error) => app.log.error(error)); });
+  // The runner is bound to the execution project so every step records its own usage row.
+  const execution = db.prepare("SELECT project_id AS projectId FROM workflow_executions WHERE id=?").get(executionId) as { projectId?: string } | undefined;
+  setImmediate(() => { void runExecution(executionId, (prompt) => runWorkflowPrompt(prompt, execution?.projectId)).catch((error) => app.log.error(error)); });
 }
 
 /** Interval scheduler: starts due workflow executions once per minute. */

@@ -22,8 +22,11 @@ const model = catalogue.json.models?.[0]?.model ?? "deepseek-v4-flash";
 check("configured default model is reported", Boolean(catalogue.json.default?.model), JSON.stringify(catalogue.json.default));
 
 const workspaces = await call("GET", "/api/v1/workspaces");
-const projects = await call("GET", `/api/v1/workspaces/${workspaces.json[0].id}/projects`);
-const projectId = projects.json[0].id;
+// A fresh project keeps the usage window clean, so the totals describe only this check.
+const workspaceId = workspaces.json[0].id;
+const project = await call("POST", `/api/v1/workspaces/${workspaceId}/projects`, { name: `AI check ${Date.now()}`, slug: `ai-check-${Date.now()}` });
+const projectId = project.json.id;
+check("check project created", Boolean(projectId), JSON.stringify(project.json)?.slice(0, 160));
 
 const conversation = await call("POST", `/api/v1/projects/${projectId}/conversations`, { title: `AI check ${Date.now()}` });
 const conversationId = conversation.json.conversation.id;
@@ -62,10 +65,12 @@ check("workflow step stored output", Boolean(promptStep && String(promptStep.out
 console.log(`INFO workflow step output: ${String(promptStep?.output ?? "").trim().slice(0, 80)}`);
 
 const usage = await call("GET", `/api/v1/projects/${projectId}/usage?days=30`);
-check("usage counts runs", usage.json?.totals?.runs > 0, JSON.stringify(usage.json)?.slice(0, 200));
-check("usage reports engine tokens", (usage.json?.totals?.inputTokens ?? 0) > 0 && (usage.json?.totals?.outputTokens ?? 0) > 0, JSON.stringify(usage.json?.totals));
-check("usage is measured, not estimated", usage.json?.totals?.estimatedRuns === 0 && usage.json?.totals?.measuredRuns > 0, JSON.stringify(usage.json?.totals));
-check("usage prices the run in US dollars", (usage.json?.totals?.costMicros ?? 0) > 0 && (usage.json?.totals?.costUsd ?? 0) > 0 && usage.json?.totals?.unpricedRuns === 0, JSON.stringify(usage.json?.totals));
+const totals = usage.json?.totals ?? {};
+// Two engine runs in this project: the chat run and the workflow prompt step.
+check("usage counts both engine runs", totals.runs === 2, JSON.stringify(totals));
+check("usage reports engine tokens", totals.inputTokens > 0 && totals.outputTokens > 0, JSON.stringify(totals));
+check("usage is measured, not estimated", totals.estimatedRuns === 0 && totals.measuredRuns === 2, JSON.stringify(totals));
+check("usage prices every run in US dollars", totals.costMicros > 0 && totals.costUsd > 0 && totals.unpricedRuns === 0, JSON.stringify(totals));
 console.log(`INFO usage: ${JSON.stringify(usage.json?.totals)}`);
 
 await call("DELETE", `/api/v1/conversations/${conversationId}`);
