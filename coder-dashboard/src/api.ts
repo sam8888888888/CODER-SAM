@@ -1,6 +1,8 @@
 import type { ApiError, Message, Session, User } from './types';
 export type Workspace = { id: string; name: string; slug: string };
 export type Project = { id: string; workspaceId: string; name: string; slug: string };
+export type Knowledge = { id: string; title: string; checksum: string; updatedAt: string };
+export type Workflow = { id: string; name: string; description: string; steps: unknown[]; status: string };
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, { credentials: 'include', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
@@ -19,5 +21,9 @@ export const api = {
   sessions: (projectId: string) => request<Session[]>(`/v1/projects/${projectId}/conversations`),
   createSession: (projectId: string, title = 'Percakapan baru') => request<{ conversation: Session }>(`/v1/projects/${projectId}/conversations`, { method: 'POST', body: JSON.stringify({ title }) }),
   messages: (id: string) => request<{ messages: Message[] }>(`/v1/conversations/${encodeURIComponent(id)}/messages`),
+  knowledge: (projectId: string) => request<Knowledge[]>(`/v1/projects/${projectId}/knowledge`),
+  addKnowledge: (projectId: string, title: string, content: string) => request(`/v1/projects/${projectId}/knowledge`, { method: 'POST', body: JSON.stringify({ title, content }) }),
+  workflows: (projectId: string) => request<Workflow[]>(`/v1/projects/${projectId}/workflows`),
+  addWorkflow: (projectId: string, name: string, steps: unknown[]) => request(`/v1/projects/${projectId}/workflows`, { method: 'POST', body: JSON.stringify({ name, steps }) }),
   sendMessage: (id: string, content: string) => request<{ message: Message; run: { id: string } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content }) }),
 };
