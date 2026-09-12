@@ -143,12 +143,13 @@ app.post<{ Params: { projectId: string }; Body: { title?: string } }>("/api/v1/p
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
   const title = request.body?.title?.trim() || "New conversation"; const id = randomUUID(); const now = new Date().toISOString();
   db.prepare("INSERT INTO conversations (id,project_id,title,created_at,updated_at) VALUES (?,?,?,?,?)").run(id,request.params.projectId,title,now,now);
-  return reply.code(201).send({ id, projectId: request.params.projectId, title, createdAt: now, updatedAt: now });
+  return reply.code(201).send({ conversation: { id, projectId: request.params.projectId, title, createdAt: now, updatedAt: now } });
 });
 app.get<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversationId/messages", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id);
   if (!allowed) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
-  return db.prepare("SELECT id, conversation_id AS conversationId, role, content, run_id AS runId, created_at AS createdAt FROM messages WHERE conversation_id=? ORDER BY created_at ASC").all(request.params.conversationId);
+  const messages = db.prepare("SELECT id, conversation_id AS conversationId, role, content, run_id AS runId, created_at AS createdAt FROM messages WHERE conversation_id=? ORDER BY created_at ASC").all(request.params.conversationId);
+  return { messages };
 });
 
 async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string) {

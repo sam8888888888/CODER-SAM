@@ -6,5 +6,5 @@ import { PrimeRpcEngine } from "./prime-rpc-engine.js";
 export const engine: AgentEngine = config.MOCK_ENGINE
   ? new MockEngine()
   : config.PRIME_AGENT_BIN
-    ? new PrimeRpcEngine({ binary: config.PRIME_AGENT_BIN, rootDir: config.ENGINE_ROOT_DIR })
+    ? new PrimeRpcEngine({ binary: config.PRIME_AGENT_BIN, rootDir: config.ENGINE_ROOT_DIR, model: config.PRIME_AGENT_MODEL, provider: config.PRIME_AGENT_PROVIDER, timeoutMs: config.ENGINE_TIMEOUT_MS })
     : new UnconfiguredEngine();
