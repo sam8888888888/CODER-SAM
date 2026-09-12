@@ -28,7 +28,7 @@ if [[ ! -f "deploy/${PACKAGE}" ]]; then
   echo "missing deploy/${PACKAGE}; build it first" >&2
   exit 2
 fi
-sha256sum "deploy/${PACKAGE}" > "deploy/${PACKAGE}.sha256"
+( cd deploy && sha256sum "${PACKAGE}" > "${PACKAGE}.sha256" )
 
 scp -q "deploy/${PACKAGE}" "deploy/${PACKAGE}.sha256" "${SSH_TARGET}:${REMOTE_DIR}/"
 
