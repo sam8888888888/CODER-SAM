@@ -3,6 +3,7 @@ export type Workspace = { id: string; name: string; slug: string };
 export type Project = { id: string; workspaceId: string; name: string; slug: string };
 export type Knowledge = { id: string; title: string; checksum: string; updatedAt: string };
 export type Workflow = { id: string; name: string; description: string; steps: unknown[]; status: string };
+export type WorkflowExecution = { id: string; workflowId: string; status: string; input: string; output: string; error?: string; createdAt: string };
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, { credentials: 'include', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
@@ -25,5 +26,7 @@ export const api = {
   addKnowledge: (projectId: string, title: string, content: string) => request(`/v1/projects/${projectId}/knowledge`, { method: 'POST', body: JSON.stringify({ title, content }) }),
   workflows: (projectId: string) => request<Workflow[]>(`/v1/projects/${projectId}/workflows`),
   addWorkflow: (projectId: string, name: string, steps: unknown[]) => request(`/v1/projects/${projectId}/workflows`, { method: 'POST', body: JSON.stringify({ name, steps }) }),
+  executeWorkflow: (workflowId: string, input: string) => request(`/v1/workflows/${workflowId}/execute`, { method: 'POST', body: JSON.stringify({ input }) }),
+  workflowExecutions: (workflowId: string) => request<WorkflowExecution[]>(`/v1/workflows/${workflowId}/executions`),
   sendMessage: (id: string, content: string) => request<{ message: Message; run: { id: string } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content }) }),
 };
