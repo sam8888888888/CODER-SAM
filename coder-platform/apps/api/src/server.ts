@@ -170,6 +170,12 @@ app.addContentTypeParser("application/json", { parseAs: "string" }, (_request, b
   try { done(null, JSON.parse(text)); } catch { const error = new Error("INVALID_JSON") as Error & { statusCode?: number }; error.statusCode = 400; done(error); }
 });
 
+/** Turns free text into a url safe slug fragment. */
+function slugifyText(value: string) {
+  const base = value.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return base || "proyek";
+}
+
 app.get("/health", async () => ({ status: "ok", service: "coder-api", time: new Date().toISOString() }));
 app.get("/ready", async (_request, reply) => {
   const result = db.prepare("SELECT 1 AS ok").get() as { ok: number };
@@ -459,7 +465,9 @@ app.post<{ Body: { name?: string; slug?: string } }>("/api/v1/workspaces", { pre
 
 app.get<{ Params: { workspaceId: string } }>("/api/v1/workspaces/:workspaceId/projects", { preHandler: requireUser }, async (request: any) => db.prepare("SELECT p.id, p.workspace_id AS workspaceId, p.name, p.slug, p.description, p.created_at AS createdAt, p.updated_at AS updatedAt FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.workspace_id = ? AND m.user_id=? ORDER BY p.created_at DESC").all(request.params.workspaceId, request.user!.id));
 app.post<{ Params: { workspaceId: string }; Body: { name?: string; slug?: string; description?: string } }>("/api/v1/workspaces/:workspaceId/projects", { preHandler: requireUser }, async (request: any, reply) => {
-  const { workspaceId } = request.params; const body = request.body ?? {}; const name = body.name?.trim(); const slug = body.slug?.trim().toLowerCase();
+  const { workspaceId } = request.params; const body = request.body ?? {}; const name = body.name?.trim();
+  // Clients may send a slug; otherwise it is derived from the name so a name alone is enough.
+  const slug = body.slug?.trim().toLowerCase() || (name ? `${slugifyText(name)}-${Date.now().toString(36)}` : "");
   if (!name || !slug || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)) return reply.code(400).send({ error: "INVALID_PROJECT" });
   const role = membershipRole(workspaceId, request.user!.id); if (!role) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" }); if (role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
   const now = new Date().toISOString(); const id = randomUUID();
@@ -580,6 +588,42 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
   }); transaction();
   void executeRun(runId, conversation.projectId, content, conversation.id, knowledge, model);
   return reply.code(202).send({ message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now }, run: { id: runId, status: "queued" } });
+});
+
+/** Run history for one project, newest first. Optional ?conversationId= filter. */
+app.get<{ Params: { projectId: string }; Querystring: { conversationId?: string; limit?: string } }>("/api/v1/projects/:projectId/runs", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT p.id FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const limit = Math.min(Math.max(Number(request.query?.limit ?? 50) || 50, 1), 200);
+  const conversationId = request.query?.conversationId?.trim() || null;
+  // A run reaches its conversation through the messages table, so the link comes from a subquery.
+  const rows = db.prepare(`
+    SELECT r.id,
+           (SELECT m.conversation_id FROM messages m WHERE m.run_id = r.id LIMIT 1) AS conversationId,
+           r.status, r.prompt, r.result, r.model, r.error_code AS errorCode,
+           r.created_at AS createdAt, r.finished_at AS finishedAt,
+           COALESCE(u.input_tokens,0) AS inputTokens, COALESCE(u.output_tokens,0) AS outputTokens,
+           COALESCE(u.cost_micros,0) AS costMicros, COALESCE(u.estimated,0) AS estimated
+    FROM runs r LEFT JOIN run_usage u ON u.run_id = r.id
+    WHERE r.project_id = ?
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM messages m WHERE m.run_id = r.id AND m.conversation_id = ?))
+    ORDER BY r.created_at DESC LIMIT ?`).all(request.params.projectId, conversationId, conversationId, limit);
+  return { runs: rows.map((row: any) => ({ ...row, costUsd: Number(((row.costMicros ?? 0) / 1_000_000).toFixed(6)) })) };
+});
+
+/** Rename a project. Owners and admins of the workspace may do this. */
+app.patch<{ Params: { projectId: string }; Body: { name?: string; description?: string } }>("/api/v1/projects/:projectId", { preHandler: requireUser }, async (request: any, reply) => {
+  const access = db.prepare("SELECT p.id, p.workspace_id AS workspaceId, m.role AS role FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id) as { id: string; workspaceId: string; role: string } | undefined;
+  if (!access) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  if (access.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  const name = request.body?.name?.trim();
+  const description = request.body?.description?.trim();
+  if (name !== undefined && (!name || name.length > 120)) return reply.code(400).send({ error: "INVALID_PROJECT_NAME" });
+  const now = new Date().toISOString();
+  db.prepare("UPDATE projects SET name=COALESCE(?,name), description=COALESCE(?,description), updated_at=? WHERE id=?").run(name ?? null, description ?? null, now, access.id);
+  const project = db.prepare("SELECT id, workspace_id AS workspaceId, name, slug, description, created_at AS createdAt, updated_at AS updatedAt FROM projects WHERE id=?").get(access.id);
+  recordAudit(access.workspaceId, request.user!.id, "project.updated", { projectId: access.id, name: name ?? null });
+  return { project };
 });
 
 app.post<{ Params: { projectId: string }; Body: { prompt?: string; model?: string } }>("/api/v1/projects/:projectId/runs", { preHandler: requireUser }, async (request: any, reply) => {

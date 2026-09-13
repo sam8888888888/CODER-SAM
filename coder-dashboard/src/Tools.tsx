@@ -13,8 +13,10 @@ function newStep(type: WorkflowStep['type']): WorkflowStep {
   return { id, type, seconds: 5 };
 }
 
-export function Tools({ projectId, workspaceId, onClose }: { projectId: string; workspaceId: string | null; onClose: () => void }) {
-  const [tab, setTab] = useState<'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit'>('knowledge');
+export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded }: { projectId: string; workspaceId: string | null; onClose?: () => void; tab?: 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit'; embedded?: boolean }) {
+  const [ownTab, setTab] = useState<'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit'>('knowledge');
+  // Inside the page shell the left navigation owns the tab; in the modal this panel owns it.
+  const tab = tabProp ?? ownTab;
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -415,25 +417,27 @@ export function Tools({ projectId, workspaceId, onClose }: { projectId: string; 
     </div>
   );
 
-  return (
-    <div className="modal-backdrop">
-      <section className="auth-card settings-card tool-card">
-        <button type="button" className="close" onClick={onClose}>×</button>
-        <span className="eyebrow">PROJECT TOOLS</span>
-        <div className="tool-tabs">
-          <button type="button" className={tab === 'knowledge' ? 'active' : ''} onClick={() => setTab('knowledge')}>Knowledge</button>
-          <button type="button" className={tab === 'workflow' ? 'active' : ''} onClick={() => setTab('workflow')}>Workflow</button>
-          <button type="button" className={tab === 'team' ? 'active' : ''} onClick={() => setTab('team')}>Tim</button>
-          <button type="button" className={tab === 'artifacts' ? 'active' : ''} onClick={() => setTab('artifacts')}>Artifact</button>
-          <button type="button" className={tab === 'usage' ? 'active' : ''} onClick={() => setTab('usage')}>Pemakaian</button>
-          <button type="button" className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>Audit</button>
-        </div>
-        <h2>{tab === 'knowledge' ? 'Knowledge Base' : tab === 'workflow' ? 'Workflow Builder' : tab === 'team' ? 'Tim Workspace' : tab === 'artifacts' ? 'Artifact Project' : tab === 'usage' ? 'Pemakaian Token' : 'Audit Workspace'}</h2>
-        {message && <p className="notice" onClick={() => setMessage('')}>{message}</p>}
-        {tab === 'knowledge' ? knowledgeTab : tab === 'workflow' ? workflowTab : tab === 'team' ? teamTab : tab === 'artifacts' ? artifactTab : tab === 'usage' ? usageTab : auditTab}
-      </section>
+  // The modal shows its own tab strip; as a page the left navigation selects the tab.
+  const tabs = embedded ? null : (
+    <div className="tool-tabs">
+      <button type="button" className={tab === 'knowledge' ? 'active' : ''} onClick={() => setTab('knowledge')}>Pengetahuan</button>
+      <button type="button" className={tab === 'workflow' ? 'active' : ''} onClick={() => setTab('workflow')}>Workflow</button>
+      <button type="button" className={tab === 'team' ? 'active' : ''} onClick={() => setTab('team')}>Tim</button>
+      <button type="button" className={tab === 'artifacts' ? 'active' : ''} onClick={() => setTab('artifacts')}>Artefak</button>
+      <button type="button" className={tab === 'usage' ? 'active' : ''} onClick={() => setTab('usage')}>Pemakaian</button>
+      <button type="button" className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>Audit</button>
     </div>
   );
+  const heading = tab === 'knowledge' ? 'Basis Pengetahuan' : tab === 'workflow' ? 'Penyusun Workflow' : tab === 'team' ? 'Tim Workspace' : tab === 'artifacts' ? 'Artefak Proyek' : tab === 'usage' ? 'Pemakaian Token & Biaya' : 'Audit Workspace';
+  const panel = <>
+        <button type="button" className="close" onClick={onClose}>×</button>
+        {!embedded && <span className="eyebrow">PERKAKAS PROYEK</span>}
+        {tabs}
+        <h2>{heading}</h2>
+        {message && <p className="notice" onClick={() => setMessage('')}>{message}</p>}
+        {tab === 'knowledge' ? knowledgeTab : tab === 'workflow' ? workflowTab : tab === 'team' ? teamTab : tab === 'artifacts' ? artifactTab : tab === 'usage' ? usageTab : auditTab}
+      </>;
+  return embedded ? <div className="tool-embedded">{panel}</div> : <div className="modal-backdrop"><section className="auth-card settings-card tool-card">{panel}</section></div>;
 }
 
 function move(steps: WorkflowStep[], from: number, to: number) {

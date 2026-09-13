@@ -205,6 +205,13 @@ const cleared = await call("PUT", `/api/v1/workspaces/${workspaceId}/limits`, { 
 // null means "use the platform default", which is the state a fresh workspace is in.
 check("workspace limits can be reset to the default", cleared.status === 200 && cleared.json.dailyCostLimitMicros === null, JSON.stringify(cleared.json));
 
+
+// The dashboard reads the run history and renames projects from its own pages.
+const runHistory = await call("GET", `/api/v1/projects/${projectId}/runs`);
+check("run history answers with a list", runHistory.status === 200 && Array.isArray(runHistory.json.runs), JSON.stringify(runHistory.json).slice(0, 200));
+const renameTarget = await call("PATCH", `/api/v1/projects/${projectId}`, { name: `Smoke Project ${Date.now()}` });
+check("project can be renamed", renameTarget.status === 200 && typeof renameTarget.json.project?.name === "string", JSON.stringify(renameTarget.json).slice(0, 200));
+
 const adminBlocked = await call("GET", "/api/v1/admin/overview");
 check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));
 const metricsBlocked = await call("GET", "/metrics");

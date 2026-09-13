@@ -1,6 +1,7 @@
 import type { ApiError, Message, Session, User } from './types';
 export type Workspace = { id: string; name: string; slug: string };
 export type Project = { id: string; workspaceId: string; name: string; slug: string };
+export type RunSummary = { id: string; conversationId: string | null; status: string; prompt: string; result: string | null; model: string | null; errorCode?: string | null; createdAt: string; finishedAt: string | null; inputTokens: number; outputTokens: number; costMicros: number; estimated: number; costUsd: number };
 export type WorkflowStep = { id?: string; name?: string; type: 'prompt'|'condition'|'branch'|'approval'|'delay'; prompt?: string; value?: string; field?: string; op?: string; goto?: string; cases?: { field?: string; op?: string; value?: string; goto?: string }[]; default?: string; seconds?: number };
 export type Workflow = { id: string; name: string; description: string; steps: WorkflowStep[]; status: string; scheduleEnabled?: boolean; intervalMinutes?: number | null; nextRunAt?: string | null; lastRunAt?: string | null };
 export type ExecutionStep = { id: string; stepIndex: number; stepId: string; type: string; status: string; input: string; output: string; error?: string | null; startedAt?: string; finishedAt?: string };
@@ -88,5 +89,9 @@ export const api = {
   adminWorkspaces: () => request<any[]>('/v1/admin/workspaces'),
   setAdmin: (userId: string, enabled: boolean) => request<{ isAdmin: boolean }>(`/v1/admin/users/${encodeURIComponent(userId)}/admin`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   workspaceLimits: (workspaceId: string, limits: { dailyCostLimitMicros?: number | null; monthlyCostLimitMicros?: number | null; runsPerHourLimit?: number | null }) => request<any>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/limits`, { method: 'PUT', body: JSON.stringify(limits) }),
+  createWorkspace: (name: string) => request<Workspace>('/v1/workspaces', { method: 'POST', body: JSON.stringify({ name }) }),
+  createProject: (workspaceId: string, name: string, description?: string) => request<Project>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/projects`, { method: 'POST', body: JSON.stringify({ name, description }) }),
+  updateProject: (projectId: string, patch: { name?: string; description?: string }) => request<{ project: Project }>(`/v1/projects/${encodeURIComponent(projectId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  runs: (projectId: string, conversationId?: string) => request<{ runs: RunSummary[] }>(`/v1/projects/${encodeURIComponent(projectId)}/runs${conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : ''}`),
   models: () => request<{ available: boolean; error?: string; default: { model: string | null; provider: string | null }; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[] }>('/v1/models'),
 };

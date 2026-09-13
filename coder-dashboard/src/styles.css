@@ -82,3 +82,28 @@
 .link-button { background: none; border: none; color: #7cc4ff; cursor: pointer; font-size: 12px; padding: 0; }
 .bell-item { width: 100%; text-align: left; background: none; border: none; color: inherit; cursor: pointer; }
 .bell-item:hover { background: rgba(255,255,255,0.08); }
+
+/* --- Page navigation: the left rail is the map of the platform --- */
+.page-nav { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid #252b42cc; }
+.page-link { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; background: none; border: none; color: #cbd3e6; cursor: pointer; font-size: 13px; padding: 7px 9px; border-radius: 9px; }
+.page-link:hover { background: rgba(255,255,255,0.06); }
+.page-link.active { background: linear-gradient(90deg,#6d3ff155,#0e749055); color: #fff; font-weight: 600; }
+.page-icon { width: 16px; text-align: center; opacity: 0.85; }
+
+/* --- Workspace and project pickers in the top bar --- */
+.picker-group { display: flex; gap: 10px; margin-right: 12px; }
+.picker { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #9aa6c2; text-transform: uppercase; letter-spacing: 0.04em; }
+.picker select { background: #161b2c; color: #e6ebf7; border: 1px solid #2b3350; border-radius: 8px; padding: 4px 6px; font-size: 12px; max-width: 190px; }
+.mobile-only.picker-group { display: none; }
+
+/* --- Page shell for every non-chat page --- */
+.page-shell { flex: 1; overflow: auto; padding: 20px 24px 40px; }
+.page-shell-inner { max-width: 720px; display: flex; flex-direction: column; gap: 12px; }
+.page-inline { display: flex; justify-content: center; }
+.tool-embedded { width: 100%; max-width: 1080px; display: flex; flex-direction: column; gap: 6px; }
+.tool-embedded h2 { margin: 4px 0 6px; }
+
+@media (max-width: 900px) {
+  .picker-group { display: none; }
+  .page-shell { padding: 14px; }
+}
