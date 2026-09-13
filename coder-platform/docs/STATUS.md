@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 13 Sep 2026 (versi 0.10.0)
+Terakhir diperbarui: 13 Sep 2026 (versi 0.10.2)
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel
@@ -84,8 +84,17 @@ Jumlah rute `server.ts` saat diperiksa: 83. Bila angka di kode berbeda, jalankan
 
 ## Sebagian
 
-- Email transaksional: alur dan isi surat lengkap, tetapi SMTP belum diisi sehingga jawabannya
-  `EMAIL_NOT_CONFIGURED`. Verifikasi email dan reset sandi lewat surat belum bisa dipakai pengguna asli.
+- Email transaksional: alur dan isi surat lengkap, klien SMTP sendiri di `apps/api/src/mailer.ts`
+  (tanpa pustaka tambahan), tetapi SMTP belum diisi sehingga jawabannya `EMAIL_NOT_CONFIGURED`.
+  Verifikasi email dan reset sandi lewat surat belum bisa dipakai pengguna asli.
+- Klien SMTP: dua bug nyata ditemukan dan diperbaiki pada 13 Sep 2026 saat mencoba server surat
+  sungguhan. (1) Baris lanjutan balasan `EHLO` (mis. `250-STARTTLS`) dibuang, sehingga klien tidak
+  pernah memulai STARTTLS dan server menjawab `530 Must issue a STARTTLS command first`; kini seluruh
+  balasan multi-baris dikumpulkan dan `capabilities` memuatnya. (2) Batas waktu memakai
+  `socket.destroy(new Error(...))` setelah `removeAllListeners("error")`, sehingga soket yang diam
+  memicu peristiwa `error` tanpa penangan dan mematikan proses API; kini soket hanya ditutup dan
+  kegagalan dilaporkan lewat `SMTP_NO_REPLY`. Bukti: `apps/api/test/mailer.e2e.ts` (25 cek lulus,
+  `ALL_MAILER_TESTS_PASSED`), termasuk jalur STARTTLS sungguhan dengan sertifikat sementara.
 - Adapter Prime Agent nyata: baru kontraknya yang terbukti lewat fixture. Jalan ke provider sungguhan
   belum diverifikasi karena belum ada kunci. `real-ai.e2e.ts` dan `real-usage.e2e.ts` butuh kunci.
 - Penjadwal: hidup di dalam proses API. Dua replika bisa menjalankan jadwal yang sama, dan run yang
@@ -93,9 +102,12 @@ Jumlah rute `server.ts` saat diperiksa: 83. Bila angka di kode berbeda, jalankan
 - CSRF level dua mati secara bawaan (`CSRF_STRICT=false`), dan belum ada suite yang menguji
   `CSRF_BLOCKED` maupun `CSRF_TOKEN_REQUIRED`.
 - Rate limit disimpan di memori proses, jadi hilang saat restart dan tidak dibagi antar replika.
-- Rute baru belum punya suite otomatis: hapus proyek/workspace/workflow/artefak/akun, ekspor CSV,
-  `GET /api/v1/artifacts/:artifactId/raw`, dan `PATCH /api/v1/auth/me`. Statusnya belum diverifikasi uji.
-- Suite end-to-end: 13 dari 16 suite gagal atau berhenti di tengah pada 13 Sep 2026. Penyebabnya bukan
+- Rute baru sudah punya suite otomatis: `delete-flow.e2e.ts` (64 cek) untuk hapus proyek/workspace/
+  workflow/artefak/akun, ekspor CSV, `GET /api/v1/artifacts/:artifactId/raw`, dan `PATCH /api/v1/auth/me`;
+  `csrf-limits.e2e.ts` (23 cek) untuk cookie CSRF dan batas permintaan.
+- Suite end-to-end: pada 13 Sep 2026 pagi, 13 dari 16 suite gagal atau berhenti di tengah karena
+  helper uji mengambil cookie pertama (masalah lama, sudah diperbaiki). Sore harinya **19 suite lulus**
+  (lihat bagian cara verifikasi). Catatan lama: penyebabnya bukan
   fitur hilang, melainkan helper klien uji mengambil cookie pertama dari header `Set-Cookie`, sedangkan
   API sekarang mengirim dua cookie (`coder_csrf` lebih dulu, lalu `coder_session`). Uji manual saya:
   dengan kedua cookie dikirim, `POST /api/v1/auth/register` menjawab 201 dan `GET /api/v1/auth/me`
@@ -149,9 +161,10 @@ Cek tipe (tanpa keluaran berarti lulus; saya jalankan 13 Sep 2026):
 Suite end-to-end lokal tanpa jaringan:
 
 - `cd coder-platform && MOCK_ENGINE=true npx tsx apps/api/test/<suite>.e2e.ts`
-- 16 suite: `account-recovery`, `account-security`, `admin-metrics`, `guards`, `knowledge-team`,
-  `login-identity`, `model-rbac`, `project-runs`, `rpc-adapter`, `session-usage`, `totp`, `usage-cost`,
-  `viewer-rbac`, `workflow-engine`, `real-ai`, `real-usage`.
+- 19 suite (semuanya lulus 13 Sep 2026, `RUNNER_EXIT=0`): `account-recovery`, `account-security`,
+  `admin-metrics`, `csrf-limits`, `delete-flow`, `guards`, `knowledge-team`, `login-identity`, `mailer`,
+  `model-rbac`, `project-runs`, `rpc-adapter`, `session-usage`, `totp`, `usage-cost`, `viewer-rbac`,
+  `workflow-engine`, `real-ai`, `real-usage`.
 - `usage-cost.e2e.ts` dijalankan tanpa `MOCK_ENGINE=true`, memakai
   `PRIME_AGENT_BIN=apps/api/test/fixtures/fake-prime-agent.mjs` (tetap tanpa jaringan).
 - Tanpa server sama sekali: `npx tsx apps/api/test/rpc-adapter.e2e.ts` dan

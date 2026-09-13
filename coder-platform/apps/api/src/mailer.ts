@@ -31,23 +31,30 @@ function encodeMime(message: MailMessage): string {
   return `${headers.join("\r\n")}\r\n\r\n${message.text.replace(/\n/g, "\r\n")}`;
 }
 
-type SmtpSession = { socket: net.Socket | tls.TLSSocket; buffer: string; lines: string[]; waiters: ((line: string) => void)[]; capabilities: string[] };
+type SmtpSession = { socket: net.Socket | tls.TLSSocket; buffer: string; lines: string[]; multiline: string[]; waiters: ((line: string) => void)[]; capabilities: string[] };
 
 function attach(session: SmtpSession, socket: net.Socket | tls.TLSSocket, timeoutMs: number) {
   session.socket = socket;
   session.buffer = "";
-  socket.setTimeout(timeoutMs, () => socket.destroy(new Error("SMTP_TIMEOUT")));
+  session.multiline = [];
+  // Batas waktu hanya menutup soket: destroy(Error) memicu peristiwa "error" tanpa penangan.
+  socket.setTimeout(timeoutMs, () => socket.destroy());
   socket.on("data", (chunk) => {
     session.buffer += chunk.toString("utf8");
     let index = session.buffer.indexOf("\r\n");
     while (index !== -1) {
       const line = session.buffer.slice(0, index);
       session.buffer = session.buffer.slice(index + 2);
-      // Multi line replies use "250-" and end with "250 ".
-      if (!/^\d{3}-/.test(line)) {
+      // Multi line replies use "250-" on every line but the last, which uses "250 ".
+      // Continuation lines must be kept: EHLO capability detection (STARTTLS, AUTH) reads them.
+      if (/^\d{3}-/.test(line)) {
+        session.multiline.push(line);
+      } else {
+        const reply = [...session.multiline, line].join("\n");
+        session.multiline = [];
         const waiter = session.waiters.shift();
-        if (waiter) waiter(line);
-        else session.lines.push(line);
+        if (waiter) waiter(reply);
+        else session.lines.push(reply);
       }
       index = session.buffer.indexOf("\r\n");
     }
@@ -81,12 +88,15 @@ export async function sendMail(message: MailMessage): Promise<MailResult> {
       const socket = config.SMTP_SECURE
         ? tls.connect({ host: config.SMTP_HOST!, port: config.SMTP_PORT, servername: config.SMTP_HOST! })
         : net.connect({ host: config.SMTP_HOST!, port: config.SMTP_PORT });
-      socket.setTimeout(timeoutMs, () => socket.destroy(new Error("SMTP_TIMEOUT")));
+      socket.setTimeout(timeoutMs, () => socket.destroy());
       socket.once("error", reject);
       socket.once(config.SMTP_SECURE ? "secureConnect" : "connect", () => resolve(socket));
     });
     plain.removeAllListeners("error");
-    const session: SmtpSession = { socket: plain, buffer: "", lines: [], waiters: [], capabilities: [] };
+    // Setelah tersambung, galat soket tidak boleh lagi melempar peristiwa "error" tanpa penangan
+    // (itu mematikan proses API). Hasilnya tetap dilaporkan lewat batas waktu.
+    plain.on("error", () => { /* ditangani lewat batas waktu / balasan perintah */ });
+    const session: SmtpSession = { socket: plain, buffer: "", lines: [], multiline: [], waiters: [], capabilities: [] };
     attach(session, plain, timeoutMs);
     await nextLine(session, timeoutMs); // server greeting
     const ehlo = await command(session, `EHLO ${config.PUBLIC_BASE_URL.replace(/^https?:\/\//, "")}`, timeoutMs);
@@ -95,11 +105,12 @@ export async function sendMail(message: MailMessage): Promise<MailResult> {
       await command(session, "STARTTLS", timeoutMs, [220]);
       const secured = await new Promise<tls.TLSSocket>((resolve, reject) => {
         const socket = tls.connect({ socket: session.socket as net.Socket, servername: config.SMTP_HOST! });
-        socket.setTimeout(timeoutMs, () => socket.destroy(new Error("SMTP_TIMEOUT")));
+        socket.setTimeout(timeoutMs, () => socket.destroy());
         socket.once("error", reject);
         socket.once("secureConnect", () => resolve(socket));
       });
       secured.removeAllListeners("error");
+      secured.on("error", () => { /* ditangani lewat batas waktu / balasan perintah */ });
       session.lines = [];
       session.buffer = "";
       attach(session, secured, timeoutMs);
