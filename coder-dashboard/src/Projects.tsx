@@ -5,6 +5,8 @@ type Props = {
   workspaceId: string | null;
   projectId: string | null;
   onSelect: (projectId: string) => void;
+  /** Dipanggil setelah proyek baru dibuat, supaya proyek itu langsung aktif di seluruh aplikasi. */
+  onCreated?: (projectId: string) => void;
 };
 
 /** Ubah error apa pun menjadi pesan teks; pesan server dipakai apa adanya. */
@@ -16,7 +18,7 @@ function errorText(error: unknown) {
  * Halaman "Proyek": pilih proyek aktif, buat proyek baru, dan ganti nama proyek aktif.
  * Semua panggilan API dibungkus try/catch dan pesan galat server ditampilkan apa adanya.
  */
-export function Projects({ workspaceId, projectId, onSelect }: Props) {
+export function Projects({ workspaceId, projectId, onSelect, onCreated }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -62,6 +64,7 @@ export function Projects({ workspaceId, projectId, onSelect }: Props) {
       setName('');
       setDescription('');
       await loadProjects();
+      onCreated?.(created.id);
       onSelect(created.id);
       setNotice(`Proyek "${created.name}" sudah dibuat dan kini menjadi proyek aktif Anda.`);
     } catch (err) {

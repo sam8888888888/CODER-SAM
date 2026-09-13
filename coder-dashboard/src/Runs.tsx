@@ -47,11 +47,26 @@ export function Runs({ projectId }: { projectId: string | null }) {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [cancelling, setCancelling] = useState('');   // id run yang sedang dihentikan
   const [status, setStatus] = useState('');          // '' = semua status
   const [keyword, setKeyword] = useState('');        // pencarian pada prompt
   const [openId, setOpenId] = useState<string | null>(null); // baris yang sedang dibuka
 
   /** Ambil daftar run terbaru. Semua galat ditampilkan apa adanya. */
+  /** Hentikan run yang masih berjalan, lalu segarkan daftar. Rute backend: POST /api/v1/runs/:runId/cancel. */
+  async function cancelRun(runId: string) {
+    setCancelling(runId);
+    setError('');
+    try {
+      await api.cancelRun(runId);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCancelling('');
+    }
+  }
+
   async function load() {
     if (!projectId) { setRuns([]); return; }
     setLoading(true);
@@ -188,6 +203,16 @@ export function Runs({ projectId }: { projectId: string | null }) {
                               {run.result ? String(run.result) : (run.status === 'queued' || run.status === 'running' ? 'Run masih berjalan…' : 'Belum ada hasil.')}
                             </pre>
                             {run.errorCode && <p className="error" style={{ margin: 0 }}>Kode galat: {run.errorCode}</p>}
+                            {(run.status === 'queued' || run.status === 'running') && (
+                              <button
+                                type="button"
+                                className="link-button"
+                                disabled={cancelling === run.id}
+                                onClick={() => void cancelRun(run.id)}
+                              >
+                                {cancelling === run.id ? 'Menghentikan…' : 'Batalkan run ini'}
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>

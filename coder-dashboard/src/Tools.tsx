@@ -430,12 +430,14 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
   );
   const heading = tab === 'knowledge' ? 'Basis Pengetahuan' : tab === 'workflow' ? 'Penyusun Workflow' : tab === 'team' ? 'Tim Workspace' : tab === 'artifacts' ? 'Artefak Proyek' : tab === 'usage' ? 'Pemakaian Token & Biaya' : 'Audit Workspace';
   const panel = <>
-        <button type="button" className="close" onClick={onClose}>×</button>
+        {onClose && <button type="button" className="close" onClick={onClose}>×</button>}
         {!embedded && <span className="eyebrow">PERKAKAS PROYEK</span>}
         {tabs}
         <h2>{heading}</h2>
         {message && <p className="notice" onClick={() => setMessage('')}>{message}</p>}
-        {tab === 'knowledge' ? knowledgeTab : tab === 'workflow' ? workflowTab : tab === 'team' ? teamTab : tab === 'artifacts' ? artifactTab : tab === 'usage' ? usageTab : auditTab}
+        {(tab === 'team' || tab === 'audit') && !workspaceId
+          ? <p className="settings-hint">Tab ini butuh workspace aktif, dan saat ini belum ada workspace yang terpilih. Pilih workspace di bagian atas halaman lalu buka lagi.</p>
+          : tab === 'knowledge' ? knowledgeTab : tab === 'workflow' ? workflowTab : tab === 'team' ? teamTab : tab === 'artifacts' ? artifactTab : tab === 'usage' ? usageTab : auditTab}
       </>;
   return embedded ? <div className="tool-embedded">{panel}</div> : <div className="modal-backdrop"><section className="auth-card settings-card tool-card">{panel}</section></div>;
 }

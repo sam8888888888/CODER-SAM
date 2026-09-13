@@ -66,5 +66,15 @@ const actions = (audit.json ?? []).map((row: any) => row.action);
 check("audit records conversation delete", actions.includes("conversation.deleted"), JSON.stringify(actions.slice(0, 6)));
 check("audit records conversation import", actions.includes("conversation.imported"), JSON.stringify(actions.slice(0, 6)));
 
+// Run cancel: the endpoint must answer with a clear code for both a known and an unknown run.
+const cancelTarget = await call("POST", `/api/v1/projects/${projectId}/runs`, { prompt: "batalkan saya" });
+check("run accepted before cancel", cancelTarget.status === 202, JSON.stringify(cancelTarget.json));
+const cancelUnknown = await call("POST", "/api/v1/runs/tidak-ada/cancel");
+check("cancelling an unknown run answers 404", cancelUnknown.status === 404 && cancelUnknown.json?.error === "RUN_NOT_FOUND", `${cancelUnknown.status} ${JSON.stringify(cancelUnknown.json)}`);
+const cancelKnown = await call("POST", `/api/v1/runs/${cancelTarget.json.id}/cancel`);
+check("cancelling a known run answers ok", cancelKnown.status === 200 && cancelKnown.json?.ok === true, `${cancelKnown.status} ${JSON.stringify(cancelKnown.json)}`);
+const afterCancel = await call("GET", `/api/v1/runs/${cancelTarget.json.id}`);
+check("cancelled run reports a terminal status", ["cancelled", "completed"].includes(afterCancel.json?.status), String(afterCancel.json?.status));
+
 console.log(failures === 0 ? "ALL_SESSION_USAGE_TESTS_PASSED" : `SESSION_USAGE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

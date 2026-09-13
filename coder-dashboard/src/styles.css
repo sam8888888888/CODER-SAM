@@ -107,3 +107,21 @@
   .picker-group { display: none; }
   .page-shell { padding: 14px; }
 }
+
+
+/* Tombol aksi di dalam daftar sesi (mis. "Keluarkan" pada perangkat aktif).
+   Tailwind preflight menghapus gaya bawaan button, jadi gaya eksplisit diperlukan. */
+.session-list button.download, .settings-card button.download {
+  background: none;
+  border: 1px solid rgba(34, 211, 238, 0.35);
+  border-radius: 9px;
+  color: #a5f3fc;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 7px 11px;
+}
+
+.session-list button.download:hover, .settings-card button.download:hover { border-color: rgba(34, 211, 238, 0.7); }
+
+/* Pesan galat pada layar pemulihan kata sandi dan formulir masuk. */
+.auth-error, .settings-card .error { color: #fda4af; font-size: 13px; }
