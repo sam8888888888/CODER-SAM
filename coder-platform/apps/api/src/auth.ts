@@ -2,16 +2,17 @@ import { promisify } from "node:util";
 import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual, createHash } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { db } from "./db.js";
+import { limiterFor } from "./ratelimit.js";
 
 const derive = (password: string, salt: Buffer, length: number, options: { N: number; r: number; p: number }) => new Promise<Buffer>((resolve, reject) => scryptCallback(password, salt, length, options, (error, key) => error ? reject(error) : resolve(key as Buffer)));
 const SESSION_COOKIE = "coder_session";
 const SESSION_DAYS = 30;
 const SCRYPT_N = 16384, SCRYPT_R = 8, SCRYPT_P = 1;
-const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+// Login shares the sliding window limiter from ratelimit.ts, so one deployment tunes a
+// single number (RATE_LIMIT_LOGIN_PER_15MIN) instead of two different hard-coded limits.
+const loginAttempts = limiterFor("login");
 export function allowLoginAttempt(key: string) {
-  const now = Date.now(); const current = loginAttempts.get(key);
-  if (!current || current.resetAt <= now) { loginAttempts.set(key, { count: 1, resetAt: now + 15 * 60_000 }); return true; }
-  if (current.count >= 10) return false; current.count += 1; return true;
+  return loginAttempts.allow(key);
 }
 
 export type AuthUser = { id: string; email: string; displayName: string };

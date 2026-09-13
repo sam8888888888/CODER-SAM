@@ -125,3 +125,27 @@
 
 /* Pesan galat pada layar pemulihan kata sandi dan formulir masuk. */
 .auth-error, .settings-card .error { color: #fda4af; font-size: 13px; }
+
+/* Tabel admin workspace (halaman Pengaturan) */
+.admin-table { width: 100%; border-collapse: collapse; margin: 10px 0 18px; font-size: 13px; }
+.admin-table th { text-align: left; padding: 8px 10px; color: #94a3b8; font-weight: 600; border-bottom: 1px solid rgba(148, 163, 184, .25); white-space: nowrap; }
+.admin-table td { padding: 8px 10px; border-bottom: 1px solid rgba(148, 163, 184, .12); vertical-align: middle; }
+.admin-table tr:hover td { background: rgba(148, 163, 184, .06); }
+.admin-table .link-button { padding: 4px 8px; }
+
+/* Zona berbahaya: hapus proyek, workspace, atau akun */
+.danger-zone { border: 1px solid rgba(248, 113, 113, .45); background: rgba(127, 29, 29, .12); }
+.danger-zone .settings-heading { color: #fca5a5; }
+
+.btn-danger {
+  background: #b91c1c; color: #fff; border: 1px solid #dc2626; border-radius: 10px;
+  padding: 9px 14px; font-weight: 600; cursor: pointer;
+}
+.btn-danger:hover:not(:disabled) { background: #dc2626; }
+.btn-danger:disabled { opacity: .5; cursor: not-allowed; }
+.link-button.danger { color: #fca5a5; }
+
+/* Pratinjau artifact di dalam halaman */
+.artifact-preview-box { flex-basis: 100%; margin-top: 8px; }
+.artifact-preview { max-width: 100%; max-height: 420px; border-radius: 10px; border: 1px solid rgba(148, 163, 184, .25); }
+.artifact-preview-text { max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: rgba(15, 23, 42, .55); border: 1px solid rgba(148, 163, 184, .2); border-radius: 10px; padding: 10px; font-size: 12px; }

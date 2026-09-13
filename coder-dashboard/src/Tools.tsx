@@ -37,6 +37,9 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
   const [executionDetail, setExecutionDetail] = useState<ExecutionDetail | null>(null);
   const [runInput, setRunInput] = useState('');
   const [intervalMinutes, setIntervalMinutes] = useState(60);
+  const [cron, setCron] = useState('');
+  const [previewId, setPreviewId] = useState<string | null>(null);
+  const [previewText, setPreviewText] = useState('');
 
   // Team state
   const [members, setMembers] = useState<Member[]>([]);
@@ -72,6 +75,43 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
   async function loadAudit() { if (workspaceId) setAudit(await api.auditEvents(workspaceId)); }
   async function loadTeam() { if (!workspaceId) return; setMembers(await api.members(workspaceId)); setInvitations(await api.invitations(workspaceId)); }
   async function loadArtifacts() { setArtifacts(await api.artifacts(projectId)); }
+
+  /** Shows an artifact inside the page: image and PDF are rendered, text is loaded as plain text. */
+  async function openPreview(artifact: Artifact) {
+    setPreviewId(previewId === artifact.id ? null : artifact.id);
+    setPreviewText('');
+    const type = artifact.mimeType || '';
+    if (type.startsWith('image/') || type === 'application/pdf') return;
+    try {
+      const response = await fetch(api.artifactRawUrl(artifact.id), { credentials: 'include' });
+      setPreviewText(response.ok ? (await response.text()).slice(0, 4000) : 'Gagal memuat pratinjau.');
+    } catch (error) {
+      setPreviewText(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /** Removes one artifact after the user confirms. */
+  async function removeArtifact(artifact: Artifact) {
+    if (!window.confirm(`Hapus artifact "${artifact.name}"?`)) return;
+    await guard(async () => {
+      await api.deleteArtifact(artifact.id);
+      if (previewId === artifact.id) { setPreviewId(null); setPreviewText(''); }
+      await loadArtifacts();
+      setMessage(`Artifact "${artifact.name}" sudah dihapus.`);
+    });
+  }
+
+  /** Removes the selected workflow after the user confirms. */
+  async function removeWorkflow(workflow: Workflow) {
+    if (!window.confirm(`Hapus workflow "${workflow.name}" beserta riwayat eksekusinya?`)) return;
+    await guard(async () => {
+      await api.deleteWorkflow(workflow.id);
+      if (selectedId === workflow.id) setSelectedId('');
+      setExecutionDetail(null);
+      await loadWorkflows();
+      setMessage(`Workflow "${workflow.name}" sudah dihapus.`);
+    });
+  }
   async function loadUsage() { const data = await api.usage(projectId, 30); setUsage(data.totals); setUsageModels(data.byModel); setUsageNote(data.note); }
 
   /** Reads a picked file as Base64 and uploads it as a knowledge document. */
@@ -184,7 +224,7 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
         {workflows.map((workflow) => (
           <div key={workflow.id} className={workflow.id === selectedId ? 'selected' : ''}>
             <b>{workflow.name}</b>
-            <small>{workflow.status} · {workflow.steps?.length ?? 0} langkah{workflow.scheduleEnabled ? ` · tiap ${workflow.intervalMinutes} menit` : ''}</small>
+            <small>{workflow.status} · {workflow.steps?.length ?? 0} langkah{workflow.scheduleEnabled ? (workflow.cron ? ` · cron ${workflow.cron}` : ` · tiap ${workflow.intervalMinutes} menit`) : ''}</small>
             <button type="button" onClick={() => pickWorkflow(workflow)}>Buka</button>
           </div>
         ))}
@@ -260,11 +300,18 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
           <div className="tool-row wrap">
             <label>Jadwal tiap <input type="number" min={1} max={20160} value={intervalMinutes} onChange={(event) => setIntervalMinutes(Number(event.target.value))} /> menit</label>
             <button type="button" disabled={busy} onClick={() => void guard(async () => {
-              const result = await api.scheduleWorkflow(selected.id, intervalMinutes, true); await loadWorkflows(); setMessage(`Jadwal aktif. Run berikutnya ${result.nextRunAt ?? '-'}.`);
-            })}>Aktifkan jadwal</button>
+              const result = await api.scheduleWorkflow(selected.id, intervalMinutes, true); setCron(''); await loadWorkflows(); setMessage(`Jadwal aktif. Run berikutnya ${result.nextRunAt ?? '-'}.`);
+            })}>Aktifkan jadwal interval</button>
+            <label>Cron (UTC, 5 bagian) <input value={cron} onChange={(event) => setCron(event.target.value)} placeholder="0 9 * * 1" /></label>
+            <button type="button" disabled={busy || !cron.trim()} onClick={() => void guard(async () => {
+              const result = await api.scheduleWorkflow(selected.id, null, true, cron.trim());
+              await loadWorkflows();
+              setMessage(`Jadwal cron aktif (${result.description ?? result.cron ?? cron}). Run berikutnya ${result.nextRunAt ?? '-'}.`);
+            })}>Aktifkan jadwal cron</button>
             <button type="button" disabled={busy} onClick={() => void guard(async () => {
-              await api.scheduleWorkflow(selected.id, null, false); await loadWorkflows(); setMessage('Jadwal dimatikan.');
+              await api.scheduleWorkflow(selected.id, null, false); setCron(''); await loadWorkflows(); setMessage('Jadwal dimatikan.');
             })}>Matikan jadwal</button>
+            <button type="button" className="link-button danger" disabled={busy} onClick={() => void removeWorkflow(selected)}>Hapus workflow</button>
           </div>
 
           <div className="tool-list">
@@ -371,6 +418,17 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
             <b>{artifact.name}</b>
             <small>{artifact.mimeType} · {(artifact.sizeBytes / 1024).toFixed(1)} KB · {artifact.sha256.slice(0, 10)}…</small>
             <a className="download" href={`/api/v1/artifacts/${artifact.id}/download`} target="_blank" rel="noreferrer">Unduh</a>
+            <button type="button" className="link-button" onClick={() => void openPreview(artifact)}>{previewId === artifact.id ? 'Tutup pratinjau' : 'Pratinjau'}</button>
+            <button type="button" className="link-button danger" onClick={() => void removeArtifact(artifact)}>Hapus</button>
+            {previewId === artifact.id && (
+              <div className="artifact-preview-box">
+                {(artifact.mimeType || '').startsWith('image/')
+                  ? <img className="artifact-preview" src={api.artifactRawUrl(artifact.id)} alt={artifact.name} />
+                  : artifact.mimeType === 'application/pdf'
+                    ? <iframe className="artifact-preview" src={api.artifactRawUrl(artifact.id)} title={artifact.name} />
+                    : <pre className="artifact-preview-text">{previewText || 'Memuat pratinjau…'}</pre>}
+              </div>
+            )}
           </div>
         ))}
         {!artifacts.length && <small>Belum ada artifact di project ini.</small>}
@@ -393,6 +451,10 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
             <div className="stat"><b>{usage.estimatedRuns}</b><small>run dengan estimasi teks</small></div>
           </div>
           <small>{usageNote || 'Token dari engine; run tanpa angka engine ditandai estimasi.'}</small>
+          <div className="tool-row wrap">
+            <a className="download" href={api.usageCsvUrl(projectId)} download>Unduh pemakaian (CSV)</a>
+            <small>Isi CSV: waktu, model, provider, run, token, dan biaya per run beserta baris TOTAL.</small>
+          </div>
           <div className="tool-list">
             {usageModels.map((row) => (
               <div key={`${row.provider}-${row.model}`}>

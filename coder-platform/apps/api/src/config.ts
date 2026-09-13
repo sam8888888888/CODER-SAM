@@ -22,6 +22,8 @@ const Env = z.object({
   SMTP_PASSWORD: z.string().optional(),
   SMTP_FROM: z.string().default("COBLAI Coder <no-reply@coder.sam.university>"),
   SMTP_SECURE: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
+  // When true every state changing request must also echo the CSRF cookie in the x-csrf-token header.
+  CSRF_STRICT: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
   // Platform administrators may inspect every workspace. Comma separated email list, plus users with is_admin=1.
   PLATFORM_ADMIN_EMAILS: z.string().default(""),
   // Cost and speed guards. Zero means "no limit".

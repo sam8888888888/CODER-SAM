@@ -214,6 +214,24 @@ check("run history answers with a list", runHistory.status === 200 && Array.isAr
 const renameTarget = await call("PATCH", `/api/v1/projects/${projectId}`, { name: `Smoke Project ${Date.now()}` });
 check("project can be renamed", renameTarget.status === 200 && typeof renameTarget.json.project?.name === "string", JSON.stringify(renameTarget.json).slice(0, 200));
 
+// New in 0.10.0: profile edit, usage export, artifact preview, and the delete endpoints.
+const profile = await call("PATCH", "/api/v1/auth/me", { displayName: login.json.user.displayName || "Pemilik Platform" });
+check("display name can be saved", profile.status === 200 && typeof profile.json.user?.displayName === "string", JSON.stringify(profile.json).slice(0, 200));
+const badProfile = await call("PATCH", "/api/v1/auth/me", { displayName: "x" });
+check("a too short display name is refused", badProfile.status === 400 && badProfile.json.error === "INVALID_DISPLAY_NAME", JSON.stringify(badProfile.json));
+const usageCsv = await call("GET", `/api/v1/projects/${projectId}/usage/export`);
+check("usage export answers with CSV", usageCsv.status === 200 && typeof usageCsv.json === "string" && usageCsv.json.includes("cost_micros"), JSON.stringify(usageCsv.json).slice(0, 160));
+const missingRaw = await call("GET", "/api/v1/artifacts/00000000-0000-0000-0000-000000000000/raw");
+check("artifact preview refuses an unknown artifact", missingRaw.status === 404 && missingRaw.json.error === "ARTIFACT_NOT_FOUND", JSON.stringify(missingRaw.json));
+const missingProject = await call("DELETE", "/api/v1/projects/00000000-0000-0000-0000-000000000000");
+check("project delete refuses an unknown project", missingProject.status === 404 && missingProject.json.error === "PROJECT_NOT_FOUND", JSON.stringify(missingProject.json));
+const missingWorkflow = await call("DELETE", "/api/v1/workflows/00000000-0000-0000-0000-000000000000");
+check("workflow delete refuses an unknown workflow", missingWorkflow.status === 404 && missingWorkflow.json.error === "WORKFLOW_NOT_FOUND", JSON.stringify(missingWorkflow.json));
+const badConfirm = await call("DELETE", `/api/v1/workspaces/${workspaceId}`, { confirm: "nama-yang-salah" });
+check("workspace delete asks for the exact name", badConfirm.status === 400 && badConfirm.json.error === "CONFIRM_REQUIRED", JSON.stringify(badConfirm.json));
+const badAccount = await call("DELETE", "/api/v1/auth/account", { password: PASSWORD, confirm: "salah" });
+check("account delete asks for the exact phrase", badAccount.status === 400 && badAccount.json.error === "CONFIRM_REQUIRED", JSON.stringify(badAccount.json));
+
 const adminBlocked = await call("GET", "/api/v1/admin/overview");
 check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));
 const metricsBlocked = await call("GET", "/metrics");

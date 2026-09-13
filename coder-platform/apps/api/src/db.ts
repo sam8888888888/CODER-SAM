@@ -220,9 +220,12 @@ try { db.exec("ALTER TABLE workspaces ADD COLUMN daily_cost_limit_micros INTEGER
 try { db.exec("ALTER TABLE workspaces ADD COLUMN monthly_cost_limit_micros INTEGER"); } catch {}
 try { db.exec("ALTER TABLE workspaces ADD COLUMN runs_per_hour_limit INTEGER"); } catch {}
 
+// Cron schedules live next to the interval schedules so one workflow can use either shape.
+try { db.exec("ALTER TABLE workflows ADD COLUMN schedule_cron TEXT"); } catch {}
+
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 6;
-export const SCHEMA_VERSION_NOTE = "cost guards, notifications, auth tokens, admin flags";
+const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION_NOTE = "cost guards, notifications, auth tokens, admin flags, cron schedules";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

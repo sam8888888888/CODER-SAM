@@ -9,4 +9,6 @@ COPY coder-platform/public ./public
 RUN mkdir -p /app/data /app/backups /app/engine-sessions
 ENV NODE_ENV=production HOST=0.0.0.0 PORT=3402 DATA_DIR=/app/data PUBLIC_DIR=/app/public PRIME_AGENT_BIN=prime-agent ENGINE_ROOT_DIR=/app/engine-sessions
 EXPOSE 3402
+# The platform can now tell whether the API is serving traffic, not just whether the process exists.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD node -e "fetch('http://127.0.0.1:3402/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 CMD ["node", "dist/api/server.js"]

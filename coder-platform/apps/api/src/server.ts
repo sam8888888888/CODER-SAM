@@ -4,7 +4,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { extname, join, normalize } from "node:path";
 import { mkdirSync } from "node:fs";
-import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
 import { estimateCostMicros } from "./model-prices.js";
 import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
@@ -16,8 +16,13 @@ import { currentSessionId, revokeOtherSessions, sessionIdForToken, touchSession 
 import { engine } from "./engine.js";
 import { createExecution, recordAudit, runExecution, scheduleNextRun } from "./workflow-engine.js";
 import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
+import { checkRequestOrigin, constantTimeEquals, csrfCookieOptions, generateCsrfToken } from "./csrf.js";
+import { limiterFor } from "./ratelimit.js";
+import { describeCron, nextCronRun, validateCronExpression } from "./cron.js";
 
-const app = Fastify({ logger: true, trustProxy: false });
+// trustProxy is on because the API only listens on 127.0.0.1 behind nginx, which sets X-Forwarded-For.
+// Without it every request would look like it came from the proxy and rate limits would lump users together.
+const app = Fastify({ logger: true, trustProxy: true });
 type Subscriber = (event: { type: string; data: unknown }) => void;
 const subscribers = new Map<string, Set<Subscriber>>();
 function publishRunEvent(runId: string, type: string, data: unknown) {
@@ -25,6 +30,60 @@ function publishRunEvent(runId: string, type: string, data: unknown) {
   for (const send of subscribers.get(runId) ?? []) send({ type, data });
 }
 function subscribeRun(runId: string, send: Subscriber) { const set = subscribers.get(runId) ?? new Set<Subscriber>(); set.add(send); subscribers.set(runId, set); return () => { set.delete(send); if (!set.size) subscribers.delete(runId); }; }
+/** True when the member may change workspace level settings and delete projects. */
+function canManageWorkspace(workspaceId: string, userId: string) {
+  const role = membershipRole(workspaceId, userId);
+  return role === "owner" || role === "admin";
+}
+
+/** Counts the platform admins so the last one can never delete their own account. */
+function platformAdminCount() {
+  const list = config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+  const placeholders = list.map(() => "?").join(",");
+  const sql = `SELECT COUNT(*) AS total FROM users WHERE is_admin=1${list.length ? ` OR lower(email) IN (${placeholders})` : ""}`;
+  return (db.prepare(sql).get(...list) as { total: number }).total;
+}
+
+/** Deletes every row that belongs to a project. Children go first so the foreign keys stay satisfied. */
+function removeProjectData(projectId: string) {
+  db.prepare("DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE project_id=?)").run(projectId);
+  db.prepare("DELETE FROM workflow_execution_steps WHERE execution_id IN (SELECT id FROM workflow_executions WHERE project_id=?)").run(projectId);
+  db.prepare("DELETE FROM workflow_executions WHERE project_id=?").run(projectId);
+  db.prepare("DELETE FROM workflows WHERE project_id=?").run(projectId);
+  db.prepare("DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE project_id=?) OR run_id IN (SELECT id FROM runs WHERE project_id=?)").run(projectId, projectId);
+  for (const document of db.prepare("SELECT id FROM knowledge_documents WHERE project_id=?").all(projectId) as { id: string }[]) deleteDocument(document.id);
+  db.prepare("DELETE FROM run_usage WHERE project_id=?").run(projectId);
+  db.prepare("DELETE FROM artifacts WHERE project_id=?").run(projectId);
+  db.prepare("DELETE FROM runs WHERE project_id=?").run(projectId);
+  db.prepare("DELETE FROM conversations WHERE project_id=?").run(projectId);
+  db.prepare("DELETE FROM projects WHERE id=?").run(projectId);
+}
+
+/** Deletes a project row and its children, then removes the stored artifact files. */
+async function deleteProjectFully(projectId: string) {
+  db.transaction(() => removeProjectData(projectId))();
+  await rm(join(config.DATA_DIR, "artifacts", projectId), { recursive: true, force: true }).catch(() => undefined);
+}
+
+/** Deletes a workspace, every project inside it, and the related invitations and notifications. */
+async function deleteWorkspaceFully(workspaceId: string) {
+  for (const project of db.prepare("SELECT id FROM projects WHERE workspace_id=?").all(workspaceId) as { id: string }[]) {
+    await deleteProjectFully(project.id);
+  }
+  db.transaction(() => {
+    db.prepare("DELETE FROM workspace_invitations WHERE workspace_id=?").run(workspaceId);
+    db.prepare("DELETE FROM memberships WHERE workspace_id=?").run(workspaceId);
+    db.prepare("DELETE FROM notifications WHERE workspace_id=?").run(workspaceId);
+    db.prepare("DELETE FROM workspaces WHERE id=?").run(workspaceId);
+  })();
+}
+
+/** Escapes one CSV field. */
+function csvField(value: unknown) {
+  const text = value === null || value === undefined ? "" : String(value);
+  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
 function membershipRole(workspaceId: string, userId: string) { return (db.prepare("SELECT role FROM memberships WHERE workspace_id=? AND user_id=?").get(workspaceId,userId) as { role: string } | undefined)?.role; }
 function workflowAccess(workflowId: string, userId: string) {
   const row = db.prepare("SELECT w.id, w.project_id AS projectId, w.name, w.description, w.status, p.workspace_id AS workspaceId FROM workflows w JOIN projects p ON p.id=w.project_id WHERE w.id=?").get(workflowId) as any;
@@ -150,10 +209,17 @@ function startWorkflowExecution(executionId: string) {
 function startWorkflowScheduler() {
   const timer = setInterval(() => {
     try {
-      const due = db.prepare("SELECT id, schedule_interval_minutes AS intervalMinutes FROM workflows WHERE schedule_enabled=1 AND status='published' AND next_run_at IS NOT NULL AND next_run_at <= ?").all(new Date().toISOString()) as any[];
+      const due = db.prepare(`SELECT id, schedule_interval_minutes AS intervalMinutes, schedule_cron AS cron FROM workflows
+        WHERE schedule_enabled=1 AND status='published' AND next_run_at IS NOT NULL AND next_run_at <= ?`).all(new Date().toISOString()) as any[];
       for (const workflow of due) {
         const executionId = createExecution(workflow.id, "scheduled run", null);
-        scheduleNextRun(workflow.id, workflow.intervalMinutes ?? null);
+        if (workflow.cron) {
+          // Cron schedules are pinned to the exact minute, so the next run is recomputed from now.
+          const next = nextCronRun(String(workflow.cron), new Date());
+          db.prepare("UPDATE workflows SET last_run_at=?, next_run_at=? WHERE id=?").run(new Date().toISOString(), next, workflow.id);
+        } else {
+          scheduleNextRun(workflow.id, workflow.intervalMinutes ?? null);
+        }
         if (executionId) startWorkflowExecution(executionId);
       }
     } catch (error) { app.log.error(error); }
@@ -176,6 +242,55 @@ function slugifyText(value: string) {
   return base || "proyek";
 }
 
+/** Independent limiters for the entry points that can be abused. */
+const registerLimiter = limiterFor("register");
+const passwordLimiter = limiterFor("password");
+const apiLimiter = limiterFor("api");
+const allowedOrigins = [config.PUBLIC_BASE_URL].filter(Boolean).map((value) => value.replace(/\/+$/, ""));
+
+/**
+ * CSRF defence. Level one always runs: a state changing request whose Origin or
+ * Sec-Fetch-Site says it came from another site is refused. Level two runs when
+ * CSRF_STRICT is on and additionally requires the double submit token that the
+ * public cookie and the x-csrf-token header share.
+ */
+app.addHook("onRequest", async (request: any, reply) => {
+  // The readable token cookie is only issued in token mode, so clients that do not use
+  // token mode keep receiving exactly one cookie and existing clients stay compatible.
+  if (config.CSRF_STRICT && !request.cookies?.coder_csrf) reply.setCookie("coder_csrf", generateCsrfToken(), csrfCookieOptions(config.NODE_ENV === "production"));
+  const method = String(request.method).toUpperCase();
+  if (method !== "POST" && method !== "PUT" && method !== "PATCH" && method !== "DELETE") return;
+  const path = String(request.url).split("?")[0];
+  if (path === "/health" || path === "/ready" || path === "/metrics") return;
+  const decision = checkRequestOrigin({
+    origin: request.headers.origin as string | undefined,
+    secFetchSite: request.headers["sec-fetch-site"] as string | undefined,
+    host: request.headers.host as string | undefined,
+    allowedOrigins,
+  });
+  if (!decision.ok) {
+    return reply.code(403).send({ error: "CSRF_BLOCKED", reason: decision.reason, message: "Permintaan ditolak karena asal permintaan tidak dikenali. Muat ulang halaman lalu coba lagi." });
+  }
+  if (config.CSRF_STRICT) {
+    const cookie = request.cookies?.coder_csrf as string | undefined;
+    const header = request.headers["x-csrf-token"] as string | undefined;
+    if (!cookie || !header || !constantTimeEquals(cookie, header)) {
+      return reply.code(403).send({ error: "CSRF_TOKEN_REQUIRED", message: "Token keamanan tidak cocok. Muat ulang halaman lalu coba lagi." });
+    }
+  }
+});
+
+/** Keeps one client from flooding the API. Auth routes carry their own tighter limit. */
+app.addHook("preHandler", async (request: any, reply) => {
+  if (config.NODE_ENV === "test") return; // the end-to-end suites fire hundreds of requests from one address
+  const path = String(request.url).split("?")[0];
+  if (!path.startsWith("/api/")) return;
+  const key = request.ip ?? "unknown";
+  if (!apiLimiter.allow(key)) {
+    return reply.code(429).send({ error: "RATE_LIMITED", retryAfter: apiLimiter.retryAfterSeconds(key), message: "Terlalu banyak permintaan dari koneksi ini. Tunggu sebentar lalu coba lagi." });
+  }
+});
+
 app.get("/health", async () => ({ status: "ok", service: "coder-api", time: new Date().toISOString() }));
 app.get("/ready", async (_request, reply) => {
   const result = db.prepare("SELECT 1 AS ok").get() as { ok: number };
@@ -189,6 +304,7 @@ app.get("/api/v1/auth/me", async (request, reply) => {
   return { user };
 });
 app.post<{ Body: { email?: string; password?: string; displayName?: string } }>("/api/v1/auth/register", async (request, reply) => {
+  if (!registerLimiter.allow(request.ip ?? "unknown")) return reply.code(429).send({ error: "RATE_LIMITED", message: "Terlalu banyak pendaftaran dari koneksi ini. Coba lagi nanti." });
   const email = request.body?.email?.trim().toLowerCase(); const password = request.body?.password ?? ""; const displayName = request.body?.displayName?.trim();
   if (!email || !/^\S+@\S+\.\S+$/.test(email) || password.length < 10 || !displayName) return reply.code(400).send({ error: "INVALID_REGISTRATION" });
   const now = new Date().toISOString(); const userId = randomUUID(); const workspaceId = randomUUID(); const slug = `workspace-${userId.slice(0, 8)}`;
@@ -307,6 +423,7 @@ app.post("/api/v1/auth/email/verify/request", { preHandler: requireUser }, async
 });
 
 app.post<{ Body: { email?: string } }>("/api/v1/auth/password/forgot", async (request, reply) => {
+  if (!passwordLimiter.allow(request.ip ?? "unknown")) return reply.code(429).send({ error: "RATE_LIMITED", message: "Terlalu banyak permintaan reset kata sandi. Coba lagi nanti." });
   const email = request.body?.email?.trim().toLowerCase();
   if (!email) return reply.code(400).send({ error: "EMAIL_REQUIRED" });
   const user = db.prepare("SELECT id, email, display_name AS displayName FROM users WHERE email=?").get(email) as { id: string; email: string; displayName: string } | undefined;
@@ -322,6 +439,7 @@ app.post<{ Body: { email?: string } }>("/api/v1/auth/password/forgot", async (re
 });
 
 app.post<{ Body: { token?: string; password?: string } }>("/api/v1/auth/password/reset", async (request, reply) => {
+  if (!passwordLimiter.allow(request.ip ?? "unknown")) return reply.code(429).send({ error: "RATE_LIMITED", message: "Terlalu banyak percobaan reset kata sandi. Coba lagi nanti." });
   const raw = request.body?.token?.trim(); const password = request.body?.password ?? "";
   if (!raw) return reply.code(400).send({ error: "TOKEN_REQUIRED" });
   if (password.length < 10) return reply.code(400).send({ error: "WEAK_PASSWORD", detail: "minimal 10 karakter" });
@@ -783,7 +901,7 @@ app.post<{ Body: { token?: string } }>("/api/v1/invitations/accept", { preHandle
 app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/workflows", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id);
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
-  return db.prepare("SELECT id, project_id AS projectId, name, description, steps_json AS stepsJson, status, schedule_enabled AS scheduleEnabled, schedule_interval_minutes AS intervalMinutes, next_run_at AS nextRunAt, last_run_at AS lastRunAt, created_at AS createdAt, updated_at AS updatedAt FROM workflows WHERE project_id=? ORDER BY updated_at DESC").all(request.params.projectId).map((w: any) => ({ ...w, steps: JSON.parse(w.stepsJson), stepsJson: undefined, scheduleEnabled: Boolean(w.scheduleEnabled) }));
+  return db.prepare("SELECT id, project_id AS projectId, name, description, steps_json AS stepsJson, status, schedule_enabled AS scheduleEnabled, schedule_interval_minutes AS intervalMinutes, schedule_cron AS cron, next_run_at AS nextRunAt, last_run_at AS lastRunAt, created_at AS createdAt, updated_at AS updatedAt FROM workflows WHERE project_id=? ORDER BY updated_at DESC").all(request.params.projectId).map((w: any) => ({ ...w, steps: JSON.parse(w.stepsJson), stepsJson: undefined, scheduleEnabled: Boolean(w.scheduleEnabled), scheduleDescription: w.cron ? describeCron(String(w.cron)) : null }));
 });
 app.post<{ Params: { projectId: string }; Body: { name?: string; description?: string; steps?: unknown[] } }>("/api/v1/projects/:projectId/workflows", { preHandler: requireUser }, async (request: any, reply) => {
   const project = db.prepare("SELECT workspace_id AS workspaceId FROM projects WHERE id=?").get(request.params.projectId) as { workspaceId: string } | undefined;
@@ -886,18 +1004,29 @@ app.put<{ Params: { workflowId: string }; Body: { name?: string; description?: s
   return { id: access.id, name, description, steps, updatedAt: now };
 });
 
-app.post<{ Params: { workflowId: string }; Body: { intervalMinutes?: number; enabled?: boolean } }>("/api/v1/workflows/:workflowId/schedule", { preHandler: requireUser }, async (request: any, reply) => {
+app.post<{ Params: { workflowId: string }; Body: { intervalMinutes?: number; cron?: string | null; enabled?: boolean } }>("/api/v1/workflows/:workflowId/schedule", { preHandler: requireUser }, async (request: any, reply) => {
   const access = workflowAccess(request.params.workflowId, request.user!.id);
   if (!access) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
   if (access.role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
   const interval = request.body?.intervalMinutes === null || request.body?.intervalMinutes === undefined ? null : Number(request.body.intervalMinutes);
+  const cron = request.body?.cron === null || request.body?.cron === undefined ? null : String(request.body.cron).trim();
   const enabled = Boolean(request.body?.enabled);
-  if (enabled && (!interval || Number.isNaN(interval) || interval < 1 || interval > 20_160)) return reply.code(400).send({ error: "INVALID_SCHEDULE" });
   const now = new Date();
+  if (enabled && cron) {
+    // A cron expression wins over the interval, because it is the more specific instruction.
+    const check = validateCronExpression(cron);
+    if (!check.ok) return reply.code(400).send({ error: "INVALID_CRON", detail: check.error });
+    const next = nextCronRun(cron, now);
+    if (!next) return reply.code(400).send({ error: "INVALID_CRON", detail: "Jadwal tidak menghasilkan waktu berikutnya." });
+    db.prepare("UPDATE workflows SET schedule_enabled=1, schedule_interval_minutes=NULL, schedule_cron=?, next_run_at=?, updated_at=? WHERE id=?").run(cron, next, now.toISOString(), access.id);
+    recordAudit(access.workspaceId, request.user!.id, "workflow.schedule.updated", { workflowId: access.id, enabled: true, cron });
+    return { id: access.id, scheduleEnabled: true, intervalMinutes: null, cron, nextRunAt: next, description: describeCron(cron) };
+  }
+  if (enabled && (!interval || Number.isNaN(interval) || interval < 1 || interval > 20_160)) return reply.code(400).send({ error: "INVALID_SCHEDULE" });
   const next = enabled && interval ? new Date(now.getTime() + interval * 60_000).toISOString() : null;
-  db.prepare("UPDATE workflows SET schedule_enabled=?, schedule_interval_minutes=?, next_run_at=?, updated_at=? WHERE id=?").run(enabled ? 1 : 0, interval, next, now.toISOString(), access.id);
+  db.prepare("UPDATE workflows SET schedule_enabled=?, schedule_interval_minutes=?, schedule_cron=NULL, next_run_at=?, updated_at=? WHERE id=?").run(enabled ? 1 : 0, interval, next, now.toISOString(), access.id);
   recordAudit(access.workspaceId, request.user!.id, "workflow.schedule.updated", { workflowId: access.id, enabled, intervalMinutes: interval });
-  return { id: access.id, scheduleEnabled: enabled, intervalMinutes: interval, nextRunAt: next };
+  return { id: access.id, scheduleEnabled: enabled, intervalMinutes: interval, cron: null, nextRunAt: next };
 });
 
 app.get<{ Params: { workspaceId: string }; Querystring: { limit?: string } }>("/api/v1/workspaces/:workspaceId/audit", { preHandler: requireUser }, async (request: any, reply) => {
@@ -1124,6 +1253,135 @@ app.post<{ Params: { projectId: string }; Body: { name?: string; mimeType?: stri
   const sha256 = createHash("sha256").update(content).digest("hex"); const now = new Date().toISOString();
   db.prepare("INSERT INTO artifacts (id,project_id,run_id,name,mime_type,size_bytes,sha256,storage_path,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(id,request.params.projectId,request.body.runId ?? null,name,mimeType,content.length,sha256,storagePath,now);
   return reply.code(201).send({ id, projectId: request.params.projectId, runId: request.body.runId ?? null, name, mimeType, sizeBytes: content.length, sha256, createdAt: now });
+});
+
+// ---------------------------------------------------------------- profil & akun
+
+app.patch<{ Body: { displayName?: string } }>("/api/v1/auth/me", { preHandler: requireUser }, async (request: any, reply) => {
+  const displayName = String(request.body?.displayName ?? "").trim();
+  if (displayName.length < 2 || displayName.length > 80) return reply.code(400).send({ error: "INVALID_DISPLAY_NAME" });
+  db.prepare("UPDATE users SET display_name=?, updated_at=? WHERE id=?").run(displayName, new Date().toISOString(), request.user!.id);
+  recordAudit(null, request.user!.id, "user.profile_updated", { displayName });
+  return { user: { id: request.user!.id, email: request.user!.email, displayName } };
+});
+
+/**
+ * Deletes the caller's own account. The password and an explicit phrase are both
+ * required, and the last platform admin cannot be removed, so nobody locks the
+ * platform out of its own administration.
+ */
+app.delete<{ Body: { password?: string; confirm?: string } }>("/api/v1/auth/account", { preHandler: requireUser }, async (request: any, reply) => {
+  if (String(request.body?.confirm ?? "").trim().toUpperCase() !== "HAPUS AKUN") return reply.code(400).send({ error: "CONFIRM_REQUIRED" });
+  const row = db.prepare("SELECT password_hash AS passwordHash FROM users WHERE id=?").get(request.user!.id) as { passwordHash: string | null } | undefined;
+  const password = String(request.body?.password ?? "");
+  if (!row?.passwordHash || !password || !(await verifyPassword(password, row.passwordHash))) return reply.code(403).send({ error: "INVALID_PASSWORD" });
+  if (isPlatformAdmin(request.user!) && platformAdminCount() <= 1) return reply.code(409).send({ error: "LAST_ADMIN" });
+  const userId = request.user!.id;
+  const soloWorkspaces = (db.prepare(`SELECT m.workspace_id AS workspaceId FROM memberships m WHERE m.user_id=?
+    AND (SELECT COUNT(*) FROM memberships other WHERE other.workspace_id=m.workspace_id)=1`).all(userId) as { workspaceId: string }[]).map((row) => row.workspaceId);
+  for (const workspaceId of soloWorkspaces) await deleteWorkspaceFully(workspaceId);
+  db.transaction(() => {
+    db.prepare("DELETE FROM auth_sessions WHERE user_id=?").run(userId);
+    db.prepare("DELETE FROM auth_tokens WHERE user_id=?").run(userId);
+    db.prepare("DELETE FROM notifications WHERE user_id=?").run(userId);
+    db.prepare("DELETE FROM memberships WHERE user_id=?").run(userId);
+    db.prepare("DELETE FROM users WHERE id=?").run(userId);
+  })();
+  recordAudit(null, null, "user.account_deleted", { userId, soloWorkspaces });
+  clearSessionCookie(reply as any, config.NODE_ENV === "production");
+  return { ok: true, deletedWorkspaces: soloWorkspaces.length };
+});
+
+// ---------------------------------------------------------------- hapus data
+
+app.delete<{ Params: { projectId: string } }>("/api/v1/projects/:projectId", { preHandler: requireUser }, async (request: any, reply) => {
+  const project = db.prepare("SELECT p.id, p.name, p.workspace_id AS workspaceId FROM projects p WHERE p.id=?").get(request.params.projectId) as { id: string; name: string; workspaceId: string } | undefined;
+  if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const role = membershipRole(project.workspaceId, request.user!.id);
+  if (!role) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  if (!canManageWorkspace(project.workspaceId, request.user!.id)) return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  recordAudit(project.workspaceId, request.user!.id, "project.deleted", { projectId: project.id, name: project.name });
+  await deleteProjectFully(project.id);
+  return { ok: true };
+});
+
+app.delete<{ Params: { workflowId: string } }>("/api/v1/workflows/:workflowId", { preHandler: requireUser }, async (request: any, reply) => {
+  const access = workflowAccess(request.params.workflowId, request.user!.id);
+  if (!access) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
+  if (access.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  const running = db.prepare("SELECT COUNT(*) AS total FROM workflow_executions WHERE workflow_id=? AND status IN ('queued','running','awaiting_approval')").get(access.id) as { total: number };
+  if (running.total > 0) return reply.code(409).send({ error: "WORKFLOW_BUSY" });
+  recordAudit(access.workspaceId, request.user!.id, "workflow.deleted", { workflowId: access.id, name: access.name });
+  db.transaction(() => {
+    db.prepare("DELETE FROM workflow_execution_steps WHERE execution_id IN (SELECT id FROM workflow_executions WHERE workflow_id=?)").run(access.id);
+    db.prepare("DELETE FROM workflow_executions WHERE workflow_id=?").run(access.id);
+    db.prepare("DELETE FROM workflows WHERE id=?").run(access.id);
+  })();
+  return { ok: true };
+});
+
+app.delete<{ Params: { artifactId: string } }>("/api/v1/artifacts/:artifactId", { preHandler: requireUser }, async (request: any, reply) => {
+  const artifact = db.prepare(`SELECT a.id, a.name, a.storage_path AS storagePath, p.workspace_id AS workspaceId FROM artifacts a
+    JOIN projects p ON p.id=a.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE a.id=? AND m.user_id=?`)
+    .get(request.params.artifactId, request.user!.id) as { id: string; name: string; storagePath: string; workspaceId: string } | undefined;
+  if (!artifact) return reply.code(404).send({ error: "ARTIFACT_NOT_FOUND" });
+  if (!canManageWorkspace(artifact.workspaceId, request.user!.id)) {
+    const role = membershipRole(artifact.workspaceId, request.user!.id);
+    if (role !== "member") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  }
+  recordAudit(artifact.workspaceId, request.user!.id, "artifact.deleted", { artifactId: artifact.id, name: artifact.name });
+  db.prepare("DELETE FROM artifacts WHERE id=?").run(artifact.id);
+  await unlink(artifact.storagePath).catch(() => undefined);
+  return { ok: true };
+});
+
+app.delete<{ Params: { workspaceId: string }; Body: { confirm?: string } }>("/api/v1/workspaces/:workspaceId", { preHandler: requireUser }, async (request: any, reply) => {
+  const workspace = db.prepare("SELECT id, name FROM workspaces WHERE id=?").get(request.params.workspaceId) as { id: string; name: string } | undefined;
+  if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (membershipRole(workspace.id, request.user!.id) !== "owner") return reply.code(403).send({ error: "OWNER_REQUIRED" });
+  if (String(request.body?.confirm ?? "").trim() !== workspace.name) return reply.code(400).send({ error: "CONFIRM_REQUIRED", expected: workspace.name });
+  const projects = (db.prepare("SELECT COUNT(*) AS total FROM projects WHERE workspace_id=?").get(workspace.id) as { total: number }).total;
+  recordAudit(workspace.id, request.user!.id, "workspace.deleted", { name: workspace.name, projects });
+  await deleteWorkspaceFully(workspace.id);
+  return { ok: true };
+});
+
+// ---------------------------------------------------------------- unduh tambahan
+
+app.get<{ Params: { projectId: string } }>("/api/v1/projects/:projectId/usage/export", { preHandler: requireUser }, async (request: any, reply) => {
+  const project = db.prepare("SELECT p.id, p.name FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?")
+    .get(request.params.projectId, request.user!.id) as { id: string; name: string } | undefined;
+  if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const rows = db.prepare(`SELECT u.created_at AS createdAt, u.model, u.provider, u.run_id AS runId, u.input_tokens AS inputTokens,
+    u.output_tokens AS outputTokens, u.cache_read_tokens AS cacheReadTokens, u.total_tokens AS totalTokens, u.cost_micros AS costMicros,
+    u.estimated AS estimated FROM run_usage u WHERE u.project_id=? ORDER BY u.created_at`).all(project.id) as any[];
+  const lines = ["tanggal,model,provider,run,input_tokens,output_tokens,cache_read_tokens,total_tokens,cost_micros,cost_usd,perkiraan"];
+  for (const row of rows) {
+    lines.push([row.createdAt, row.model, row.provider, row.runId, row.inputTokens, row.outputTokens, row.cacheReadTokens, row.totalTokens,
+      row.costMicros, (Number(row.costMicros ?? 0) / 1e6).toFixed(6), row.estimated ? "ya" : "tidak"].map(csvField).join(","));
+  }
+  const total = rows.reduce((sum, row) => sum + Number(row.costMicros ?? 0), 0);
+  lines.push([`"TOTAL"`, "", "", `${rows.length} run`, "", "", "", "", total, (total / 1e6).toFixed(6), ""].map(csvField).join(","));
+  const safeName = project.name.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 40) || "proyek";
+  return reply
+    .header("Content-Disposition", `attachment; filename="pemakaian-${safeName}.csv"`)
+    .type("text/csv; charset=utf-8")
+    .send("\uFEFF" + lines.join("\n"));
+});
+
+app.get<{ Params: { artifactId: string } }>("/api/v1/artifacts/:artifactId/raw", { preHandler: requireUser }, async (request: any, reply) => {
+  const artifact = db.prepare(`SELECT a.name, a.mime_type AS mimeType, a.storage_path AS storagePath FROM artifacts a
+    JOIN projects p ON p.id=a.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE a.id=? AND m.user_id=?`)
+    .get(request.params.artifactId, request.user!.id) as { name: string; mimeType: string; storagePath: string } | undefined;
+  if (!artifact) return reply.code(404).send({ error: "ARTIFACT_NOT_FOUND" });
+  try {
+    const content = await readFile(artifact.storagePath);
+    return reply
+      .header("Content-Disposition", `inline; filename="${artifact.name.replaceAll('"', "")}"`)
+      .header("X-Content-Type-Options", "nosniff")
+      .type(artifact.mimeType)
+      .send(content);
+  } catch { return reply.code(404).send({ error: "ARTIFACT_FILE_MISSING" }); }
 });
 
 app.setErrorHandler((error: any, _request, reply) => { app.log.error(error); const status = Number(error.statusCode) >= 400 && Number(error.statusCode) < 500 ? Number(error.statusCode) : 500; return reply.code(status).send({ error: status < 500 ? "INVALID_REQUEST" : "INTERNAL_ERROR" }); });

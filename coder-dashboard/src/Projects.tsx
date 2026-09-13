@@ -7,6 +7,8 @@ type Props = {
   onSelect: (projectId: string) => void;
   /** Dipanggil setelah proyek baru dibuat, supaya proyek itu langsung aktif di seluruh aplikasi. */
   onCreated?: (projectId: string) => void;
+  /** Dipanggil setelah proyek dihapus, supaya aplikasi memilih proyek lain. */
+  onDeleted?: (projectId: string) => void;
 };
 
 /** Ubah error apa pun menjadi pesan teks; pesan server dipakai apa adanya. */
@@ -18,7 +20,7 @@ function errorText(error: unknown) {
  * Halaman "Proyek": pilih proyek aktif, buat proyek baru, dan ganti nama proyek aktif.
  * Semua panggilan API dibungkus try/catch dan pesan galat server ditampilkan apa adanya.
  */
-export function Projects({ workspaceId, projectId, onSelect, onCreated }: Props) {
+export function Projects({ workspaceId, projectId, onSelect, onCreated, onDeleted }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -26,6 +28,8 @@ export function Projects({ workspaceId, projectId, onSelect, onCreated }: Props)
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
+  const [deleteName, setDeleteName] = useState('');
+  const [deleting, setDeleting] = useState(false);
 
   const active = projects.find((item) => item.id === projectId) ?? null;
 
@@ -88,6 +92,24 @@ export function Projects({ workspaceId, projectId, onSelect, onCreated }: Props)
       setError(errorText(err));
     } finally {
       setBusy(false);
+    }
+  }
+
+  /** Hapus proyek aktif beserta seluruh isinya setelah nama diketik ulang. */
+  async function deleteProject() {
+    if (!active) return;
+    setBusy(true); setError(''); setNotice('');
+    try {
+      await api.deleteProject(active.id);
+      setDeleteName('');
+      await loadProjects();
+      setNotice(`Proyek "${active.name}" sudah dihapus.`);
+      onDeleted?.(active.id);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+      setDeleting(false);
     }
   }
 
@@ -164,6 +186,22 @@ export function Projects({ workspaceId, projectId, onSelect, onCreated }: Props)
         </div>
       ) : (
         <p className="empty-side">Pilih satu proyek dulu untuk mengganti namanya.</p>
+      )}
+
+      {active && (
+        <section className="settings-card danger-zone">
+          <span className="section-label">HAPUS PROYEK AKTIF</span>
+          <p className="settings-hint">Menghapus proyek juga menghapus percakapan, run, artefak, knowledge, dan workflow di dalamnya. Tindakan ini tidak bisa dibatalkan.</p>
+          <label>Ketik nama proyek untuk konfirmasi<input value={deleteName} onChange={(event) => setDeleteName(event.target.value)} placeholder={active.name} /></label>
+          <button
+            type="button"
+            className="btn-danger"
+            disabled={busy || deleteName.trim() !== active.name}
+            onClick={() => { setDeleting(true); void deleteProject(); }}
+          >
+            {deleting ? 'Menghapus…' : 'Hapus proyek'}
+          </button>
+        </section>
       )}
 
       {busy && <p className="notice">Memproses…</p>}
