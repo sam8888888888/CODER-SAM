@@ -201,8 +201,9 @@ check("email verify rejects an invalid token", badVerify.status === 400, JSON.st
 
 const limits = await call("PUT", `/api/v1/workspaces/${workspaceId}/limits`, { dailyCostLimitMicros: 1000000, monthlyCostLimitMicros: 0, runsPerHourLimit: 0 });
 check("workspace limits can be set", limits.status === 200 && limits.json.dailyCostLimitMicros === 1000000, JSON.stringify(limits.json));
-const cleared = await call("PUT", `/api/v1/workspaces/${workspaceId}/limits`, { dailyCostLimitMicros: 0, monthlyCostLimitMicros: 0, runsPerHourLimit: 0 });
-check("workspace limits can be cleared", cleared.status === 200 && cleared.json.dailyCostLimitMicros === 0, JSON.stringify(cleared.json));
+const cleared = await call("PUT", `/api/v1/workspaces/${workspaceId}/limits`, { dailyCostLimitMicros: null, monthlyCostLimitMicros: null, runsPerHourLimit: null });
+// null means "use the platform default", which is the state a fresh workspace is in.
+check("workspace limits can be reset to the default", cleared.status === 200 && cleared.json.dailyCostLimitMicros === null, JSON.stringify(cleared.json));
 
 const adminBlocked = await call("GET", "/api/v1/admin/overview");
 check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));
