@@ -89,6 +89,7 @@ export const api = {
   adminWorkspaces: () => request<any[]>('/v1/admin/workspaces'),
   setAdmin: (userId: string, enabled: boolean) => request<{ isAdmin: boolean }>(`/v1/admin/users/${encodeURIComponent(userId)}/admin`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   workspaceLimits: (workspaceId: string, limits: { dailyCostLimitMicros?: number | null; monthlyCostLimitMicros?: number | null; runsPerHourLimit?: number | null }) => request<any>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/limits`, { method: 'PUT', body: JSON.stringify(limits) }),
+  readWorkspaceLimits: (workspaceId: string) => request<{ dailyCostLimitMicros: number | null; monthlyCostLimitMicros: number | null; runsPerHourLimit: number | null; effective: { dailyCostLimitMicros: number; monthlyCostLimitMicros: number; runsPerHourLimit: number } }>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/limits`),
   createWorkspace: (name: string) => request<Workspace>('/v1/workspaces', { method: 'POST', body: JSON.stringify({ name }) }),
   createProject: (workspaceId: string, name: string, description?: string) => request<Project>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/projects`, { method: 'POST', body: JSON.stringify({ name, description }) }),
   updateProject: (projectId: string, patch: { name?: string; description?: string }) => request<{ project: Project }>(`/v1/projects/${encodeURIComponent(projectId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),

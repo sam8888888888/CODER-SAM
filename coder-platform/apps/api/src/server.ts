@@ -405,6 +405,23 @@ app.post<{ Params: { userId: string }; Body: { enabled?: boolean } }>("/api/v1/a
   return { userId: request.params.userId, isAdmin: Boolean(enabled) };
 });
 
+app.get<{ Params: { workspaceId: string } }>("/api/v1/workspaces/:workspaceId/limits", { preHandler: requireUser }, async (request: any, reply) => {
+  const role = membershipRole(request.params.workspaceId, request.user!.id);
+  if (!role) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  // Any member may read the limits; the form needs the current numbers, not just the ability to overwrite them.
+  const row = db.prepare("SELECT daily_cost_limit_micros AS dailyCostLimitMicros, monthly_cost_limit_micros AS monthlyCostLimitMicros, runs_per_hour_limit AS runsPerHourLimit FROM workspaces WHERE id=?").get(request.params.workspaceId) as any;
+  return {
+    dailyCostLimitMicros: row?.dailyCostLimitMicros ?? null,
+    monthlyCostLimitMicros: row?.monthlyCostLimitMicros ?? null,
+    runsPerHourLimit: row?.runsPerHourLimit ?? null,
+    effective: {
+      dailyCostLimitMicros: row?.dailyCostLimitMicros ?? config.DEFAULT_DAILY_COST_LIMIT_MICROS,
+      monthlyCostLimitMicros: row?.monthlyCostLimitMicros ?? config.DEFAULT_MONTHLY_COST_LIMIT_MICROS,
+      runsPerHourLimit: row?.runsPerHourLimit ?? config.DEFAULT_RUNS_PER_HOUR_LIMIT,
+    },
+  };
+});
+
 app.put<{ Params: { workspaceId: string }; Body: { dailyCostLimitMicros?: number | null; monthlyCostLimitMicros?: number | null; runsPerHourLimit?: number | null } }>("/api/v1/workspaces/:workspaceId/limits", { preHandler: requireUser }, async (request: any, reply) => {
   const role = membershipRole(request.params.workspaceId, request.user!.id);
   if (!role) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });

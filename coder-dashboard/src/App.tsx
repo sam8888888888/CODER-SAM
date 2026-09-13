@@ -13,7 +13,7 @@ const starterPrompts = ['Tinjau kode saya dan temukan masalahnya', 'Buatkan renc
 function App() {
   const [user, setUser] = useState<User | null>(null); const [toolsOpen, setToolsOpen] = useState(false); const [projectId, setProjectId] = useState<string | null>(null); const [workspaceId, setWorkspaceId] = useState<string | null>(null)
   // Left navigation is the map of the platform: every page is reachable without a modal.
-  const [page, setPage] = useState<PageKey>('home'); const [workspaceOptions, setWorkspaceOptions] = useState<Workspace[]>([]); const [projectOptions, setProjectOptions] = useState<Project[]>([]); const [settingsOpen, setSettingsOpen] = useState(false); const [sessions, setSessions] = useState<Session[]>([]); const [current, setCurrent] = useState<string | null>(null); const [messages, setMessages] = useState<Message[]>([]); const [prompt, setPrompt] = useState(''); const [busy, setBusy] = useState(false); const [sidebar, setSidebar] = useState(false); const [authOpen, setAuthOpen] = useState(false); const [notifOpen, setNotifOpen] = useState(false); const [notifItems, setNotifItems] = useState<{ id: string; kind: string; title: string; body: string | null; readAt: string | null; createdAt: string }[]>([]); const [notifUnread, setNotifUnread] = useState(0); const [banner, setBanner] = useState(''); const [resetToken, setResetToken] = useState<string | null>(null); const [authMode, setAuthMode] = useState<'login'|'register'>('login'); const [error, setError] = useState(''); const [online, setOnline] = useState(true); const [notice, setNotice] = useState(''); const [query, setQuery] = useState(''); const [activeRun, setActiveRun] = useState<string | null>(null); const endRef = useRef<HTMLDivElement>(null);
+  const [page, setPage] = useState<PageKey>('home'); const [workspaceOptions, setWorkspaceOptions] = useState<Workspace[]>([]); const [projectOptions, setProjectOptions] = useState<Project[]>([]); const [settingsOpen, setSettingsOpen] = useState(false); const [sessions, setSessions] = useState<Session[]>([]); const [current, setCurrent] = useState<string | null>(null); const [messages, setMessages] = useState<Message[]>([]); const [prompt, setPrompt] = useState(''); const [busy, setBusy] = useState(false); const [sidebar, setSidebar] = useState(false); const [authOpen, setAuthOpen] = useState(false); const [notifOpen, setNotifOpen] = useState(false); const [notifItems, setNotifItems] = useState<{ id: string; kind: string; title: string; body: string | null; readAt: string | null; createdAt: string }[]>([]); const [notifUnread, setNotifUnread] = useState(0); const [banner, setBanner] = useState(''); const [resetToken, setResetToken] = useState<string | null>(null); const [inviteToken, setInviteToken] = useState<string | null>(null); const [authMode, setAuthMode] = useState<'login'|'register'>('login'); const [error, setError] = useState(''); const [online, setOnline] = useState(true); const [notice, setNotice] = useState(''); const [query, setQuery] = useState(''); const [activeRun, setActiveRun] = useState<string | null>(null); const endRef = useRef<HTMLDivElement>(null);
   // Signed out visitors always land on the chat surface; pages belong to signed in users.
   const view = user ? page : 'chat';
   const hasChat = Boolean(current || messages.length);
@@ -28,10 +28,35 @@ function App() {
     } else if (token && (path.includes('reset-password') || params.get('reset') === '1')) {
       setResetToken(token);
     }
+    // Invitation links are created in the Team tab as /?invitation=<token>; the token is accepted after sign-in.
+    const invite = params.get('invitation');
+    if (invite) setInviteToken(invite);
     api.me().then(d => { setUser(d.user); setOnline(true); loadSessions().catch(() => setOnline(false)); void loadNotifications(); }).catch(() => { setOnline(false); });
   }, []);
   async function loadNotifications() { try { const data = await api.notifications(); setNotifItems(data.notifications || []); setNotifUnread(data.unread || 0); } catch { /* belum masuk */ } }
   async function markAllRead() { try { await api.readAllNotifications(); await loadNotifications(); } catch (e) { setError((e as Error).message); } }
+  // An invited person must sign in first, so the token is kept until a session exists.
+  useEffect(() => {
+    if (!inviteToken) return;
+    if (!user) { setNotice('Anda menerima undangan workspace. Masuk atau daftar dengan email yang diundang untuk menerimanya.'); return; }
+    let cancelled = false;
+    api.acceptInvitation(inviteToken).then(async (result) => {
+      if (cancelled) return;
+      setInviteToken(null);
+      window.history.replaceState({}, '', '/');
+      setNotice(`Anda sudah bergabung ke workspace ini sebagai ${result.role}.`);
+      await loadSessions().catch(() => undefined);
+    }).catch((e) => {
+      if (cancelled) return;
+      const message = (e as Error).message || '';
+      setInviteToken(null);
+      window.history.replaceState({}, '', '/');
+      setNotice(message.includes('INVITATION_EMAIL_MISMATCH') ? 'Undangan ini ditujukan untuk alamat email lain. Masuk dengan email yang diundang lalu buka tautannya lagi.'
+        : message.includes('INVITATION_INVALID_OR_EXPIRED') ? 'Undangan sudah kedaluwarsa atau sudah dipakai.'
+        : message || 'Undangan tidak bisa diterima.');
+    });
+    return () => { cancelled = true; };
+  }, [user, inviteToken]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, busy]);
   async function loadSessions() { try { const all = await api.workspaces(); setWorkspaceOptions(all || []); const ws = all[0]; if (!ws) return; setWorkspaceId(ws.id); const projects = await api.projects(ws.id); setProjectOptions(projects || []); const project = projects[0]; if (!project) return; setProjectId(project.id); const d = await api.chatSessions(project.id); setSessions(d || []); } catch { setOnline(false); } }
   /** Switch the active workspace and reload its projects, sessions and default selection. */
@@ -108,13 +133,26 @@ function Settings({ user, workspaceId, onClose, onLogout, inline }: { user: User
   const [recovery, setRecovery] = useState<string[]>([]);
   const [emailVerified, setEmailVerified] = useState<boolean | null>(null);
   const [limits, setLimits] = useState({ daily: '', monthly: '', perHour: '' });
+  const [limitDefaults, setLimitDefaults] = useState<{ dailyCostLimitMicros: number; monthlyCostLimitMicros: number; runsPerHourLimit: number } | null>(null);
+  // The role is per workspace, so it is read from the member list instead of the login payload.
+  const [canManageLimits, setCanManageLimits] = useState(false);
   const [admin, setAdmin] = useState<any | null>(null); const [adminUsers, setAdminUsers] = useState<any[]>([]);
   async function refresh() {
     try { setSessions(await api.sessions()); } catch { setSessions([]); }
     try { setMfa(await api.mfaStatus()); } catch { setMfa(null); }
     try { const me = await api.me(); setEmailVerified(Boolean((me.user as { emailVerified?: boolean }).emailVerified)); } catch { setEmailVerified(null); }
     try { const overview = await api.adminOverview(); setAdmin(overview); const people = await api.adminUsers(); setAdminUsers(people); } catch { setAdmin(null); setAdminUsers([]); }
-    try { const rows = workspaceId ? await api.adminWorkspaces().catch(() => []) : []; const mine = Array.isArray(rows) ? rows.find((row: any) => row.id === workspaceId) : null; if (mine) setLimits({ daily: mine.dailyCostLimitMicros ? String(mine.dailyCostLimitMicros) : '', monthly: mine.monthlyCostLimitMicros ? String(mine.monthlyCostLimitMicros) : '', perHour: mine.runsPerHourLimit ? String(mine.runsPerHourLimit) : '' }); } catch { /* batas bersifat opsional */ }
+    // Every member reads the workspace limits through their own endpoint; the admin listing is refused for normal owners.
+    try {
+      if (workspaceId) {
+        const mine = await api.readWorkspaceLimits(workspaceId);
+        setLimits({ daily: mine.dailyCostLimitMicros === null ? '' : String(mine.dailyCostLimitMicros), monthly: mine.monthlyCostLimitMicros === null ? '' : String(mine.monthlyCostLimitMicros), perHour: mine.runsPerHourLimit === null ? '' : String(mine.runsPerHourLimit) });
+        setLimitDefaults(mine.effective);
+        const people = await api.members(workspaceId).catch(() => []);
+        const self = Array.isArray(people) ? people.find((row: any) => row.userId === user.id) : null;
+        setCanManageLimits(['owner', 'admin'].includes(String(self?.role ?? '')));
+      }
+    } catch { setLimitDefaults(null); setCanManageLimits(false); }
   }
   useEffect(() => { void refresh(); }, []);
   function run(action: () => Promise<void>) { setMessage(''); setProblem(''); void action().catch((e) => setProblem((e as Error).message)); }
@@ -125,11 +163,13 @@ function Settings({ user, workspaceId, onClose, onLogout, inline }: { user: User
     <div className="settings-meta"><span>Status email</span><strong>{emailVerified === null ? 'tidak diketahui' : emailVerified ? 'terverifikasi' : 'belum terverifikasi'}</strong></div>
     {emailVerified === false && <button type="button" onClick={() => run(async () => { const result = await api.requestEmailVerification(); setMessage(result.sent ? 'Email verifikasi sudah dikirim.' : result.reason === 'EMAIL_NOT_CONFIGURED' ? 'Server email belum dikonfigurasi, jadi tautan verifikasi belum bisa dikirim.' : `Gagal mengirim email (${result.reason ?? 'tidak diketahui'}).`); })}>Kirim ulang email verifikasi</button>}
     <h3 className="settings-heading">Batas pemakaian workspace</h3>
-    <p className="settings-hint">Kosongkan untuk tanpa batas. Biaya dalam micro-USD (1 USD = 1.000.000).</p>
-    <label>Batas biaya harian<input inputMode="numeric" value={limits.daily} onChange={e => setLimits(v => ({ ...v, daily: e.target.value }))} /></label>
-    <label>Batas biaya 30 hari<input inputMode="numeric" value={limits.monthly} onChange={e => setLimits(v => ({ ...v, monthly: e.target.value }))} /></label>
-    <label>Batas jumlah run per hari<input inputMode="numeric" value={limits.perHour} onChange={e => setLimits(v => ({ ...v, perHour: e.target.value }))} /></label>
-    <button type="button" onClick={() => run(async () => { if (!workspaceId) throw new Error('Workspace belum dipilih.'); const num = (value: string) => value.trim() === '' ? null : Number(value); await api.workspaceLimits(workspaceId, { dailyCostLimitMicros: num(limits.daily), monthlyCostLimitMicros: num(limits.monthly), runsPerHourLimit: num(limits.perHour) }); setMessage('Batas pemakaian disimpan.'); })}>Simpan batas</button>
+    {canManageLimits ? <>
+      <p className="settings-hint">Angka dalam micro-USD (1 USD = 1.000.000). Kosongkan sebuah kolom untuk memakai batas default platform{limitDefaults ? ` (harian $${(limitDefaults.dailyCostLimitMicros / 1_000_000).toFixed(2)}, 30 hari $${(limitDefaults.monthlyCostLimitMicros / 1_000_000).toFixed(2)}, ${limitDefaults.runsPerHourLimit === 0 ? 'tanpa batas run' : `${limitDefaults.runsPerHourLimit} run per jam`})` : ''}. Isi 0 untuk benar-benar tanpa batas.</p>
+      <label>Batas biaya harian<input inputMode="numeric" value={limits.daily} onChange={e => setLimits(v => ({ ...v, daily: e.target.value }))} /></label>
+      <label>Batas biaya 30 hari<input inputMode="numeric" value={limits.monthly} onChange={e => setLimits(v => ({ ...v, monthly: e.target.value }))} /></label>
+      <label>Batas jumlah run per jam<input inputMode="numeric" value={limits.perHour} onChange={e => setLimits(v => ({ ...v, perHour: e.target.value }))} /></label>
+      <button type="button" onClick={() => run(async () => { if (!workspaceId) throw new Error('Workspace belum dipilih.'); const num = (value: string) => value.trim() === '' ? null : Number(value); await api.workspaceLimits(workspaceId, { dailyCostLimitMicros: num(limits.daily), monthlyCostLimitMicros: num(limits.monthly), runsPerHourLimit: num(limits.perHour) }); setMessage('Batas pemakaian disimpan.'); await refresh(); })}>Simpan batas</button>
+    </> : <p className="settings-hint">Hanya pemilik atau admin workspace yang bisa mengubah batas. Batas saat ini: harian {limitDefaults ? (limitDefaults.dailyCostLimitMicros === 0 ? 'tanpa batas' : `$${(limitDefaults.dailyCostLimitMicros / 1_000_000).toFixed(2)}`) : 'tidak diketahui'}.</p>}
     <h3 className="settings-heading">Ganti password</h3>
     <label>Password sekarang<input type="password" value={current} onChange={e => setCurrent(e.target.value)} /></label>
     <label>Password baru (minimal 10 karakter)<input type="password" value={next} onChange={e => setNext(e.target.value)} /></label>

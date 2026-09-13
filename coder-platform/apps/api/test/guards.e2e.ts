@@ -33,6 +33,8 @@ check("run allowed while unlimited", (await owner("POST", `/api/v1/projects/${pr
 
 const limits = await owner("PUT", `/api/v1/workspaces/${workspaceId}/limits`, { dailyCostLimitMicros: 1_000_000, monthlyCostLimitMicros: 0, runsPerHourLimit: 0 });
 check("owner can set limits", limits.status === 200 && limits.json?.dailyCostLimitMicros === 1_000_000, JSON.stringify(limits.json));
+const readLimits = await owner("GET", `/api/v1/workspaces/${workspaceId}/limits`);
+check("owner can read the limits back", readLimits.status === 200 && readLimits.json?.dailyCostLimitMicros === 1_000_000 && readLimits.json?.effective?.dailyCostLimitMicros === 1_000_000, `${readLimits.status} ${JSON.stringify(readLimits.json)}`);
 
 // Simulate a spent budget by writing a usage row, the same way a finished run would.
 const spendRun = randomUUID();
@@ -60,6 +62,8 @@ const invite = await owner("POST", `/api/v1/workspaces/${workspaceId}/invitation
 await member("POST", "/api/v1/invitations/accept", { token: invite.json.token ?? invite.json.invitation?.token });
 const forbidden = await member("PUT", `/api/v1/workspaces/${workspaceId}/limits`, { dailyCostLimitMicros: 5_000_000 });
 check("plain member cannot change limits", forbidden.status === 403 && forbidden.json?.error === "OWNER_REQUIRED", `${forbidden.status} ${JSON.stringify(forbidden.json)}`);
+const memberReadLimits = await member("GET", `/api/v1/workspaces/${workspaceId}/limits`);
+check("plain member may read the limits", memberReadLimits.status === 200 && typeof memberReadLimits.json?.effective?.monthlyCostLimitMicros === "number", `${memberReadLimits.status} ${JSON.stringify(memberReadLimits.json)}`);
 
 // Workflow execution must obey the same cost guard.
 const workflow = await owner("POST", `/api/v1/projects/${projectId}/workflows`, { name: "wf guard", steps: [{ id: "a", type: "prompt", prompt: "hai" }] });
