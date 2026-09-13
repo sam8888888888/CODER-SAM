@@ -46,3 +46,4 @@ dist/
 build/
 __pycache__/
 *.pyc
+.smoke-env.local
