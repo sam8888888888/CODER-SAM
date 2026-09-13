@@ -80,3 +80,5 @@
 .bell-item.unread { background: rgba(255,255,255,0.06); }
 .bell-item em { font-size: 11px; opacity: 0.6; font-style: normal; }
 .link-button { background: none; border: none; color: #7cc4ff; cursor: pointer; font-size: 12px; padding: 0; }
+.bell-item { width: 100%; text-align: left; background: none; border: none; color: inherit; cursor: pointer; }
+.bell-item:hover { background: rgba(255,255,255,0.08); }

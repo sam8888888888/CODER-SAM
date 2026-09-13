@@ -1061,7 +1061,8 @@ app.setErrorHandler((error: any, _request, reply) => { app.log.error(error); con
 
 const contentTypes: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 app.setNotFoundHandler(async (request, reply) => {
-  if (request.method !== "GET" || request.url.startsWith("/api/")) return reply.code(404).send({ error: "NOT_FOUND" });
+  // HEAD is answered like GET so uptime checks and monitors see a healthy page.
+  if (!["GET", "HEAD"].includes(request.method) || request.url.startsWith("/api/")) return reply.code(404).send({ error: "NOT_FOUND" });
   const publicDir = normalize(config.PUBLIC_DIR); const requested = decodeURIComponent(request.url.split("?")[0]);
   const relative = requested === "/" ? "index.html" : requested.replace(/^\/+/, "");
   if (relative.split("/").some((segment) => segment.startsWith(".")) || [".env", ".git", "package.json", "package-lock.json"].includes(relative)) return reply.code(404).send({ error: "NOT_FOUND" });
