@@ -63,7 +63,17 @@ function App() {
       // The API asks for a second factor with MFA_REQUIRED; the form then shows the code field.
       const message = (e as Error).message;
       setMfaNeeded(message.includes('MFA_REQUIRED') || message.includes('MFA_INVALID_CODE'));
-      setError(message.includes('MFA_INVALID_CODE') ? 'Kode verifikasi salah. Coba lagi.' : message);
+      // Error codes from the API are shown as plain Indonesian sentences.
+      const friendly: Record<string, string> = {
+        INVALID_CREDENTIALS: 'Email/username atau kata sandi salah.',
+        EMAIL_EXISTS: 'Email ini sudah terdaftar. Silakan masuk.',
+        LOGIN_RATE_LIMITED: 'Terlalu banyak percobaan masuk. Tunggu beberapa menit lalu coba lagi.',
+        INVALID_REGISTRATION: 'Pendaftaran gagal. Periksa email dan kata sandi (minimal 10 karakter).',
+        MFA_INVALID_CODE: 'Kode verifikasi salah. Coba lagi.',
+        MFA_REQUIRED: 'Masukkan kode verifikasi 6 angka dari aplikasi authenticator Anda.',
+      };
+      const code = Object.keys(friendly).find(key => message.includes(key));
+      setError(code ? friendly[code] : message);
     }
   }
   async function logout() { await api.logout().catch(() => undefined); setUser(null); setSessions([]); setCurrent(null); setMessages([]); }
@@ -130,7 +140,7 @@ function Settings({ user, workspaceId, onClose, onLogout }: { user: User; worksp
 
 function Auth({ mode, onClose, onSwitch, onSubmit, error, mfaNeeded }: { mode: 'login'|'register'; onClose: () => void; onSwitch: () => void; onSubmit: (u: string, p: string, n: string, code?: string) => void; error: string; mfaNeeded?: boolean }) { const [username, setUsername] = useState(''); const [password, setPassword] = useState(''); const [name, setName] = useState(''); const [code, setCode] = useState(''); const [forgot, setForgot] = useState(false); const [forgotEmail, setForgotEmail] = useState(''); const [forgotMsg, setForgotMsg] = useState('');
   if (forgot) return <div className="modal-backdrop"><form className="auth-card" onSubmit={e => { e.preventDefault(); setForgotMsg(''); void api.forgotPassword(forgotEmail).then(result => setForgotMsg(result.delivery === 'email' ? 'Tautan atur ulang sudah dikirim ke email Anda.' : 'Server email belum dikonfigurasi, jadi tautan belum bisa dikirim. Hubungi admin.')).catch(err => setForgotMsg((err as Error).message)); }}><button type="button" className="close" onClick={onClose}>×</button><span className="eyebrow">COBLAI CODER</span><h2>Lupa kata sandi</h2><p className="settings-hint">Masukkan email akun Anda. Kami kirimkan tautan atur ulang yang berlaku 60 menit.</p><input required value={forgotEmail} onChange={e => setForgotEmail(e.target.value)} placeholder="Email akun" /><button className="primary">Kirim tautan</button>{forgotMsg && <p className="settings-ok">{forgotMsg}</p>}<button type="button" className="switch" onClick={() => setForgot(false)}>Kembali ke halaman masuk</button></form></div>;
-  return <div className="modal-backdrop"><form className="auth-card" onSubmit={e => { e.preventDefault(); onSubmit(username, password, name, code); }}><button type="button" className="close" onClick={onClose}>×</button><span className="eyebrow">COBLAI CODER</span><h2>{mode === 'login' ? 'Masuk ke workspace' : 'Buat akun baru'}</h2>{mode === 'register' && <input value={name} onChange={e => setName(e.target.value)} placeholder="Nama Anda" /> }<input required value={username} onChange={e => setUsername(e.target.value)} placeholder="Username atau email" /><input required type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password" />{mode === 'login' && mfaNeeded && <input autoFocus value={code} onChange={e => setCode(e.target.value)} placeholder="Kode verifikasi 6 angka" inputMode="numeric" />}<button className="primary">Lanjutkan</button>{error && <p className="error">{error}</p>}<button type="button" className="switch" onClick={onSwitch}>{mode === 'login' ? 'Belum punya akun? Daftar' : 'Sudah punya akun? Masuk'}</button>{mode === 'login' && <button type="button" className="switch" onClick={() => { setForgotEmail(username); setForgot(true); }}>Lupa kata sandi?</button>}</form></div>; }
+  return <div className="modal-backdrop"><form className="auth-card" onSubmit={e => { e.preventDefault(); onSubmit(username, password, name, code); }}><button type="button" className="close" onClick={onClose}>×</button><span className="eyebrow">COBLAI CODER</span><h2>{mode === 'login' ? 'Masuk ke workspace' : 'Buat akun baru'}</h2>{mode === 'register' && <input value={name} onChange={e => setName(e.target.value)} placeholder="Nama Anda" /> }<input required value={username} onChange={e => setUsername(e.target.value)} placeholder="Email atau username" /><input required type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password" />{mode === 'login' && mfaNeeded && <input autoFocus value={code} onChange={e => setCode(e.target.value)} placeholder="Kode verifikasi 6 angka" inputMode="numeric" />}<button className="primary">Lanjutkan</button>{error && <p className="error">{error}</p>}<button type="button" className="switch" onClick={onSwitch}>{mode === 'login' ? 'Belum punya akun? Daftar' : 'Sudah punya akun? Masuk'}</button>{mode === 'login' && <button type="button" className="switch" onClick={() => { setForgotEmail(username); setForgot(true); }}>Lupa kata sandi?</button>}</form></div>; }
 
 export { App };
 

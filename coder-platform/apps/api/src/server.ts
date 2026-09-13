@@ -202,7 +202,15 @@ app.post<{ Body: { email?: string; password?: string; displayName?: string } }>(
 app.post<{ Body: { email?: string; password?: string; code?: string } }>("/api/v1/auth/login", async (request, reply) => {
   const email = request.body?.email?.trim().toLowerCase(); const password = request.body?.password ?? ""; const code = request.body?.code?.trim();
   const key = `${request.ip}:${email ?? "unknown"}`; if (!allowLoginAttempt(key)) return reply.code(429).send({ error: "LOGIN_RATE_LIMITED" });
-  const row = email ? db.prepare("SELECT id,email,display_name AS displayName,password_hash AS passwordHash, mfa_enabled AS mfaEnabled, mfa_secret AS mfaSecret, mfa_recovery_codes AS recoveryCodes FROM users WHERE email=?").get(email) as { id:string; email:string; displayName:string; passwordHash:string|null; mfaEnabled:number; mfaSecret:string|null; recoveryCodes:string|null }|undefined : undefined;
+  // The form accepts either a full email address or the username before the @.
+  type LoginRow = { id:string; email:string; displayName:string; passwordHash:string|null; mfaEnabled:number; mfaSecret:string|null; recoveryCodes:string|null };
+  const fields = "id,email,display_name AS displayName,password_hash AS passwordHash, mfa_enabled AS mfaEnabled, mfa_secret AS mfaSecret, mfa_recovery_codes AS recoveryCodes";
+  let row = email ? db.prepare(`SELECT ${fields} FROM users WHERE email=?`).get(email) as LoginRow|undefined : undefined;
+  if (!row && email && !email.includes("@")) {
+    // A username is only accepted when exactly one account uses that local part.
+    const matches = db.prepare(`SELECT ${fields} FROM users WHERE lower(substr(email,1,instr(email,'@')-1))=?`).all(email) as LoginRow[];
+    if (matches.length === 1) row = matches[0];
+  }
   if (!row?.passwordHash || !(await verifyPassword(password,row.passwordHash))) return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
   if (row.mfaEnabled) {
     if (!code) return reply.code(401).send({ error: "MFA_REQUIRED" });
