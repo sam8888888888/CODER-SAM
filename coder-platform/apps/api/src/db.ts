@@ -197,6 +197,34 @@ try { db.exec("ALTER TABLE users ADD COLUMN mfa_secret TEXT"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN mfa_recovery_codes TEXT"); } catch {}
 
+// Account recovery, notifications, platform administration and per-workspace guards.
+db.exec(`
+CREATE TABLE IF NOT EXISTS auth_tokens (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK(kind IN ('password_reset','email_verify')),
+ token_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_tokens_hash ON auth_tokens(token_hash);
+CREATE TABLE IF NOT EXISTS notifications (
+ id TEXT PRIMARY KEY, workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE, user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+ kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT, link TEXT, read_at TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_workspace ON notifications(workspace_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS schema_migrations (
+ version INTEGER PRIMARY KEY, note TEXT, applied_at TEXT NOT NULL
+);
+`);
+try { db.exec("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE workspaces ADD COLUMN daily_cost_limit_micros INTEGER"); } catch {}
+try { db.exec("ALTER TABLE workspaces ADD COLUMN monthly_cost_limit_micros INTEGER"); } catch {}
+try { db.exec("ALTER TABLE workspaces ADD COLUMN runs_per_hour_limit INTEGER"); } catch {}
+
+/** Records the applied schema version so operators can see which shape the database has. */
+const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION_NOTE = "cost guards, notifications, auth tokens, admin flags";
+db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
+
 // Runs after the additive columns exist, because it copies them.
 migrateKnowledgeSourceTypes();
 

@@ -71,3 +71,12 @@
 .session-list span { font-size: 11px; opacity: .7; }
 .recovery-codes { border: 1px dashed var(--line, #2a2f3a); border-radius: 10px; padding: 8px 10px; margin: 8px 0; }
 .recovery-codes ul { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; padding: 0; margin: 6px 0 0; }
+
+.bell-wrap { position: relative; }
+.bell-count { position: absolute; top: -4px; right: -4px; min-width: 16px; height: 16px; border-radius: 999px; background: #d9480f; color: #fff; font-size: 10px; line-height: 16px; text-align: center; padding: 0 3px; }
+.bell-panel { position: absolute; right: 0; top: 40px; width: min(340px, 88vw); background: #14161c; border: 1px solid rgba(255,255,255,0.12); border-radius: 12px; padding: 12px; z-index: 40; box-shadow: 0 18px 40px rgba(0,0,0,0.45); }
+.bell-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.bell-item { display: flex; flex-direction: column; gap: 2px; padding: 8px; border-radius: 8px; }
+.bell-item.unread { background: rgba(255,255,255,0.06); }
+.bell-item em { font-size: 11px; opacity: 0.6; font-style: normal; }
+.link-button { background: none; border: none; color: #7cc4ff; cursor: pointer; font-size: 12px; padding: 0; }

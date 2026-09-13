@@ -180,5 +180,34 @@ if (sampleModel) {
   check("run rejects an unknown model", badModel.status === 400 && badModel.json.error === "UNKNOWN_MODEL", JSON.stringify(badModel.json));
 }
 
+// ------------------------------------------------- account recovery, notifications, admin, metrics
+const notifications = await call("GET", "/api/v1/notifications");
+check("notifications respond", notifications.status === 200 && Array.isArray(notifications.json.notifications) && typeof notifications.json.unread === "number", JSON.stringify(notifications.json)?.slice(0, 160));
+const readAll = await call("POST", "/api/v1/notifications/read-all");
+check("notifications can be marked read", readAll.status === 200 && typeof readAll.json.read === "number", JSON.stringify(readAll.json));
+
+const forgot = await call("POST", "/api/v1/auth/password/forgot", { email: `tidak-ada-${Date.now()}@example.test` });
+check("forgot password answers for any address", forgot.status === 200 && forgot.json.ok === true, JSON.stringify(forgot.json));
+if (forgot.json.delivery === "email") {
+  check("forgot password reports email delivery", true, "");
+} else {
+  // No SMTP credential is configured yet, so no mail can leave the platform. Reported, not hidden.
+  console.log(`SKIP password reset email delivery: ${forgot.json.note ?? forgot.json.delivery}`);
+}
+const badReset = await call("POST", "/api/v1/auth/password/reset", { token: "token-palsu", password: "PanjangSekali123!" });
+check("password reset rejects an invalid token", badReset.status === 400 && badReset.json.error === "TOKEN_INVALID_OR_EXPIRED", JSON.stringify(badReset.json));
+const badVerify = await call("POST", "/api/v1/auth/email/verify", { token: "token-palsu" });
+check("email verify rejects an invalid token", badVerify.status === 400, JSON.stringify(badVerify.json));
+
+const limits = await call("PUT", `/api/v1/workspaces/${workspaceId}/limits`, { dailyCostLimitMicros: 1000000, monthlyCostLimitMicros: 0, runsPerHourLimit: 0 });
+check("workspace limits can be set", limits.status === 200 && limits.json.dailyCostLimitMicros === 1000000, JSON.stringify(limits.json));
+const cleared = await call("PUT", `/api/v1/workspaces/${workspaceId}/limits`, { dailyCostLimitMicros: 0, monthlyCostLimitMicros: 0, runsPerHourLimit: 0 });
+check("workspace limits can be cleared", cleared.status === 200 && cleared.json.dailyCostLimitMicros === 0, JSON.stringify(cleared.json));
+
+const adminBlocked = await call("GET", "/api/v1/admin/overview");
+check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));
+const metricsBlocked = await call("GET", "/metrics");
+check("metrics stay hidden without a token", metricsBlocked.status === 404, JSON.stringify(metricsBlocked.json));
+
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

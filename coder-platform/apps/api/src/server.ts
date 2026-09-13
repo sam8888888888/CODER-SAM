@@ -10,6 +10,7 @@ import { estimateCostMicros } from "./model-prices.js";
 import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
 import { extractText } from "./text-extract.js";
 import { generateTotpSecret, otpAuthUrl, verifyTotp } from "./totp.js";
+import { mailerConfigured, passwordResetEmail, sendMail, verificationEmail } from "./mailer.js";
 import { db } from "./db.js";
 import { currentSessionId, revokeOtherSessions, sessionIdForToken, touchSession } from "./auth.js";
 import { engine } from "./engine.js";
@@ -30,6 +31,85 @@ function workflowAccess(workflowId: string, userId: string) {
   if (!row) return null;
   const role = membershipRole(row.workspaceId, userId);
   return role ? { ...row, role } : null;
+}
+
+/** True when the user may inspect the whole platform (workspace list, all users, totals). */
+function isPlatformAdmin(user: { id: string; email: string }): boolean {
+  const allowed = config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+  if (allowed.includes(user.email.toLowerCase())) return true;
+  const row = db.prepare("SELECT is_admin FROM users WHERE id=?").get(user.id) as { is_admin?: number } | undefined;
+  return Boolean(row?.is_admin);
+}
+
+/** True when a share of the platform (chat runs, workflow steps) may start for a workspace. */
+function workspaceGuards(workspaceId: string) {
+  const row = db.prepare("SELECT id, daily_cost_limit_micros AS daily, monthly_cost_limit_micros AS monthly, runs_per_hour_limit AS perHour FROM workspaces WHERE id=?").get(workspaceId) as { id: string; daily: number | null; monthly: number | null; perHour: number | null } | undefined;
+  return {
+    daily: row?.daily ?? config.DEFAULT_DAILY_COST_LIMIT_MICROS,
+    monthly: row?.monthly ?? config.DEFAULT_MONTHLY_COST_LIMIT_MICROS,
+    perHour: row?.perHour ?? config.DEFAULT_RUNS_PER_HOUR_LIMIT,
+  };
+}
+
+/** Cost in micros that a workspace produced today, plus this calendar month. */
+function workspaceSpend(workspaceId: string) {
+  const day = db.prepare(`SELECT COALESCE(SUM(u.cost_micros),0) AS micros, COUNT(*) AS runs FROM run_usage u JOIN projects p ON p.id=u.project_id WHERE p.workspace_id=? AND u.created_at >= ?`).get(workspaceId, new Date(Date.now() - 86_400_000).toISOString()) as { micros: number; runs: number };
+  const month = db.prepare(`SELECT COALESCE(SUM(u.cost_micros),0) AS micros FROM run_usage u JOIN projects p ON p.id=u.project_id WHERE p.workspace_id=? AND u.created_at >= ?`).get(workspaceId, new Date(Date.now() - 30 * 86_400_000).toISOString()) as { micros: number };
+  return { dayMicros: day.micros ?? 0, dayRuns: day.runs ?? 0, monthMicros: month.micros ?? 0 };
+}
+
+/**
+ * Guard for a workspace about to start engine work.
+ * Returns null when allowed, or { status, error } describing the block.
+ */
+function guardWorkspaceUsage(workspaceId: string): { status: number; error: string; detail?: Record<string, unknown> } | null {
+  const limits = workspaceGuards(workspaceId);
+  const spend = workspaceSpend(workspaceId);
+  if (limits.daily > 0 && spend.dayMicros >= limits.daily) return { status: 429, error: "COST_LIMIT_EXCEEDED", detail: { window: "day", limitMicros: limits.daily, usedMicros: spend.dayMicros } };
+  if (limits.monthly > 0 && spend.monthMicros >= limits.monthly) return { status: 429, error: "COST_LIMIT_EXCEEDED", detail: { window: "month", limitMicros: limits.monthly, usedMicros: spend.monthMicros } };
+  if (limits.perHour > 0 && spend.dayRuns >= limits.perHour) return { status: 429, error: "RUN_RATE_LIMITED", detail: { window: "day", limitRuns: limits.perHour, usedRuns: spend.dayRuns } };
+  return null;
+}
+
+/** Stores one notification for a user and, when the workspace is known, for its owners and admins. */
+function notify(workspaceId: string | null, userId: string | null, kind: string, title: string, body?: string, link?: string) {
+  const createdAt = new Date().toISOString();
+  const targets = new Set<string>();
+  if (userId) targets.add(userId);
+  if (workspaceId) {
+    const members = db.prepare("SELECT user_id AS userId FROM memberships WHERE workspace_id=? AND role IN ('owner','admin')").all(workspaceId) as { userId: string }[];
+    for (const member of members) targets.add(member.userId);
+  }
+  const insert = db.prepare("INSERT INTO notifications (id,workspace_id,user_id,kind,title,body,link,created_at) VALUES (?,?,?,?,?,?,?,?)");
+  db.transaction(() => { for (const target of targets) insert.run(randomUUID(), workspaceId, target, kind, title, body ?? null, link ?? null, createdAt); })();
+}
+
+/** Creates a single use token (only its hash is stored) and returns the raw value for the email link. */
+function createAuthToken(userId: string, kind: "password_reset" | "email_verify", ttlMinutes: number) {
+  const token = randomBytes(32).toString("base64url");
+  const hash = createHash("sha256").update(token).digest("hex");
+  const expiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
+  db.prepare("UPDATE auth_tokens SET used_at=? WHERE user_id=? AND kind=? AND used_at IS NULL").run(new Date().toISOString(), userId, kind);
+  db.prepare("INSERT INTO auth_tokens (id,user_id,kind,token_hash,expires_at,created_at) VALUES (?,?,?,?,?,?)").run(randomUUID(), userId, kind, hash, expiresAt, new Date().toISOString());
+  return { token, expiresAt };
+}
+
+/** Consumes a token of the given kind and returns the user id, or null when invalid, used or expired. */
+function consumeAuthToken(rawToken: string, kind: "password_reset" | "email_verify"): string | null {
+  const hash = createHash("sha256").update(rawToken).digest("hex");
+  const row = db.prepare("SELECT id, user_id AS userId, expires_at AS expiresAt, used_at AS usedAt FROM auth_tokens WHERE token_hash=? AND kind=?").get(hash, kind) as { id: string; userId: string; expiresAt: string; usedAt: string | null } | undefined;
+  if (!row || row.usedAt || row.expiresAt < new Date().toISOString()) return null;
+  db.prepare("UPDATE auth_tokens SET used_at=? WHERE id=?").run(new Date().toISOString(), row.id);
+  return row.userId;
+}
+
+/** Sends a verification email when SMTP is configured; reports the delivery state honestly. */
+async function sendVerificationEmail(user: { id: string; email: string; displayName: string }) {
+  if (!mailerConfigured()) return { sent: false, reason: "EMAIL_NOT_CONFIGURED" as const };
+  const { token } = createAuthToken(user.id, "email_verify", 24 * 60);
+  const link = `${config.PUBLIC_BASE_URL}/verify-email?token=${encodeURIComponent(token)}`;
+  const result = await sendMail({ to: user.email, subject: "Verifikasi email COBLAI Coder", text: verificationEmail(user.displayName, link) });
+  return result.sent ? { sent: true as const } : { sent: false, reason: result.reason ?? "EMAIL_SEND_FAILED", detail: result.detail };
 }
 
 /**
@@ -114,7 +194,9 @@ app.post<{ Body: { email?: string; password?: string; displayName?: string } }>(
       db.prepare("INSERT INTO memberships (user_id,workspace_id,role,created_at) VALUES (?,?,?,?)").run(userId,workspaceId,"owner",now);
     }); transaction();
     const token = createSession(userId); setSessionCookie(reply, token, config.NODE_ENV === "production");
-    return reply.code(201).send({ user: { id: userId, email, displayName }, workspace: { id: workspaceId, slug } });
+    const verification = await sendVerificationEmail({ id: userId, email, displayName });
+    notify(workspaceId, userId, "account", "Selamat datang di COBLAI Coder", verification.sent ? "Kami sudah mengirim tautan verifikasi email." : "Verifikasi email belum aktif karena server email belum dikonfigurasi.", "/");
+    return reply.code(201).send({ user: { id: userId, email, displayName }, workspace: { id: workspaceId, slug }, emailVerification: verification });
   } catch (error) { if (String(error).includes("UNIQUE")) return reply.code(409).send({ error: "EMAIL_EXISTS" }); throw error; }
 });
 app.post<{ Body: { email?: string; password?: string; code?: string } }>("/api/v1/auth/login", async (request, reply) => {
@@ -189,6 +271,166 @@ app.post<{ Body: { password?: string; code?: string } }>("/api/v1/auth/mfa/disab
 app.get("/api/v1/auth/mfa", { preHandler: requireUser }, async (request: any) => {
   const row = db.prepare("SELECT mfa_enabled AS enabled, mfa_secret AS secret FROM users WHERE id=?").get(request.user!.id) as { enabled: number; secret: string | null } | undefined;
   return { enabled: Boolean(row?.enabled), pendingSetup: Boolean(row?.secret && !row?.enabled) };
+});
+
+// ---------------------------------------------------------------- account recovery
+
+app.post<{ Body: { token?: string } }>("/api/v1/auth/email/verify", async (request, reply) => {
+  const raw = request.body?.token?.trim();
+  if (!raw) return reply.code(400).send({ error: "TOKEN_REQUIRED" });
+  const userId = consumeAuthToken(raw, "email_verify");
+  if (!userId) return reply.code(400).send({ error: "TOKEN_INVALID_OR_EXPIRED" });
+  db.prepare("UPDATE users SET email_verified=1, updated_at=? WHERE id=?").run(new Date().toISOString(), userId);
+  recordAudit(null, userId, "auth.email_verified", {});
+  return { verified: true };
+});
+
+app.post("/api/v1/auth/email/verify/request", { preHandler: requireUser }, async (request: any) => {
+  const row = db.prepare("SELECT id, email, display_name AS displayName, email_verified AS emailVerified FROM users WHERE id=?").get(request.user!.id) as { id: string; email: string; displayName: string; emailVerified: number } | undefined;
+  if (!row) return { sent: false, reason: "USER_NOT_FOUND" };
+  if (row.emailVerified) return { sent: false, reason: "ALREADY_VERIFIED" };
+  return sendVerificationEmail({ id: row.id, email: row.email, displayName: row.displayName });
+});
+
+app.post<{ Body: { email?: string } }>("/api/v1/auth/password/forgot", async (request, reply) => {
+  const email = request.body?.email?.trim().toLowerCase();
+  if (!email) return reply.code(400).send({ error: "EMAIL_REQUIRED" });
+  const user = db.prepare("SELECT id, email, display_name AS displayName FROM users WHERE email=?").get(email) as { id: string; email: string; displayName: string } | undefined;
+  // The answer never reveals whether the address exists.
+  if (!user) return { ok: true, delivery: mailerConfigured() ? "email" : "unavailable" };
+  if (!mailerConfigured()) return { ok: true, delivery: "unavailable", note: "EMAIL_NOT_CONFIGURED" };
+  const { token } = createAuthToken(user.id, "password_reset", 60);
+  const link = `${config.PUBLIC_BASE_URL}/reset-password?token=${encodeURIComponent(token)}`;
+  const result = await sendMail({ to: user.email, subject: "Atur ulang kata sandi COBLAI Coder", text: passwordResetEmail(user.displayName, link) });
+  if (!result.sent) return reply.code(502).send({ error: result.reason ?? "EMAIL_SEND_FAILED", detail: result.detail });
+  recordAudit(null, user.id, "auth.password_reset_requested", {});
+  return { ok: true, delivery: "email" };
+});
+
+app.post<{ Body: { token?: string; password?: string } }>("/api/v1/auth/password/reset", async (request, reply) => {
+  const raw = request.body?.token?.trim(); const password = request.body?.password ?? "";
+  if (!raw) return reply.code(400).send({ error: "TOKEN_REQUIRED" });
+  if (password.length < 10) return reply.code(400).send({ error: "WEAK_PASSWORD", detail: "minimal 10 karakter" });
+  const userId = consumeAuthToken(raw, "password_reset");
+  if (!userId) return reply.code(400).send({ error: "TOKEN_INVALID_OR_EXPIRED" });
+  const passwordHash = await hashPassword(password);
+  db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?").run(passwordHash, new Date().toISOString(), userId);
+  // Every other session dies, so a stolen cookie cannot survive a reset.
+  db.prepare("DELETE FROM auth_sessions WHERE user_id=?").run(userId);
+  recordAudit(null, userId, "auth.password_reset_completed", {});
+  notify(null, userId, "security", "Kata sandi diatur ulang", "Semua sesi dikeluarkan setelah kata sandi baru dibuat.", "/");
+  return { reset: true };
+});
+
+// ---------------------------------------------------------------- notifications
+
+app.get<{ Querystring: { unread?: string } }>("/api/v1/notifications", { preHandler: requireUser }, async (request: any) => {
+  const limit = Math.min(Number(request.query?.limit ?? 50) || 50, 200);
+  const items = db.prepare(`SELECT id, workspace_id AS workspaceId, kind, title, body, link, read_at AS readAt, created_at AS createdAt FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT ?`).all(request.user!.id, limit);
+  const unread = db.prepare("SELECT COUNT(*) AS total FROM notifications WHERE user_id=? AND read_at IS NULL").get(request.user!.id) as { total: number };
+  return { notifications: items, unread: unread.total };
+});
+
+app.post<{ Params: { notificationId: string } }>("/api/v1/notifications/:notificationId/read", { preHandler: requireUser }, async (request: any, reply) => {
+  const result = db.prepare("UPDATE notifications SET read_at=? WHERE id=? AND user_id=? AND read_at IS NULL").run(new Date().toISOString(), request.params.notificationId, request.user!.id);
+  if (result.changes === 0) {
+    const exists = db.prepare("SELECT 1 FROM notifications WHERE id=? AND user_id=?").get(request.params.notificationId, request.user!.id);
+    if (!exists) return reply.code(404).send({ error: "NOTIFICATION_NOT_FOUND" });
+  }
+  return { read: true };
+});
+
+app.post("/api/v1/notifications/read-all", { preHandler: requireUser }, async (request: any) => {
+  const result = db.prepare("UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL").run(new Date().toISOString(), request.user!.id);
+  return { read: result.changes };
+});
+
+// ---------------------------------------------------------------- platform administration
+
+app.get("/api/v1/admin/overview", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED" });
+  const totals = db.prepare(`SELECT (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM workspaces) AS workspaces, (SELECT COUNT(*) FROM projects) AS projects,
+    (SELECT COUNT(*) FROM conversations) AS conversations, (SELECT COUNT(*) FROM messages) AS messages, (SELECT COUNT(*) FROM runs) AS runs,
+    (SELECT COUNT(*) FROM workflows) AS workflows, (SELECT COUNT(*) FROM workflow_executions) AS executions`).get() as Record<string, number>;
+  const usage = db.prepare(`SELECT COUNT(*) AS runs, COALESCE(SUM(cost_micros),0) AS micros, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens,
+    COALESCE(SUM(estimated),0) AS estimatedRuns FROM run_usage`).get() as Record<string, number>;
+  const spend = db.prepare(`SELECT COALESCE(SUM(cost_micros),0) AS micros, COUNT(*) AS runs FROM run_usage WHERE created_at >= ?`).get(new Date(Date.now() - 86_400_000).toISOString()) as { micros: number; runs: number };
+  const engineStatus = await engine.health();
+  return {
+    totals, usage: { ...usage, costUsd: Number((usage.micros / 1e6).toFixed(6)) },
+    today: { runs: spend.runs, costMicros: spend.micros, costUsd: Number((spend.micros / 1e6).toFixed(6)) },
+    engine: engineStatus,
+    schemaVersion: (db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version,
+  };
+});
+
+app.get("/api/v1/admin/users", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED" });
+  return db.prepare(`SELECT u.id, u.email, u.display_name AS displayName, u.created_at AS createdAt, u.mfa_enabled AS mfaEnabled, u.email_verified AS emailVerified, u.is_admin AS isAdmin,
+    (SELECT COUNT(*) FROM memberships m WHERE m.user_id=u.id) AS workspaces, (SELECT COUNT(*) FROM auth_sessions s WHERE s.user_id=u.id) AS sessions
+    FROM users u ORDER BY u.created_at DESC`).all();
+});
+
+app.get("/api/v1/admin/workspaces", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED" });
+  return db.prepare(`SELECT w.id, w.name, w.slug, w.created_at AS createdAt, w.daily_cost_limit_micros AS dailyCostLimitMicros, w.monthly_cost_limit_micros AS monthlyCostLimitMicros, w.runs_per_hour_limit AS runsPerHourLimit,
+    (SELECT COUNT(*) FROM memberships m WHERE m.workspace_id=w.id) AS members, (SELECT COUNT(*) FROM projects p WHERE p.workspace_id=w.id) AS projects,
+    (SELECT COALESCE(SUM(u.cost_micros),0) FROM run_usage u JOIN projects p ON p.id=u.project_id WHERE p.workspace_id=w.id) AS costMicros,
+    (SELECT COALESCE(SUM(u.cost_micros),0) FROM run_usage u JOIN projects p ON p.id=u.project_id WHERE p.workspace_id=w.id AND u.created_at >= ?) AS costTodayMicros
+    FROM workspaces w ORDER BY w.created_at DESC`).all(new Date(Date.now() - 86_400_000).toISOString());
+});
+
+app.post<{ Params: { userId: string }; Body: { enabled?: boolean } }>("/api/v1/admin/users/:userId/admin", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED" });
+  const target = db.prepare("SELECT id FROM users WHERE id=?").get(request.params.userId) as { id: string } | undefined;
+  if (!target) return reply.code(404).send({ error: "USER_NOT_FOUND" });
+  const enabled = request.body?.enabled === false ? 0 : 1;
+  db.prepare("UPDATE users SET is_admin=?, updated_at=? WHERE id=?").run(enabled, new Date().toISOString(), request.params.userId);
+  recordAudit(null, request.user!.id, enabled ? "admin.granted" : "admin.revoked", { userId: request.params.userId });
+  notify(null, request.params.userId, "security", enabled ? "Anda kini admin platform" : "Akses admin dicabut", undefined, "/");
+  return { userId: request.params.userId, isAdmin: Boolean(enabled) };
+});
+
+app.put<{ Params: { workspaceId: string }; Body: { dailyCostLimitMicros?: number | null; monthlyCostLimitMicros?: number | null; runsPerHourLimit?: number | null } }>("/api/v1/workspaces/:workspaceId/limits", { preHandler: requireUser }, async (request: any, reply) => {
+  const role = membershipRole(request.params.workspaceId, request.user!.id);
+  if (!role) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (role !== "owner" && role !== "admin") return reply.code(403).send({ error: "OWNER_REQUIRED" });
+  const clean = (value: number | null | undefined) => (value === null || value === undefined || Number.isNaN(Number(value)) ? null : Math.max(0, Math.trunc(Number(value))));
+  db.prepare("UPDATE workspaces SET daily_cost_limit_micros=?, monthly_cost_limit_micros=?, runs_per_hour_limit=?, updated_at=? WHERE id=?")
+    .run(clean(request.body?.dailyCostLimitMicros), clean(request.body?.monthlyCostLimitMicros), clean(request.body?.runsPerHourLimit), new Date().toISOString(), request.params.workspaceId);
+  recordAudit(request.params.workspaceId, request.user!.id, "workspace.limits_updated", { body: request.body ?? {} });
+  return db.prepare("SELECT id, daily_cost_limit_micros AS dailyCostLimitMicros, monthly_cost_limit_micros AS monthlyCostLimitMicros, runs_per_hour_limit AS runsPerHourLimit FROM workspaces WHERE id=?").get(request.params.workspaceId);
+});
+
+// ---------------------------------------------------------------- metrics
+
+app.get("/metrics", async (request, reply) => {
+  const token = config.METRICS_TOKEN;
+  const provided = (request.headers["x-metrics-token"] as string | undefined) ?? (request.query as { token?: string } | undefined)?.token;
+  if (!token || provided !== token) return reply.code(404).send({ error: "NOT_FOUND" });
+  const one = (sql: string, ...params: unknown[]) => Number((db.prepare(sql).get(...params as never[]) as Record<string, number> | undefined)?.value ?? 0);
+  const totals = {
+    users: one("SELECT COUNT(*) AS value FROM users"),
+    workspaces: one("SELECT COUNT(*) AS value FROM workspaces"),
+    projects: one("SELECT COUNT(*) AS value FROM projects"),
+    conversations: one("SELECT COUNT(*) AS value FROM conversations"),
+    messages: one("SELECT COUNT(*) AS value FROM messages"),
+    runs: one("SELECT COUNT(*) AS value FROM runs"),
+    runs_failed: one("SELECT COUNT(*) AS value FROM runs WHERE status='failed'"),
+    workflows: one("SELECT COUNT(*) AS value FROM workflows"),
+    executions_failed: one("SELECT COUNT(*) AS value FROM workflow_executions WHERE status='failed'"),
+    tokens_input: one("SELECT COALESCE(SUM(input_tokens),0) AS value FROM run_usage"),
+    tokens_output: one("SELECT COALESCE(SUM(output_tokens),0) AS value FROM run_usage"),
+    cost_micros: one("SELECT COALESCE(SUM(cost_micros),0) AS value FROM run_usage"),
+    cost_micros_today: one("SELECT COALESCE(SUM(cost_micros),0) AS value FROM run_usage WHERE created_at >= ?", new Date(Date.now() - 86_400_000).toISOString()),
+    estimated_runs: one("SELECT COALESCE(SUM(estimated),0) AS value FROM run_usage"),
+    sessions_active: one("SELECT COUNT(*) AS value FROM auth_sessions"),
+    schema_version: one("SELECT COALESCE(MAX(version),0) AS value FROM schema_migrations"),
+  };
+  const lines: string[] = ["# HELP coder_info Static information about the COBLAI Coder API", "# TYPE coder_info gauge", `coder_info{engine="${config.MOCK_ENGINE ? "mock" : "prime-rpc"}"} 1`];
+  for (const [key, value] of Object.entries(totals)) lines.push(`coder_${key} ${value}`);
+  lines.push("# TYPE coder_uptime_seconds gauge", `coder_uptime_seconds ${Math.round(process.uptime())}`);
+  return reply.type("text/plain; version=0.0.4").send(`${lines.join("\n")}\n`);
 });
 
 app.get("/api/v1/workspaces", { preHandler: requireUser }, async (request: any) => db.prepare("SELECT w.id, w.name, w.slug, w.created_at AS createdAt, w.updated_at AS updatedAt FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=? ORDER BY w.created_at DESC").all(request.user!.id));
@@ -306,6 +548,9 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
     const message = error instanceof Error ? error.message : "RUN_FAILED";
     db.prepare("UPDATE runs SET status='failed', error_code=?, finished_at=? WHERE id=?").run(message, new Date().toISOString(), runId);
     publishRunEvent(runId, "failed", { message });
+    // A failed engine run is worth a notification, because it usually needs a human.
+    const owner = db.prepare("SELECT workspace_id AS workspaceId FROM projects WHERE id=?").get(projectId) as { workspaceId: string } | undefined;
+    notify(owner?.workspaceId ?? null, null, "run", "Run gagal", `Run ${runId.slice(0, 8)} gagal: ${message.slice(0, 200)}`, "/");
   }
 }
 
@@ -337,6 +582,15 @@ app.post<{ Params: { projectId: string }; Body: { prompt?: string; model?: strin
   const project = db.prepare("SELECT p.id, p.workspace_id AS workspaceId, m.role AS role FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id) as { id: string; workspaceId: string; role: string } | undefined;
   if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
   if (project.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  // Cost and speed guards: a workspace can cap how much engine work it starts.
+  const guard = guardWorkspaceUsage(project.workspaceId);
+  if (guard) {
+    notify(project.workspaceId, null, "cost", guard.error === "COST_LIMIT_EXCEEDED" ? "Batas biaya tercapai" : "Batas kecepatan run tercapai",
+      guard.error === "COST_LIMIT_EXCEEDED"
+        ? `Batas pemakaian tercapai (${JSON.stringify(guard.detail)}). Naikkan batas di Pengaturan workspace atau tunggu periode berikutnya.`
+        : `Terlalu banyak run pada periode ini (${JSON.stringify(guard.detail)}).`, "/");
+    return reply.code(guard.status).send({ error: guard.error, ...(guard.detail ?? {}) });
+  }
   const id = randomUUID(); const createdAt = new Date().toISOString();
   db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(id, project.id, "queued", prompt, model ?? config.PRIME_AGENT_MODEL, createdAt);
   void executeRun(id, project.id, prompt, undefined, undefined, model);
@@ -536,6 +790,13 @@ app.post<{ Params: { workflowId: string }; Body: { input?: string } }>("/api/v1/
   if (!access) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
   if (access.role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
   if (access.status !== "published") return reply.code(409).send({ error: "WORKFLOW_NOT_PUBLISHED" });
+  // Workflow prompt steps also cost money, so the same guard applies.
+  const workspace = db.prepare("SELECT workspace_id AS workspaceId FROM projects WHERE id=?").get(access.projectId) as { workspaceId: string } | undefined;
+  const guard = workspace ? guardWorkspaceUsage(workspace.workspaceId) : null;
+  if (guard && workspace) {
+    notify(workspace.workspaceId, null, "cost", guard.error === "COST_LIMIT_EXCEEDED" ? "Batas biaya tercapai" : "Batas kecepatan run tercapai", `Eksekusi workflow ditolak (${JSON.stringify(guard.detail ?? {})}).`, "/");
+    return reply.code(guard.status).send({ error: guard.error, ...(guard.detail ?? {}) });
+  }
   const input = String(request.body?.input ?? "");
   const id = createExecution(access.id, input, request.user!.id);
   if (!id) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
@@ -732,7 +993,12 @@ app.get<{ Params: { projectId: string }; Querystring: { days?: string } }>("/api
 });
 
 /** Runs the engine CLI once and returns its model catalogue. Never invents models. */
-function engineModelCatalogue(): { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string; note?: string } {
+let catalogueCache: { at: number; value: { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string; note?: string } } | null = null;
+/** A successful catalogue is reused for ten minutes, a failure for one, so runs never spawn the CLI twice. */
+const CATALOGUE_TTL_MS = 10 * 60 * 1000;
+const CATALOGUE_ERROR_TTL_MS = 60 * 1000;
+
+function readEngineModelCatalogue(): { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string; note?: string } {
   try {
     const binary = config.PRIME_AGENT_BIN ?? "prime-agent";
     const result = spawnSync(binary, ["model", "list"], { encoding: "utf8", timeout: 20_000 });
@@ -753,8 +1019,21 @@ function engineModelCatalogue(): { available: boolean; models: { provider: strin
   }
 }
 
-app.get("/api/v1/models", { preHandler: requireUser }, async () => {
-  const catalogue = engineModelCatalogue();
+function engineModelCatalogue(force = false) { return catalogueFor(force); }
+
+/** Reads the engine catalogue from cache unless it is stale; never blocks the event loop on a cache hit. */
+function catalogueFor(force: boolean) {
+  if (!force && catalogueCache) {
+    const ttl = catalogueCache.value.available ? CATALOGUE_TTL_MS : CATALOGUE_ERROR_TTL_MS;
+    if (Date.now() - catalogueCache.at < ttl) return catalogueCache.value;
+  }
+  const value = readEngineModelCatalogue();
+  catalogueCache = { at: Date.now(), value };
+  return value;
+}
+
+app.get("/api/v1/models", { preHandler: requireUser }, async (request: any) => {
+  const catalogue = engineModelCatalogue(request?.query?.refresh === "1");
   return { ...catalogue, default: { model: config.PRIME_AGENT_MODEL ?? null, provider: config.PRIME_AGENT_PROVIDER ?? null } };
 });
 
@@ -795,6 +1074,9 @@ app.setNotFoundHandler(async (request, reply) => {
 mkdirSync(config.DATA_DIR, { recursive: true });
 startWorkflowScheduler();
 await app.listen({ host: config.HOST, port: config.PORT });
+
+// Reads the engine model catalogue once at start-up so the first user request never pays the CLI cost.
+setTimeout(() => { try { engineModelCatalogue(); } catch { /* the catalogue is optional, runs still work */ } }, 0);
 
 const stop = async () => { await app.close(); db.close(); process.exit(0); };
 process.on("SIGTERM", stop); process.on("SIGINT", stop);
