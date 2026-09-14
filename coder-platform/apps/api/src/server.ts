@@ -19,6 +19,13 @@ import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, ge
 import { checkRequestOrigin, constantTimeEquals, csrfCookieOptions, generateCsrfToken } from "./csrf.js";
 import { limiterFor } from "./ratelimit.js";
 import { describeCron, nextCronRun, validateCronExpression } from "./cron.js";
+import {
+  activeSubscription, attachOrderProof, branding, chargeQuota, createBankAccount, createOrder, createCoupon,
+  creditHistory, deleteBankAccount, ensureCommerceSeed, getOrder, getPlan, grantCredit,
+  listBankAccounts, listCoupons, listOrders, listPlans, markOrderPaid, paymentConfig, quotaGuard, quotaState,
+  recordPayment, rejectOrder, resetQuota, revenueSummary, saveBranding, savePaymentConfig, setCouponActive,
+  setUsdToIdrRate, updatePlan, userTier, validateCoupon,
+} from "./billing.js";
 
 // trustProxy is on because the API only listens on 127.0.0.1 behind nginx, which sets X-Forwarded-For.
 // Without it every request would look like it came from the proxy and rate limits would lump users together.
@@ -301,7 +308,8 @@ app.get("/ready", async (_request, reply) => {
 app.get("/api/v1/auth/me", async (request, reply) => {
   const user = getSessionUser(request);
   if (!user) return reply.code(401).send({ error: "AUTH_REQUIRED" });
-  return { user };
+  // isAdmin and tier let the shell show the right pages without extra requests.
+  return { user: { ...user, isAdmin: isPlatformAdmin(user), tier: userTier(user.id) } };
 });
 app.post<{ Body: { email?: string; password?: string; displayName?: string } }>("/api/v1/auth/register", async (request, reply) => {
   if (!registerLimiter.allow(request.ip ?? "unknown")) return reply.code(429).send({ error: "RATE_LIMITED", message: "Terlalu banyak pendaftaran dari koneksi ini. Coba lagi nanti." });
@@ -661,7 +669,7 @@ function providerForModel(model: string): string | undefined {
   return catalogue.models.find((row) => row.model === model)?.provider ?? config.PRIME_AGENT_PROVIDER;
 }
 
-function recordRunUsage(runId: string, projectId: string, prompt: string, answer: string, usage: any) {
+function recordRunUsage(runId: string, projectId: string, prompt: string, answer: string, usage: any, userId?: string) {
   const reported = usage && typeof usage === "object" ? usage : null;
   const hasTokens = typeof reported?.inputTokens === "number" || typeof reported?.outputTokens === "number";
   const inputTokens = hasTokens ? Math.round(reported.inputTokens ?? 0) : Math.ceil(prompt.length / 4);
@@ -675,9 +683,12 @@ function recordRunUsage(runId: string, projectId: string, prompt: string, answer
   const provider = model ? providerForModel(model) : config.PRIME_AGENT_PROVIDER ?? null;
   db.prepare("INSERT INTO run_usage (id,run_id,project_id,model,provider,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost_micros,estimated,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
     .run(randomUUID(), runId, projectId, model, provider, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, costMicros, hasTokens ? 0 : 1, reported ? JSON.stringify(reported.raw ?? null).slice(0, 4000) : null, new Date().toISOString());
+  // Token over the tier limit is paid from purchased credit. Workflow steps fall back to the workspace owner.
+  const payerId = userId ?? (db.prepare("SELECT m.user_id AS userId FROM memberships m JOIN projects p ON p.workspace_id=m.workspace_id WHERE p.id=? AND m.role='owner' LIMIT 1").get(projectId) as { userId: string } | undefined)?.userId;
+  if (payerId) chargeQuota(payerId, totalTokens);
 }
 
-async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext, model?: string) {
+async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext, model?: string, userId?: string) {
   const startedAt = new Date().toISOString();
   db.prepare("UPDATE runs SET status='running', started_at=? WHERE id=?").run(startedAt, runId);
   let text = "";
@@ -713,6 +724,12 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
   const conversation = db.prepare("SELECT c.id, c.project_id AS projectId, m.role AS role FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; projectId: string; role: string } | undefined;
   if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
   if (conversation.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  // Token quota guard: the tier limits how many tokens a customer may spend.
+  const quotaBlock = quotaGuard(request.user!.id, "");
+  if (quotaBlock) {
+    notify(null, request.user!.id, "quota", quotaBlock.error === "DAILY_TOKEN_QUOTA_EXCEEDED" ? "Kuota harian habis" : "Kuota bulanan habis", String((quotaBlock.detail as any)?.message ?? "Kuota token paket Anda habis."), "/");
+    return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
+  }
   const runId = randomUUID(); const messageId = randomUUID(); const now = new Date().toISOString();
   const retrieved = buildKnowledgeContext(conversation.projectId, content);
   const knowledge: KnowledgeContext | undefined = retrieved.hits.length ? { text: retrieved.text, hits: retrieved.hits.map((hit) => ({ documentId: hit.documentId, title: hit.title, chunkIndex: hit.chunkIndex })) } : undefined;
@@ -721,7 +738,7 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
     db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(messageId, conversation.id, "user", content, runId, now);
     db.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversation.id);
   }); transaction();
-  void executeRun(runId, conversation.projectId, content, conversation.id, knowledge, model);
+  void executeRun(runId, conversation.projectId, content, conversation.id, knowledge, model, request.user!.id);
   return reply.code(202).send({ message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now }, run: { id: runId, status: "queued" } });
 });
 
@@ -778,9 +795,11 @@ app.post<{ Params: { projectId: string }; Body: { prompt?: string; model?: strin
         : `Terlalu banyak run pada periode ini (${JSON.stringify(guard.detail)}).`, "/");
     return reply.code(guard.status).send({ error: guard.error, ...(guard.detail ?? {}) });
   }
+  const quotaBlock = quotaGuard(request.user!.id, project.workspaceId);
+  if (quotaBlock) return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
   const id = randomUUID(); const createdAt = new Date().toISOString();
   db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(id, project.id, "queued", prompt, model ?? config.PRIME_AGENT_MODEL, createdAt);
-  void executeRun(id, project.id, prompt, undefined, undefined, model);
+  void executeRun(id, project.id, prompt, undefined, undefined, model, request.user!.id);
   return reply.code(202).send({ id, projectId: project.id, status: "queued", prompt, model: model ?? config.PRIME_AGENT_MODEL ?? null, createdAt });
 });
 
@@ -1255,6 +1274,408 @@ app.post<{ Params: { projectId: string }; Body: { name?: string; mimeType?: stri
   return reply.code(201).send({ id, projectId: request.params.projectId, runId: request.body.runId ?? null, name, mimeType, sizeBytes: content.length, sha256, createdAt: now });
 });
 
+// ---------------------------------------------------------------- komersial: paket, pesanan, kredit token
+
+/** Email address of a user id, or an empty string when the user is gone. */
+function userEmail(userId: string | null | undefined): string {
+  if (!userId) return "";
+  const row = db.prepare("SELECT email FROM users WHERE id=?").get(userId) as { email: string } | undefined;
+  return row?.email ?? "";
+}
+
+/** Sends an in-app notification to every platform administrator. */
+function notifyAdmins(kind: string, title: string, body: string, link?: string) {
+  const allowed = config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+  const rows = db.prepare("SELECT id, email, is_admin AS isAdmin FROM users").all() as { id: string; email: string; isAdmin: number }[];
+  for (const row of rows) {
+    if (row.isAdmin === 1 || allowed.includes(row.email.toLowerCase())) notify(null, row.id, kind, title, body, link);
+  }
+}
+
+/** Public branding so the shell, the manifest and the login page can read the same name. */
+app.get("/api/v1/branding", async () => branding());
+
+app.get("/api/v1/billing/plans", { preHandler: requireUser }, async () => ({ plans: listPlans(true), currency: "IDR" }));
+
+/** Everything the billing page needs in one read: tier, quota, orders, banks and payment setup. */
+app.get("/api/v1/billing/me", { preHandler: requireUser }, async (request: any) => {
+  const userId = request.user!.id;
+  const tier = userTier(userId);
+  return {
+    tier,
+    plan: getPlan(tier),
+    subscription: activeSubscription(userId),
+    quota: quotaState(userId),
+    orders: listOrders({ userId, limit: 20 }),
+    banks: listBankAccounts(true),
+    creditHistory: creditHistory(userId, 20),
+    payment: paymentConfig(),
+    currency: "IDR",
+  };
+});
+
+app.get("/api/v1/billing/orders", { preHandler: requireUser }, async (request: any) => ({ orders: listOrders({ userId: request.user!.id, limit: 50 }) }));
+
+app.post<{ Body: { code?: string; amountIdr?: number } }>("/api/v1/billing/coupons/validate", { preHandler: requireUser }, async (request: any, reply) => {
+  const amountIdr = Math.max(0, Math.round(Number(request.body?.amountIdr ?? 0)));
+  const result = validateCoupon(String(request.body?.code ?? ""), amountIdr);
+  if (!result.ok) return reply.code(400).send({ error: result.error, message: "Kupon tidak bisa dipakai. Periksa kembali kodenya." });
+  return { code: result.coupon.code, discountIdr: result.discountIdr, percent: result.coupon.percent };
+});
+
+app.post<{ Body: { planCode?: string; months?: number; couponCode?: string; note?: string } }>("/api/v1/billing/orders", { preHandler: requireUser }, async (request: any, reply) => {
+  const result = createOrder({
+    userId: request.user!.id,
+    planCode: String(request.body?.planCode ?? "").trim(),
+    months: Number(request.body?.months ?? 1),
+    couponCode: request.body?.couponCode ?? null,
+    note: request.body?.note,
+  });
+  if (!result.ok) {
+    const status = result.error === "PLAN_NOT_FOUND" ? 404 : 400;
+    return reply.code(status).send({ error: result.error, message: result.error === "PLAN_NOT_FOUND" ? "Paket tidak ditemukan." : "Kupon tidak bisa dipakai." });
+  }
+  recordAudit(null, request.user!.id, "billing.order_created", { orderId: result.order.id, planCode: result.order.planCode, totalIdr: result.order.totalIdr, method: result.order.method });
+  if (result.order.status === "pending") {
+    notifyAdmins("billing", "Pesanan baru menunggu pembayaran", `${request.user!.email} memesan paket ${result.order.planCode} senilai Rp${result.order.totalIdr.toLocaleString("id-ID")}.`, "/");
+  }
+  return { order: result.order };
+});
+
+/**
+ * Accepts a transfer proof (image or pdf, at most 5 MB). The file stays on the server;
+ * orders.proof_artifact_id holds its path there, which is why the reply only returns the id.
+ */
+app.post<{ Params: { orderId: string }; Body: { filename?: string; contentBase64?: string } }>("/api/v1/billing/orders/:orderId/proof", { preHandler: requireUser, bodyLimit: 12 * 1024 * 1024 }, async (request: any, reply) => {
+  const order = getOrder(request.params.orderId);
+  if (!order || order.userId !== request.user!.id) return reply.code(404).send({ error: "ORDER_NOT_FOUND", message: "Pesanan tidak ditemukan." });
+  if (order.status !== "pending") return reply.code(409).send({ error: "ORDER_NOT_PENDING", message: "Pesanan ini sudah tidak menunggu pembayaran." });
+  const filename = String(request.body?.filename ?? "").trim();
+  const encoded = String(request.body?.contentBase64 ?? "");
+  const ext = extname(filename).toLowerCase();
+  const allowedExt = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf"];
+  if (!filename || filename.length > 120 || !allowedExt.includes(ext) || filename.includes("/") || filename.includes("\\") || !encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+    return reply.code(400).send({ error: "PROOF_INVALID", message: "Berkas bukti harus gambar (png/jpg/webp/gif) atau pdf." });
+  }
+  if (encoded.length > 7_000_000) return reply.code(413).send({ error: "PROOF_TOO_LARGE", message: "Ukuran berkas maksimal 5 MB." });
+  const content = Buffer.from(encoded, "base64");
+  if (content.length > 5 * 1024 * 1024) return reply.code(413).send({ error: "PROOF_TOO_LARGE", message: "Ukuran berkas maksimal 5 MB." });
+  const dir = join(config.DATA_DIR, "proofs");
+  await mkdir(dir, { recursive: true });
+  const proofId = randomUUID();
+  const storagePath = join(dir, `${proofId}${ext}`);
+  await writeFile(storagePath, content, { flag: "wx" });
+  attachOrderProof(order.id, storagePath);
+  recordPayment({ orderId: order.id, userId: request.user!.id, provider: "manual_transfer", providerRef: filename, amountIdr: order.totalIdr, status: "proof_uploaded", raw: { filename, bytes: content.length } });
+  recordAudit(null, request.user!.id, "billing.proof_uploaded", { orderId: order.id, filename, bytes: content.length });
+  notifyAdmins("billing", "Bukti transfer masuk", `Pesanan dari ${userEmail(request.user!.id)} menunggu pemeriksaan admin.`, "/");
+  return { order: getOrder(order.id)!, artifactId: proofId };
+});
+
+// ---------------------------------------------------------------- admin: pesanan & pendapatan
+
+app.get<{ Querystring: { status?: string } }>("/api/v1/admin/orders", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh membuka daftar pesanan." });
+  const status = request.query?.status && ["pending", "paid", "rejected", "cancelled"].includes(request.query.status) ? request.query.status : undefined;
+  const orders = listOrders({ status, limit: 200 }).map((order) => ({ ...order, userEmail: userEmail(order.userId) }));
+  return { orders };
+});
+
+/** Streams an uploaded transfer proof back to an admin. */
+app.get<{ Params: { orderId: string } }>("/api/v1/admin/orders/:orderId/proof", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat bukti transfer." });
+  const order = getOrder(request.params.orderId);
+  if (!order?.proofArtifactId) return reply.code(404).send({ error: "PROOF_NOT_FOUND" });
+  const root = join(config.DATA_DIR, "proofs");
+  const target = normalize(order.proofArtifactId);
+  if (!target.startsWith(root)) return reply.code(404).send({ error: "PROOF_NOT_FOUND" });
+  try {
+    const data = await readFile(target);
+    return reply.type(extname(target) === ".pdf" ? "application/pdf" : `image/${extname(target).replace(".", "")}`).send(data);
+  } catch { return reply.code(404).send({ error: "PROOF_NOT_FOUND" }); }
+});
+
+app.post<{ Params: { orderId: string }; Body: { decision?: string; note?: string } }>("/api/v1/admin/orders/:orderId/decision", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh memutuskan pesanan." });
+  const decision = String(request.body?.decision ?? "");
+  if (decision !== "paid" && decision !== "rejected") return reply.code(400).send({ error: "INVALID_DECISION", message: "Keputusan harus paid atau rejected." });
+  const existing = getOrder(request.params.orderId);
+  if (!existing) return reply.code(404).send({ error: "ORDER_NOT_FOUND", message: "Pesanan tidak ditemukan." });
+  if (decision === "rejected" && existing.status === "paid") return reply.code(409).send({ error: "ORDER_ALREADY_PAID", message: "Pesanan ini sudah lunas." });
+  if (decision === "paid") {
+    // Idempotent: paying twice returns the same order and never creates a second subscription.
+    const result = markOrderPaid(existing.id, request.user!.id, String(request.body?.note ?? ""));
+    const fresh = result.ok ? result.order : existing;
+    if (fresh.status === "paid" && !existing.decidedAt) {
+      recordAudit(null, request.user!.id, "billing.order_paid", { orderId: fresh.id, totalIdr: fresh.totalIdr, planCode: fresh.planCode });
+      notify(null, fresh.userId, "billing", "Pembayaran diterima", `Paket ${fresh.planCode} sudah aktif. Terima kasih.`, "/");
+    }
+    return { order: fresh };
+  }
+  const rejected = rejectOrder(existing.id, request.user!.id, String(request.body?.note ?? "")) ?? existing;
+  recordAudit(null, request.user!.id, "billing.order_rejected", { orderId: rejected.id });
+  notify(null, rejected.userId, "billing", "Pesanan ditolak", "Bukti transfer belum bisa diverifikasi. Hubungi admin bila transfernya sudah benar.", "/");
+  return { order: rejected };
+});
+
+app.get<{ Querystring: { days?: string } }>("/api/v1/admin/revenue", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat pendapatan." });
+  return revenueSummary(Number(request.query?.days ?? 30));
+});
+
+app.get("/api/v1/admin/coupons", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat kupon." });
+  return { coupons: listCoupons() };
+});
+
+app.post<{ Body: { code?: string; percent?: number; amountIdr?: number; maxUses?: number; expiresAt?: string | null } }>("/api/v1/admin/coupons", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh membuat kupon." });
+  const code = String(request.body?.code ?? "").trim().toUpperCase();
+  if (!/^[A-Z0-9_-]{3,24}$/.test(code)) return reply.code(400).send({ error: "INVALID_COUPON", message: "Kode kupon 3-24 karakter: huruf, angka, tanda hubung." });
+  const percent = Math.max(0, Math.min(100, Math.round(Number(request.body?.percent ?? 0))));
+  const amountIdr = Math.max(0, Math.round(Number(request.body?.amountIdr ?? 0)));
+  if (percent <= 0 && amountIdr <= 0) return reply.code(400).send({ error: "INVALID_COUPON", message: "Isi potongan persen atau potongan rupiah." });
+  if (db.prepare("SELECT 1 FROM coupons WHERE code=?").get(code)) return reply.code(409).send({ error: "COUPON_EXISTS", message: "Kode kupon itu sudah ada." });
+  const coupon = createCoupon({ code, percent, amountIdr, maxUses: Number(request.body?.maxUses ?? 0), expiresAt: request.body?.expiresAt ? String(request.body.expiresAt) : null });
+  recordAudit(null, request.user!.id, "billing.coupon_created", { code, percent, amountIdr });
+  return { coupon };
+});
+
+app.patch<{ Params: { code: string }; Body: { active?: boolean } }>("/api/v1/admin/coupons/:code", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah kupon." });
+  const changed = setCouponActive(request.params.code, request.body?.active !== false);
+  if (!changed) return reply.code(404).send({ error: "COUPON_NOT_FOUND", message: "Kupon tidak ditemukan." });
+  const coupon = listCoupons().find((row) => row.code === request.params.code.toUpperCase());
+  return { coupon };
+});
+
+app.get("/api/v1/admin/banks", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat rekening." });
+  return { banks: listBankAccounts(false) };
+});
+
+app.post<{ Body: { bankName?: string; accountNumber?: string; accountHolder?: string; note?: string; sortOrder?: number } }>("/api/v1/admin/banks", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh menambah rekening." });
+  const bankName = String(request.body?.bankName ?? "").trim();
+  const accountNumber = String(request.body?.accountNumber ?? "").trim();
+  const accountHolder = String(request.body?.accountHolder ?? "").trim();
+  if (!bankName || !accountNumber || !accountHolder) return reply.code(400).send({ error: "INVALID_BANK", message: "Nama bank, nomor rekening dan nama pemilik wajib diisi." });
+  const bank = createBankAccount({ bankName, accountNumber, accountHolder, note: request.body?.note, sortOrder: Number(request.body?.sortOrder ?? 0) });
+  recordAudit(null, request.user!.id, "billing.bank_created", { bankName });
+  return { bank };
+});
+
+app.delete<{ Params: { bankId: string } }>("/api/v1/admin/banks/:bankId", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh menghapus rekening." });
+  if (!deleteBankAccount(request.params.bankId)) return reply.code(404).send({ error: "BANK_NOT_FOUND", message: "Rekening tidak ditemukan." });
+  recordAudit(null, request.user!.id, "billing.bank_deleted", { bankId: request.params.bankId });
+  return { ok: true };
+});
+
+app.get("/api/v1/admin/payment-config", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat konfigurasi pembayaran." });
+  return paymentConfig();
+});
+
+app.put<{ Body: { gateway?: string; xenditEnabled?: boolean; midtransEnabled?: boolean; instructions?: string } }>("/api/v1/admin/payment-config", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah konfigurasi pembayaran." });
+  const gateway = String(request.body?.gateway ?? "manual");
+  if (!["manual", "xendit", "midtrans"].includes(gateway)) return reply.code(400).send({ error: "INVALID_GATEWAY", message: "Gateway harus manual, xendit atau midtrans." });
+  const xenditEnabled = request.body?.xenditEnabled === true;
+  const midtransEnabled = request.body?.midtransEnabled === true;
+  if ((gateway === "xendit" || xenditEnabled) && !config.XENDIT_SECRET_KEY) {
+    return reply.code(400).send({ error: "GATEWAY_NOT_CONFIGURED", message: "Kunci API Xendit belum dipasang di server. Isi XENDIT_SECRET_KEY dulu." });
+  }
+  if ((gateway === "midtrans" || midtransEnabled) && !config.MIDTRANS_SERVER_KEY) {
+    return reply.code(400).send({ error: "GATEWAY_NOT_CONFIGURED", message: "Kunci API Midtrans belum dipasang di server. Isi MIDTRANS_SERVER_KEY dulu." });
+  }
+  const saved = savePaymentConfig({ gateway: gateway as "manual" | "xendit" | "midtrans", xenditEnabled, midtransEnabled, instructions: request.body?.instructions });
+  recordAudit(null, request.user!.id, "billing.payment_config_saved", { gateway, xenditEnabled, midtransEnabled });
+  return saved;
+});
+
+app.get("/api/v1/admin/plans", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat paket." });
+  return { plans: listPlans(false) };
+});
+
+app.patch<{ Params: { code: string }; Body: Record<string, unknown> }>("/api/v1/admin/plans/:code", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah paket." });
+  const body = request.body ?? {};
+  const patch: Record<string, unknown> = {};
+  for (const key of ["name", "description", "tier"] as const) if (typeof body[key] === "string") patch[key] = body[key];
+  for (const key of ["priceIdr", "periodDays", "dailyTokenLimit", "monthlyTokenLimit", "bonusTokens", "sortOrder"] as const) {
+    if (body[key] !== undefined && Number.isFinite(Number(body[key]))) patch[key] = Math.max(0, Math.round(Number(body[key])));
+  }
+  if (typeof body.active === "boolean") patch.active = body.active;
+  if (Array.isArray(body.features)) patch.features = (body.features as unknown[]).map((item) => String(item)).slice(0, 20);
+  const plan = updatePlan(request.params.code, patch as any);
+  if (!plan) return reply.code(404).send({ error: "PLAN_NOT_FOUND", message: "Paket tidak ditemukan." });
+  recordAudit(null, request.user!.id, "billing.plan_updated", { code: plan.code, patch });
+  return { plan };
+});
+
+app.put<{ Body: { rate?: number } }>("/api/v1/admin/currency", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah kurs." });
+  const rate = Number(request.body?.rate);
+  if (!Number.isFinite(rate) || rate <= 0) return reply.code(400).send({ error: "INVALID_RATE", message: "Kurs harus angka lebih besar dari nol." });
+  const saved = setUsdToIdrRate(rate);
+  recordAudit(null, request.user!.id, "billing.currency_updated", { usdIdrRate: saved });
+  return { usdIdrRate: saved };
+});
+
+app.put<{ Body: { appName?: string; tagline?: string; primaryColor?: string; logoUrl?: string; faviconUrl?: string; supportEmail?: string } }>("/api/v1/admin/branding", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah branding." });
+  const body = request.body ?? {};
+  const appName = String(body.appName ?? "").trim();
+  if (appName.length < 2 || appName.length > 60) return reply.code(400).send({ error: "INVALID_BRANDING", message: "Nama aplikasi 2-60 karakter." });
+  const primaryColor = String(body.primaryColor ?? "").trim();
+  if (primaryColor && !/^#[0-9a-fA-F]{6}$/.test(primaryColor)) return reply.code(400).send({ error: "INVALID_BRANDING", message: "Warna utama harus format #rrggbb." });
+  const url = (value: unknown) => String(value ?? "").trim().slice(0, 300);
+  const saved = saveBranding({
+    appName, tagline: String(body.tagline ?? "").trim().slice(0, 120), primaryColor,
+    logoUrl: url(body.logoUrl), faviconUrl: url(body.faviconUrl), supportEmail: url(body.supportEmail),
+  });
+  recordAudit(null, request.user!.id, "platform.branding_updated", { appName: saved.appName });
+  return saved;
+});
+
+// ---------------------------------------------------------------- admin: pengguna
+
+app.get("/api/v1/admin/user-list", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat daftar pengguna." });
+  const rows = db.prepare(`SELECT u.id, u.email, u.display_name AS displayName, COALESCE(u.tier,'free') AS tier,
+    u.is_admin AS isAdmin, u.email_verified AS emailVerified, u.created_at AS createdAt,
+    (SELECT COUNT(*) FROM memberships m WHERE m.user_id = u.id) AS workspaces
+    FROM users u ORDER BY u.created_at DESC`).all() as any[];
+  return { users: rows.map((row) => ({ ...row, isAdmin: row.isAdmin === 1, emailVerified: row.emailVerified === 1 })) };
+});
+
+/** Admin creates an account: user, personal workspace and quota row in one step. */
+app.post<{ Body: { email?: string; displayName?: string; password?: string; tier?: string } }>("/api/v1/admin/users", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh menambah pengguna." });
+  const email = String(request.body?.email ?? "").trim().toLowerCase();
+  const displayName = String(request.body?.displayName ?? "").trim();
+  const password = String(request.body?.password ?? "");
+  const tier = String(request.body?.tier ?? "free").trim() || "free";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 200) return reply.code(400).send({ error: "INVALID_EMAIL", message: "Format email tidak valid." });
+  if (displayName.length < 2 || displayName.length > 80) return reply.code(400).send({ error: "INVALID_DISPLAY_NAME", message: "Nama tampilan 2-80 karakter." });
+  if (password.length < 8 || password.length > 200) return reply.code(400).send({ error: "INVALID_PASSWORD", message: "Kata sandi minimal 8 karakter." });
+  if (!getPlan(tier)) return reply.code(400).send({ error: "PLAN_NOT_FOUND", message: "Paket tidak ditemukan." });
+  if (db.prepare("SELECT 1 FROM users WHERE email=?").get(email)) return reply.code(409).send({ error: "EMAIL_TAKEN", message: "Email itu sudah dipakai." });
+  const userId = randomUUID();
+  const now = new Date().toISOString();
+  const workspaceId = randomUUID();
+  const shortId = userId.slice(0, 8);
+  const passwordHash = await hashPassword(password);
+  db.transaction(() => {
+    db.prepare("INSERT INTO users (id,email,display_name,password_hash,created_at,updated_at,tier,email_verified,is_admin) VALUES (?,?,?,?,?,?,?,0,0)")
+      .run(userId, email, displayName, passwordHash, now, now, tier);
+    db.prepare("INSERT INTO workspaces (id,name,slug,created_at,updated_at) VALUES (?,?,?,?,?)").run(workspaceId, `${displayName} Workspace`, `${slugifyText(displayName)}-${shortId}`, now, now);
+    db.prepare("INSERT INTO memberships (user_id,workspace_id,role,created_at) VALUES (?,?,?,?)").run(userId, workspaceId, "owner", now);
+    db.prepare("INSERT INTO token_quotas (user_id,tier,day_key,day_tokens,month_key,month_tokens,updated_at) VALUES (?,?,?,0,?,0,?)")
+      .run(userId, tier, now.slice(0, 10), now.slice(0, 7), now);
+  })();
+  recordAudit(null, request.user!.id, "admin.user_created", { userId, email, tier });
+  const row = db.prepare(`SELECT u.id, u.email, u.display_name AS displayName, COALESCE(u.tier,'free') AS tier, u.is_admin AS isAdmin, u.email_verified AS emailVerified, u.created_at AS createdAt,
+    (SELECT COUNT(*) FROM memberships m WHERE m.user_id = u.id) AS workspaces FROM users u WHERE u.id=?`).get(userId) as any;
+  return { user: { ...row, isAdmin: false, emailVerified: false } };
+});
+
+app.patch<{ Params: { userId: string }; Body: { displayName?: string; tier?: string; isAdmin?: boolean; emailVerified?: boolean } }>("/api/v1/admin/users/:userId", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah pengguna." });
+  const target = db.prepare("SELECT id, email, display_name AS displayName, is_admin AS isAdmin FROM users WHERE id=?").get(request.params.userId) as { id: string; email: string; displayName: string; isAdmin: number } | undefined;
+  if (!target) return reply.code(404).send({ error: "USER_NOT_FOUND", message: "Pengguna tidak ditemukan." });
+  const body = request.body ?? {};
+  if (body.isAdmin === false) {
+    const admins = db.prepare("SELECT id, email, is_admin AS isAdmin FROM users WHERE is_admin=1").all() as { id: string; email: string; isAdmin: number }[];
+    const allowed = config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+    const effective = new Set([...admins.map((row) => row.id), ...(db.prepare("SELECT id, email FROM users").all() as { id: string; email: string }[]).filter((row) => allowed.includes(row.email.toLowerCase())).map((row) => row.id)]);
+    effective.delete(target.id);
+    if (effective.size === 0) return reply.code(400).send({ error: "LAST_ADMIN", message: "Admin terakhir tidak boleh diturunkan menjadi pengguna biasa." });
+  }
+  const sets: string[] = [];
+  const values: unknown[] = [];
+  if (typeof body.displayName === "string") {
+    const displayName = body.displayName.trim();
+    if (displayName.length < 2 || displayName.length > 80) return reply.code(400).send({ error: "INVALID_DISPLAY_NAME", message: "Nama tampilan 2-80 karakter." });
+    sets.push("display_name=?"); values.push(displayName);
+  }
+  if (typeof body.tier === "string") {
+    if (!getPlan(body.tier)) return reply.code(400).send({ error: "PLAN_NOT_FOUND", message: "Paket tidak ditemukan." });
+    sets.push("tier=?"); values.push(body.tier);
+  }
+  if (typeof body.isAdmin === "boolean") { sets.push("is_admin=?"); values.push(body.isAdmin ? 1 : 0); }
+  if (typeof body.emailVerified === "boolean") { sets.push("email_verified=?"); values.push(body.emailVerified ? 1 : 0); }
+  if (!sets.length) return reply.code(400).send({ error: "NOTHING_TO_UPDATE", message: "Tidak ada perubahan yang dikirim." });
+  sets.push("updated_at=?"); values.push(new Date().toISOString());
+  values.push(target.id);
+  db.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id=?`).run(...(values as any[]));
+  recordAudit(null, request.user!.id, "admin.user_updated", { userId: target.id, fields: sets.join(",") });
+  const row = db.prepare(`SELECT u.id, u.email, u.display_name AS displayName, COALESCE(u.tier,'free') AS tier, u.is_admin AS isAdmin, u.email_verified AS emailVerified, u.created_at AS createdAt,
+    (SELECT COUNT(*) FROM memberships m WHERE m.user_id = u.id) AS workspaces FROM users u WHERE u.id=?`).get(target.id) as any;
+  return { user: { ...row, isAdmin: row.isAdmin === 1, emailVerified: row.emailVerified === 1 } };
+});
+
+app.post<{ Params: { userId: string } }>("/api/v1/admin/users/:userId/reset-quota", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mereset kuota." });
+  const exists = db.prepare("SELECT 1 FROM users WHERE id=?").get(request.params.userId);
+  if (!exists) return reply.code(404).send({ error: "USER_NOT_FOUND", message: "Pengguna tidak ditemukan." });
+  const quota = resetQuota(request.params.userId);
+  recordAudit(null, request.user!.id, "admin.quota_reset", { userId: request.params.userId });
+  notify(null, request.params.userId, "billing", "Kuota direset", "Admin sudah mereset penghitung kuota Anda. Anda bisa memakai platform lagi.", "/");
+  return { ok: true, quota };
+});
+
+app.post<{ Params: { userId: string }; Body: { tokens?: number; note?: string } }>("/api/v1/admin/users/:userId/credit", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh memberi kredit token." });
+  const exists = db.prepare("SELECT 1 FROM users WHERE id=?").get(request.params.userId);
+  if (!exists) return reply.code(404).send({ error: "USER_NOT_FOUND", message: "Pengguna tidak ditemukan." });
+  const tokens = Math.round(Number(request.body?.tokens ?? 0));
+  if (!Number.isFinite(tokens) || tokens === 0 || Math.abs(tokens) > 5_000_000_000) return reply.code(400).send({ error: "INVALID_TOKENS", message: "Jumlah token harus angka bulat dan tidak nol." });
+  grantCredit(request.params.userId, tokens, "admin_grant", request.user!.id, String(request.body?.note ?? "").slice(0, 200));
+  recordAudit(null, request.user!.id, "admin.credit_granted", { userId: request.params.userId, tokens });
+  notify(null, request.params.userId, "billing", "Kredit token ditambahkan", `Admin menambahkan ${tokens.toLocaleString("id-ID")} token ke akun Anda.`, "/");
+  const quota = quotaState(request.params.userId);
+  return { creditTokens: quota.creditTokens, quota };
+});
+
+// ---------------------------------------------------------------- gerbang pembayaran (webhook)
+
+/** Xendit invoice callback. Disabled unless the key and the callback token are both present. */
+app.post("/api/v1/webhooks/xendit", async (request: any, reply) => {
+  const cfg = paymentConfig();
+  if (!cfg.xenditEnabled || !config.XENDIT_SECRET_KEY || !config.XENDIT_CALLBACK_TOKEN) return reply.code(404).send({ error: "GATEWAY_DISABLED" });
+  const token = String(request.headers["x-callback-token"] ?? "");
+  if (!constantTimeEquals(token, config.XENDIT_CALLBACK_TOKEN)) return reply.code(401).send({ error: "INVALID_CALLBACK_TOKEN" });
+  const body = request.body ?? {};
+  const orderId = String(body.external_id ?? "").replace(/^coder-/, "");
+  const status = String(body.status ?? "").toUpperCase();
+  const order = getOrder(orderId);
+  recordPayment({ orderId: order?.id ?? null, userId: order?.userId ?? null, provider: "xendit", providerRef: String(body.id ?? ""), amountIdr: Number(body.paid_amount ?? body.amount ?? 0), status, raw: body });
+  if (order && ["PAID", "SETTLED"].includes(status)) {
+    markOrderPaid(order.id, null, "Otomatis: callback Xendit");
+    notify(null, order.userId, "billing", "Pembayaran diterima", "Paket Anda sudah aktif setelah pembayaran Xendit dikonfirmasi.", "/");
+  }
+  return { ok: true };
+});
+
+/** Midtrans transaction notification. Disabled unless the server key is present. */
+app.post("/api/v1/webhooks/midtrans", async (request: any, reply) => {
+  const cfg = paymentConfig();
+  if (!cfg.midtransEnabled || !config.MIDTRANS_SERVER_KEY) return reply.code(404).send({ error: "GATEWAY_DISABLED" });
+  const body = request.body ?? {};
+  const orderId = String(body.order_id ?? "");
+  const status = String(body.transaction_status ?? "").toUpperCase();
+  const order = getOrder(orderId);
+  recordPayment({ orderId: order?.id ?? null, userId: order?.userId ?? null, provider: "midtrans", providerRef: String(body.transaction_id ?? ""), amountIdr: Number(body.gross_amount ?? 0), status, raw: body });
+  if (order && ["SETTLEMENT", "CAPTURE"].includes(status)) {
+    markOrderPaid(order.id, null, "Otomatis: callback Midtrans");
+    notify(null, order.userId, "billing", "Pembayaran diterima", "Paket Anda sudah aktif setelah pembayaran Midtrans dikonfirmasi.", "/");
+  }
+  return { ok: true };
+});
+
 // ---------------------------------------------------------------- profil & akun
 
 app.patch<{ Body: { displayName?: string } }>("/api/v1/auth/me", { preHandler: requireUser }, async (request: any, reply) => {
@@ -1401,6 +1822,7 @@ app.setNotFoundHandler(async (request, reply) => {
 
 mkdirSync(config.DATA_DIR, { recursive: true });
 startWorkflowScheduler();
+ensureCommerceSeed();
 await app.listen({ host: config.HOST, port: config.PORT });
 
 // Reads the engine model catalogue once at start-up so the first user request never pays the CLI cost.

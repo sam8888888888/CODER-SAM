@@ -32,6 +32,14 @@ const Env = z.object({
   DEFAULT_RUNS_PER_HOUR_LIMIT: z.coerce.number().int().min(0).default(0),
   // Prometheus metrics. The endpoint answers only when METRICS_TOKEN is set and matches.
   METRICS_TOKEN: z.string().optional(),
+  // Payment gateways. Keys stay in the environment; the database only stores which gateway is on.
+  XENDIT_SECRET_KEY: z.string().optional(),
+  XENDIT_CALLBACK_TOKEN: z.string().optional(),
+  MIDTRANS_SERVER_KEY: z.string().optional(),
+  MIDTRANS_CLIENT_KEY: z.string().optional(),
+  MIDTRANS_MERCHANT_ID: z.string().optional(),
+  // Notification webhook used by the platform itself (admin alert channel). Optional.
+  PLATFORM_WEBHOOK_URL: z.string().optional(),
 });
 
 export const config = Env.parse(process.env);

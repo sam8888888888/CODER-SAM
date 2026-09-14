@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 13 Sep 2026 (versi 0.10.2)
+Terakhir diperbarui: 14 Sep 2026 (versi 0.11.0)
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel
@@ -9,7 +9,8 @@ Bila ragu, tulis "belum diverifikasi".
 
 Catatan snapshot: berkas ini diperiksa saat repo sedang diedit, jadi beberapa perubahan belum di-commit
 (`server.ts`, `csrf.ts`, `ratelimit.ts`, `cron.ts`, `ProfilePanel.tsx`, `WorkspaceAdmin.tsx`).
-Jumlah rute `server.ts` saat diperiksa: 83. Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
+Jumlah rute `server.ts` saat diperiksa: 113 (30 rute baru v0.11.0 untuk komersial, admin dan webhook).
+Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
 
 ## Sudah jalan
 
@@ -82,6 +83,52 @@ Jumlah rute `server.ts` saat diperiksa: 83. Bila angka di kode berbeda, jalankan
 - Smoke produksi: `apps/api/test/production-smoke.mjs` memuat 57 pemanggilan `check(`.
 - Cek tipe backend dan dashboard sama-sama lulus (`--noEmit` tanpa keluaran) saat saya jalankan.
 
+## Komersial (v0.11.0)
+
+- Paket: tabel `plans` dengan seed `free` (Rp0, 400.000 token/hari), `premium` (Rp199.000, 3 juta/hari,
+  bonus 5 juta) dan `enterprise` (Rp799.000, 20 juta/hari, bonus 50 juta). Angka ini titik awal yang
+  bisa diubah admin, bukan keputusan harga final. Rute: `GET /api/v1/billing/plans`,
+  `GET /api/v1/admin/plans`, `PATCH /api/v1/admin/plans/:code`.
+- Pesanan: `orders` dengan status `pending|paid|rejected|cancelled`; `POST /api/v1/billing/orders`
+  membuat pesanan (paket Rp0 langsung lunas), `GET /api/v1/billing/orders` milik sendiri,
+  `GET /api/v1/admin/orders`, `POST /api/v1/admin/orders/:id/decision` (idempoten: melunasi dua kali
+  tidak membuat langganan kedua). Melunasi pesanan menaikkan tier, memberi bonus token ke
+  `credit_ledger`, dan membuat baris `subscriptions`.
+- Bukti transfer: `POST /api/v1/billing/orders/:id/proof` menerima png/jpg/webp/gif/pdf maksimal 5 MB,
+  disimpan di `DATA_DIR/proofs`, hanya bisa dibaca admin lewat `GET /api/v1/admin/orders/:id/proof`.
+  `orders.proof_artifact_id` menyimpan path berkas di server.
+- Kupon: `coupons` dengan potongan persen atau rupiah, batas pakai dan masa berlaku;
+  `POST /api/v1/billing/coupons/validate`, `GET|POST /api/v1/admin/coupons`,
+  `PATCH /api/v1/admin/coupons/:code`.
+- Kuota token: `quotaState()` menghitung pemakaian nyata dari `run_usage` (tabel `token_quotas` hanya
+  salinan). Batas harian/bulanan berasal dari paket pengguna; kredit token menambah batas harian. Rute
+  kirim pesan dan mulai run memanggil `quotaGuard()` dan menjawab `429 DAILY_TOKEN_QUOTA_EXCEEDED` atau
+  `429 MONTHLY_TOKEN_QUOTA_EXCEEDED` dengan pesan Indonesia. Pemakaian di atas batas harian dipotong
+  dari kredit sebagai baris `usage_overflow`. `POST /api/v1/admin/users/:id/reset-quota` menggeser titik
+  hitung (`token_quotas.reset_at`) tanpa menghapus riwayat pemakaian.
+- Pendapatan: `GET /api/v1/admin/revenue?days=30` menghitung pendapatan pesanan lunas, biaya nyata dari
+  `run_usage`, margin, token, dan kurs USD ke IDR (default 17876, dapat diubah lewat
+  `PUT /api/v1/admin/currency`).
+- Rekening bank manual: `GET|POST /api/v1/admin/banks` dan `DELETE /api/v1/admin/banks/:id`; daftar
+  rekening tampil di `GET /api/v1/billing/me`.
+- Gateway: `GET|PUT /api/v1/admin/payment-config` memilih `manual|xendit|midtrans`. Kunci API hanya
+  dibaca dari env (`XENDIT_SECRET_KEY`, `XENDIT_CALLBACK_TOKEN`, `MIDTRANS_SERVER_KEY`); mengaktifkan
+  gateway tanpa kunci dijawab `400 GATEWAY_NOT_CONFIGURED`. Webhook `POST /api/v1/webhooks/xendit` dan
+  `/api/v1/webhooks/midtrans` memverifikasi token callback dan mencatat baris `payments`.
+- Pengguna oleh admin: `GET /api/v1/admin/user-list`, `POST /api/v1/admin/users` (membuat pengguna,
+  workspace pribadi dan baris kuota; `409 EMAIL_TAKEN`), `PATCH /api/v1/admin/users/:id`
+  (`400 LAST_ADMIN` melindungi admin terakhir), dan `POST /api/v1/admin/users/:id/credit` untuk kredit
+  token manual.
+- Branding: `GET /api/v1/branding` (publik) dan `PUT /api/v1/admin/branding`, disimpan di tabel
+  `platform_settings`.
+- Halaman: `Paket & langganan` (`coder-dashboard/src/Billing.tsx`) dan `Admin platform`
+  (`AdminCommerce.tsx` + `AdminUsers.tsx`); entri sidebar baru `billing` dan `admin` di `nav.ts`.
+  Halaman `admin` hanya terlihat untuk admin platform, yang kini diketahui dari `isAdmin` pada
+  `GET /api/v1/auth/me`.
+- Suite: `apps/api/test/billing.e2e.ts`, 87 pemeriksaan, lulus (`ALL_BILLING_TESTS_PASSED`).
+- Belum diverifikasi: halaman baru belum diuji di peramban; gateway Xendit/Midtrans belum pernah
+  dihubungi karena kuncinya belum ada, jadi baru jalur transfer manual yang terbukti end-to-end.
+
 ## Sebagian
 
 - Email transaksional: alur dan isi surat lengkap, klien SMTP sendiri di `apps/api/src/mailer.ts`
@@ -149,7 +196,8 @@ Jumlah rute `server.ts` saat diperiksa: 83. Bila angka di kode berbeda, jalankan
   dijalankan Aaron; saya tidak punya SSH ke server itu.
 - `METRICS_TOKEN` dan `PLATFORM_ADMIN_EMAILS` harus diisi di server sebelum metrik dan admin platform
   berguna.
-- Keputusan billing dan kebijakan retensi data menunggu pemilik produk.
+- Kunci gateway pembayaran (`XENDIT_SECRET_KEY`, `MIDTRANS_SERVER_KEY`) dan kebijakan retensi data
+  menunggu pemilik produk. Tanpa kunci itu hanya transfer manual yang aktif.
 
 ## Cara verifikasi
 
@@ -161,10 +209,10 @@ Cek tipe (tanpa keluaran berarti lulus; saya jalankan 13 Sep 2026):
 Suite end-to-end lokal tanpa jaringan:
 
 - `cd coder-platform && MOCK_ENGINE=true npx tsx apps/api/test/<suite>.e2e.ts`
-- 19 suite (semuanya lulus 13 Sep 2026, `RUNNER_EXIT=0`): `account-recovery`, `account-security`,
-  `admin-metrics`, `csrf-limits`, `delete-flow`, `guards`, `knowledge-team`, `login-identity`, `mailer`,
-  `model-rbac`, `project-runs`, `rpc-adapter`, `session-usage`, `totp`, `usage-cost`, `viewer-rbac`,
-  `workflow-engine`, `real-ai`, `real-usage`.
+- 20 suite (semuanya lulus 14 Sep 2026, `RUNNER_EXIT=0`): `account-recovery`, `account-security`,
+  `admin-metrics`, `billing`, `csrf-limits`, `delete-flow`, `guards`, `knowledge-team`, `login-identity`,
+  `mailer`, `model-rbac`, `project-runs`, `rpc-adapter`, `session-usage`, `totp`, `usage-cost`,
+  `viewer-rbac`, `workflow-engine`, `real-ai`, `real-usage`.
 - `usage-cost.e2e.ts` dijalankan tanpa `MOCK_ENGINE=true`, memakai
   `PRIME_AGENT_BIN=apps/api/test/fixtures/fake-prime-agent.mjs` (tetap tanpa jaringan).
 - Tanpa server sama sekali: `npx tsx apps/api/test/rpc-adapter.e2e.ts` dan

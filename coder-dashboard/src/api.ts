@@ -29,6 +29,23 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   if (!response.ok) throw new Error((data as ApiError | null)?.error || `Request gagal (${response.status})`);
   return data as T;
 }
+export type Plan = { code: string; name: string; description: string; priceIdr: number; periodDays: number; tier: string; dailyTokenLimit: number; monthlyTokenLimit: number; bonusTokens: number; features: string[]; sortOrder?: number; active?: boolean };
+export type BillingOrder = { id: string; userId?: string; userEmail?: string; planCode: string; months: number; amountIdr: number; discountIdr: number; totalIdr: number; couponCode: string | null; method: string; status: 'pending' | 'paid' | 'rejected' | 'cancelled'; note: string; proofArtifactId: string | null; decidedAt: string | null; createdAt: string; updatedAt?: string };
+export type BankAccount = { id: string; bankName: string; accountNumber: string; accountHolder: string; note?: string; sortOrder?: number; active?: boolean };
+export type Coupon = { code: string; percent: number; amountIdr: number; maxUses: number; uses: number; expiresAt: string | null; active: boolean; createdAt?: string };
+export type QuotaState = { tier: string; dayKey?: string; monthKey?: string; usedToday: number; usedMonth: number; dailyLimit: number; monthlyLimit: number; creditTokens: number; remainingToday: number | null; remainingMonth: number | null; blocked: boolean; reason: string | null };
+export type BillingMe = {
+  tier: string; plan: Plan | null;
+  subscription: { id: string; planCode: string; status: string; startedAt: string; expiresAt: string } | null;
+  quota: QuotaState; orders: BillingOrder[]; banks: BankAccount[]; creditHistory: { id: string; tokens: number; reason: string; note: string; createdAt: string }[];
+  payment: { gateway: string; xenditEnabled: boolean; midtransEnabled: boolean; xenditConfigured: boolean; midtransConfigured: boolean; instructions: string };
+  currency: string;
+};
+export type PaymentConfig = { gateway: string; xenditEnabled: boolean; midtransEnabled: boolean; xenditConfigured: boolean; midtransConfigured: boolean; instructions: string; updatedAt?: string };
+export type RevenueSummary = { days: number; since: string; revenueIdr: number; costIdr: number; marginIdr: number; marginPercent: number | null; paidOrders: number; pendingOrders: number; tokens: number; costUsd: number; usdIdrRate: number; activeSubscriptions: number; newSubscriptions: number; creditGrantedTokens: number };
+export type AdminUserRow = { id: string; email: string; displayName: string; tier: string; isAdmin: boolean; emailVerified: boolean; createdAt: string; workspaces: number };
+export type Branding = { appName: string; tagline: string; primaryColor: string; logoUrl: string; faviconUrl: string; supportEmail: string };
+
 export const api = {
   me: () => request<{ user: User }>('/v1/auth/me'),
   login: (username: string, password: string, code?: string) => request<{ user: User; mfaEnabled?: boolean }>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: username, password, code }) }),
@@ -111,4 +128,37 @@ export const api = {
   updateProject: (projectId: string, patch: { name?: string; description?: string }) => request<{ project: Project }>(`/v1/projects/${encodeURIComponent(projectId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   runs: (projectId: string, conversationId?: string) => request<{ runs: RunSummary[] }>(`/v1/projects/${encodeURIComponent(projectId)}/runs${conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : ''}`),
   models: () => request<{ available: boolean; error?: string; default: { model: string | null; provider: string | null }; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[] }>('/v1/models'),
+
+  // --- Paket, pesanan, kredit token dan kuota ---------------------------------
+  plans: () => request<{ plans: Plan[]; currency: string }>('/v1/billing/plans'),
+  billingMe: () => request<BillingMe>('/v1/billing/me'),
+  createOrder: (planCode: string, months: number, couponCode?: string) => request<{ order: BillingOrder }>('/v1/billing/orders', { method: 'POST', body: JSON.stringify({ planCode, months, couponCode }) }),
+  validateCoupon: (code: string, amountIdr: number) => request<{ code: string; discountIdr: number; percent: number }>('/v1/billing/coupons/validate', { method: 'POST', body: JSON.stringify({ code, amountIdr }) }),
+  uploadOrderProof: (orderId: string, filename: string, contentBase64: string) => request<{ order: BillingOrder; artifactId: string }>(`/v1/billing/orders/${encodeURIComponent(orderId)}/proof`, { method: 'POST', body: JSON.stringify({ filename, contentBase64 }) }),
+  myOrders: () => request<{ orders: BillingOrder[] }>('/v1/billing/orders'),
+
+  // --- Admin: pesanan, pendapatan, kupon, rekening, pembayaran ---------------
+  adminOrders: (status?: string) => request<{ orders: BillingOrder[] }>(`/v1/admin/orders${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  decideOrder: (orderId: string, decision: 'paid' | 'rejected', note?: string) => request<{ order: BillingOrder }>(`/v1/admin/orders/${encodeURIComponent(orderId)}/decision`, { method: 'POST', body: JSON.stringify({ decision, note }) }),
+  adminRevenue: (days = 30) => request<RevenueSummary>(`/v1/admin/revenue?days=${days}`),
+  adminCoupons: () => request<{ coupons: Coupon[] }>('/v1/admin/coupons'),
+  createCoupon: (input: { code: string; percent?: number; amountIdr?: number; maxUses?: number; expiresAt?: string | null }) => request<{ coupon: Coupon }>('/v1/admin/coupons', { method: 'POST', body: JSON.stringify(input) }),
+  setCouponActive: (code: string, active: boolean) => request<{ coupon: Coupon }>(`/v1/admin/coupons/${encodeURIComponent(code)}`, { method: 'PATCH', body: JSON.stringify({ active }) }),
+  adminBanks: () => request<{ banks: BankAccount[] }>('/v1/admin/banks'),
+  createBank: (input: { bankName: string; accountNumber: string; accountHolder: string; note?: string; sortOrder?: number }) => request<{ bank: BankAccount }>('/v1/admin/banks', { method: 'POST', body: JSON.stringify(input) }),
+  deleteBank: (bankId: string) => request<{ ok: boolean }>(`/v1/admin/banks/${encodeURIComponent(bankId)}`, { method: 'DELETE' }),
+  adminPaymentConfig: () => request<PaymentConfig>('/v1/admin/payment-config'),
+  savePaymentConfig: (patch: { gateway?: string; xenditEnabled?: boolean; midtransEnabled?: boolean; instructions?: string }) => request<PaymentConfig>('/v1/admin/payment-config', { method: 'PUT', body: JSON.stringify(patch) }),
+  adminPlans: () => request<{ plans: Plan[] }>('/v1/admin/plans'),
+  updatePlan: (code: string, patch: Partial<Plan>) => request<{ plan: Plan }>(`/v1/admin/plans/${encodeURIComponent(code)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  adminUserList: () => request<{ users: AdminUserRow[] }>('/v1/admin/user-list'),
+  adminCreateUser: (input: { email: string; displayName: string; password: string; tier?: string }) => request<{ user: AdminUserRow }>('/v1/admin/users', { method: 'POST', body: JSON.stringify(input) }),
+  adminUpdateUser: (userId: string, patch: { displayName?: string; tier?: string; isAdmin?: boolean; emailVerified?: boolean }) => request<{ user: AdminUserRow }>(`/v1/admin/users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  adminResetQuota: (userId: string) => request<{ ok: boolean; quota: QuotaState }>(`/v1/admin/users/${encodeURIComponent(userId)}/reset-quota`, { method: 'POST' }),
+  adminGrantCredit: (userId: string, tokens: number, note?: string) => request<{ creditTokens: number }>(`/v1/admin/users/${encodeURIComponent(userId)}/credit`, { method: 'POST', body: JSON.stringify({ tokens, note }) }),
+  setUsdRate: (rate: number) => request<{ usdIdrRate: number }>('/v1/admin/currency', { method: 'PUT', body: JSON.stringify({ rate }) }),
+
+  // --- Branding --------------------------------------------------------------
+  branding: () => request<Branding>('/v1/branding'),
+  saveBranding: (patch: Partial<Branding>) => request<Branding>('/v1/admin/branding', { method: 'PUT', body: JSON.stringify(patch) }),
 };

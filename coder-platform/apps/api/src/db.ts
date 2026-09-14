@@ -223,9 +223,70 @@ try { db.exec("ALTER TABLE workspaces ADD COLUMN runs_per_hour_limit INTEGER"); 
 // Cron schedules live next to the interval schedules so one workflow can use either shape.
 try { db.exec("ALTER TABLE workflows ADD COLUMN schedule_cron TEXT"); } catch {}
 
+// Commerce: plans, orders, coupons, subscriptions, credit, quota, bank accounts and payment records.
+// Money is stored in whole rupiah (IDR) and tokens are whole numbers, so no floating point is involved.
+db.exec(`
+CREATE TABLE IF NOT EXISTS platform_settings (
+ key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plans (
+ code TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+ price_idr INTEGER NOT NULL DEFAULT 0, period_days INTEGER NOT NULL DEFAULT 30, tier TEXT NOT NULL,
+ daily_token_limit INTEGER NOT NULL DEFAULT 0, monthly_token_limit INTEGER NOT NULL DEFAULT 0,
+ bonus_tokens INTEGER NOT NULL DEFAULT 0, features_json TEXT NOT NULL DEFAULT '[]',
+ sort_order INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orders (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ plan_code TEXT NOT NULL, months INTEGER NOT NULL DEFAULT 1,
+ amount_idr INTEGER NOT NULL DEFAULT 0, discount_idr INTEGER NOT NULL DEFAULT 0, total_idr INTEGER NOT NULL DEFAULT 0,
+ coupon_code TEXT, method TEXT NOT NULL DEFAULT 'manual',
+ status TEXT NOT NULL CHECK(status IN ('pending','paid','rejected','cancelled')) DEFAULT 'pending',
+ note TEXT NOT NULL DEFAULT '', proof_artifact_id TEXT, decided_by TEXT, decided_at TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at DESC);
+CREATE TABLE IF NOT EXISTS coupons (
+ code TEXT PRIMARY KEY, percent INTEGER NOT NULL DEFAULT 0, amount_idr INTEGER NOT NULL DEFAULT 0,
+ max_uses INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0, expires_at TEXT,
+ active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS subscriptions (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ plan_code TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','expired','cancelled')) DEFAULT 'active',
+ started_at TEXT NOT NULL, expires_at TEXT NOT NULL, order_id TEXT REFERENCES orders(id) ON DELETE SET NULL,
+ created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id, status, expires_at DESC);
+CREATE TABLE IF NOT EXISTS credit_ledger (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ tokens INTEGER NOT NULL, reason TEXT NOT NULL, ref TEXT, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_credit_ledger_user ON credit_ledger(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS token_quotas (
+ user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ tier TEXT NOT NULL DEFAULT 'free', day_key TEXT NOT NULL DEFAULT '', day_tokens INTEGER NOT NULL DEFAULT 0,
+ month_key TEXT NOT NULL DEFAULT '', month_tokens INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bank_accounts (
+ id TEXT PRIMARY KEY, bank_name TEXT NOT NULL, account_number TEXT NOT NULL, account_holder TEXT NOT NULL,
+ note TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS payments (
+ id TEXT PRIMARY KEY, order_id TEXT REFERENCES orders(id) ON DELETE SET NULL, user_id TEXT,
+ provider TEXT NOT NULL, provider_ref TEXT, amount_idr INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+ raw_json TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id, created_at DESC);
+`);
+try { db.exec("ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'"); } catch {}
+// time stamp resets the quota counter without deleting usage history.
+try { db.exec("ALTER TABLE token_quotas ADD COLUMN reset_at TEXT"); } catch {}
+
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 7;
-export const SCHEMA_VERSION_NOTE = "cost guards, notifications, auth tokens, admin flags, cron schedules";
+const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION_NOTE = "commerce (plans, orders, coupons, credit, quota), user tier";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

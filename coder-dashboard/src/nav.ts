@@ -1,5 +1,5 @@
 /** Pages of the workspace shell. Shared by the sidebar, the dashboard cards and the tool panels. */
-export type PageKey = 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'settings';
+export type PageKey = 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'billing' | 'admin' | 'settings';
 
 export type NavItem = { key: PageKey; label: string; icon: string; blurb: string };
 
@@ -14,6 +14,8 @@ export const NAV_ITEMS: NavItem[] = [
   { key: 'usage', label: 'Pemakaian', icon: '◪', blurb: 'Token, biaya, dan efisiensi tiap model' },
   { key: 'runs', label: 'Riwayat run', icon: '≡', blurb: 'Semua run AI beserta status dan biayanya' },
   { key: 'audit', label: 'Audit', icon: '⚑', blurb: 'Jejak tindakan penting di workspace' },
+  { key: 'billing', label: 'Paket & langganan', icon: '⬡', blurb: 'Paket, kuota token, kredit, pesanan dan bukti transfer' },
+  { key: 'admin', label: 'Admin platform', icon: '⌘', blurb: 'Pesanan, kupon, rekening, paket, branding, pengguna' },
   { key: 'settings', label: 'Pengaturan & akun', icon: '⚒', blurb: 'Keamanan, MFA, batas biaya, admin platform' },
 ];
 
