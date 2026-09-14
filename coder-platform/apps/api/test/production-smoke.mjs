@@ -232,6 +232,24 @@ check("workspace delete asks for the exact name", badConfirm.status === 400 && b
 const badAccount = await call("DELETE", "/api/v1/auth/account", { password: PASSWORD, confirm: "salah" });
 check("account delete asks for the exact phrase", badAccount.status === 400 && badAccount.json.error === "CONFIRM_REQUIRED", JSON.stringify(badAccount.json));
 
+// Commerce surface added in v0.11.0.
+const branding = await call("GET", "/api/v1/branding");
+check("public branding answers", branding.status === 200 && typeof branding.json.appName === "string", JSON.stringify(branding.json).slice(0, 160));
+const plans = await call("GET", "/api/v1/billing/plans");
+check("plan list exposes the three seeded plans", plans.status === 200 && Array.isArray(plans.json.plans) && plans.json.plans.length >= 3, JSON.stringify(plans.json).slice(0, 200));
+const billingMe = await call("GET", "/api/v1/billing/me");
+check("billing detail answers with a quota", billingMe.status === 200 && typeof billingMe.json.quota?.usedToday === "number", JSON.stringify(billingMe.json).slice(0, 200));
+const myOrders = await call("GET", "/api/v1/billing/orders");
+check("own order list answers", myOrders.status === 200 && Array.isArray(myOrders.json.orders), JSON.stringify(myOrders.json).slice(0, 160));
+const badCoupon = await call("POST", "/api/v1/billing/coupons/validate", { code: "TIDAK-ADA-KODENYA" });
+check("unknown coupon is refused", badCoupon.status === 400 && ["COUPON_NOT_FOUND", "INVALID_COUPON"].includes(badCoupon.json.error), JSON.stringify(badCoupon.json));
+const missingPlan = await call("POST", "/api/v1/billing/orders", { planCode: "plan-tidak-ada", months: 1 });
+check("unknown plan is refused", missingPlan.status === 404 && missingPlan.json.error === "PLAN_NOT_FOUND", JSON.stringify(missingPlan.json));
+const userListBlocked = await call("GET", "/api/v1/admin/user-list");
+check("user list refuses a normal user", userListBlocked.status === 403 && userListBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(userListBlocked.json));
+const revenueBlocked = await call("GET", "/api/v1/admin/revenue?days=30");
+check("revenue refuses a normal user", revenueBlocked.status === 403 && revenueBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(revenueBlocked.json));
+
 const adminBlocked = await call("GET", "/api/v1/admin/overview");
 check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));
 const metricsBlocked = await call("GET", "/metrics");
