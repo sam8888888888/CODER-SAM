@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 15 Sep 2026 (versi 0.15.0)
+Terakhir diperbarui: 15 Sep 2026 (versi 0.16.0)
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel
@@ -8,12 +8,70 @@ di `apps/api/src/db.ts`, halaman di `coder-dashboard/src/nav.ts`, dan suite di `
 Bila ragu, tulis "belum diverifikasi".
 
 Catatan snapshot: berkas ini diperiksa saat repo sedang diedit, jadi beberapa perubahan belum di-commit
-(Wave 5: `server.ts`, `config.ts`, `jobs.ts` baru, `db.ts`, `api.ts`, `nav.ts`, `App.tsx`, `AdminJobs.tsx` baru).
-Jumlah rute `server.ts` saat diperiksa: 171 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2
+(Wave 6: `server.ts`, `db.ts`, `config.ts`, `jobs.ts`, `apikeys.ts`, `webhooks.ts` baru, `api.ts`, `nav.ts`,
+`App.tsx`, `ApiKeys.tsx`, `ApiWebhooks.tsx` baru).
+Jumlah rute `server.ts` saat diperiksa: 179 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2
 untuk lampiran, cabang dan hapus massal; 25 rute Wave 3 untuk ruang kerja agen; 28 rute Wave 4 untuk kunci API,
 API publik, antrean email, ekspor data, retensi, dan harga publik; 3 rute Wave 5 untuk melihat antrean pekerjaan,
-mengulang pekerjaan, dan memaksa satu putaran).
+mengulang pekerjaan, dan memaksa satu putaran; 8 rute Wave 6 untuk dua rute tulis publik dan enam rute webhook).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
+
+## Wave 6 (v0.16.0) — API publik fase 2: tulis, webhook, kuota per kunci
+
+Tema: API publik tidak lagi hanya membaca, dan pekerjaan kunci API bisa dibatasi serta dilaporkan ke sistem lain.
+Schema basis data naik 13 -> 14.
+
+- Dua rute tulis publik sudah benar-benar dilayani (sebelumnya hanya rencana di `plannedEndpoints`):
+  - `POST /api/v1/public/v1/projects/:projectId/conversations` -> 201, kunci butuh izin `write`.
+    Peran `viewer` ditolak `403 VIEWER_READ_ONLY`.
+  - `POST /api/v1/public/v1/conversations/:conversationId/messages` -> 202 berisi `run` dan
+    `read.messages`. Isi pesan divalidasi (model dikenal, tingkat penalaran sah, maksimal 100.000 karakter),
+    kuota workspace dijaga `quotaGuard`, lalu run dijalankan seperti lewat antarmuka web.
+  - `GET /api/v1/api-keys/docs` kini melaporkan `scopes: ["read","write"]`, `endpoints` berisi 9 rute aktif,
+    dan `plannedEndpoints` KOSONG. Izin `write` tidak lagi ditolak `SCOPE_NOT_AVAILABLE`
+    (`parseScopes` otomatis menambahkan `read` bila `write` diminta).
+- Webhook keluar (`apps/api/src/webhooks.ts`, tabel `webhooks` + `webhook_deliveries`):
+  - Peristiwa `run.completed` dan `run.failed` dikirim dari `executeRun` (`emitProjectEvent`), bukan dari
+    penjadwal terpisah, jadi peristiwa selalu mencerminkan hasil run yang sebenarnya.
+  - Tanda tangan HMAC-SHA256 atas `timestamp.body` di header `X-Coblai-Signature: sha256=...`, bersama
+    `X-Coblai-Event`, `X-Coblai-Delivery`, dan `X-Coblai-Timestamp`.
+  - Pengiriman lewat antrean pekerjaan `webhook.deliver` (schema 13), jadi percobaan ulang, jeda, dan sewa
+    memakai mekanisme yang sama dengan pekerjaan lain. Kegagalan jaringan menaikkan `attempts` sampai
+    `WEBHOOK_MAX_ATTEMPTS`, lalu baris berakhir `failed`.
+  - Rute sesi: `GET/POST /api/v1/webhooks`, `PATCH/DELETE /api/v1/webhooks/:id`,
+    `GET /api/v1/webhooks/:id/deliveries`, `POST /api/v1/webhooks/:id/test` (pengiriman sinkron untuk mencoba
+    sekarang). Membuat dan menghapus webhook hanya untuk owner/admin ruang kerja (`403 OWNER_REQUIRED`).
+  - Rahasia penanda tangan hanya ditampilkan sekali saat webhook dibuat (awalan `whsec_`); daftar webhook tidak
+    pernah memuatnya lagi.
+  - Validasi alamat: hanya `http`/`https`. Alamat metadata cloud `169.254.169.254` SELALU ditolak, dan
+    alamat lokal (`127.0.0.1`, `localhost`) ditolak kecuali `WEBHOOK_ALLOW_LOCAL=true`.
+    BATAS YANG DIAKUI: tidak ada resolusi DNS, jadi domain yang menunjuk ke alamat privat belum diblokir.
+- Kuota harian per kunci API: kolom `daily_request_limit`, `daily_token_limit`, `requests_today`, `usage_day`
+  pada `api_keys`, dan `runs.api_key_id` pada tabel `runs`.
+  - `requireApiKey` memeriksa kuota sebelum batas laju; kelebihan menjawab `429 API_KEY_DAILY_REQUEST_LIMIT`
+    atau `429 API_KEY_DAILY_TOKEN_LIMIT` beserta jumlah yang sudah dipakai hari itu.
+  - Token dihitung dari `SUM(run_usage.total_tokens)` untuk run yang memakai kunci itu pada hari berjalan;
+    hitungan direset saat `usage_day` berbeda dari tanggal hari ini.
+  - Angka `0` berarti tanpa batas khusus untuk kunci tersebut. `GET /api/v1/public/v1/me` melaporkan
+    `requestsToday` dan `tokensToday` supaya pemilik kunci bisa mengawasi sendiri.
+- Halaman `Kunci API` ikut berubah: kotak centang izin tulis aktif, dua isian batas harian saat membuat kunci,
+  kolom "Batas harian" dengan tombol "Ubah batas", dan panel "Direncanakan" hilang sendiri karena kosong.
+- Halaman baru `Webhook` (`coder-dashboard/src/ApiWebhooks.tsx`): ringkasan pengiriman, formulir pendaftaran,
+  kotak rahasia sekali tampil, uji kirim, riwayat pengiriman per webhook, dan pesan galat Bahasa Indonesia.
+
+### Bukti uji Wave 6
+
+- `apps/api/test/wave6.e2e.ts` — 91 pemeriksaan, semua lulus (`ALL_WAVE6_TESTS_PASSED`): bentuk schema 14,
+  izin tulis benar-benar dilayani, rute tulis publik (201/202/400/403/404), kuota harian per kunci
+  (permintaan dan token, termasuk pergantian hari), CRUD webhook, verifikasi tanda tangan HMAC di penerima
+  uji, pengiriman otomatis `run.completed`, percobaan ulang sampai gagal, dan penerimaan status hub.
+- `coder-dashboard/render-check-wave6.tsx` — merender halaman Webhook dan halaman Kunci API
+  (`ALL_WAVE6_PAGES_RENDERED`).
+- `apps/api/test/run-all.cjs` — 26/26 suite mock hijau (lihat daftar di bawah).
+- `apps/api/test/production-smoke.mjs` — 144 pemeriksaan terhadap produksi (termasuk blok Wave 6: daftar
+  webhook dibaca saja, penolakan alamat metadata, hitungan rute publik 9/0, dan satu rute tulis publik yang
+  sungguh membuat percakapan di proyek smoke bot memakai kunci tulis sementara yang langsung dicabut).
+  Produksi SENGAJA tidak membuat webhook saat smoke, supaya tidak ada panggilan jaringan keluar yang tak diminta.
 
 ## Wave 5 (v0.15.0) — ketahanan & operasi
 
@@ -126,8 +184,8 @@ Keterbatasan jujur Wave 5 (belum ada, jangan diklaim ada):
   Mencakup: kunci API (termasuk batas 20 dan batas laju 429), API publik dan isolasi lintas workspace,
   antrean email, preferensi email (termasuk penggabungan email harian), ekspor data (termasuk pemeriksaan
   bahwa berkas tidak memuat bahan rahasia), laporan retensi, peran viewer, dan harga publik.
-- `apps/api/test/run-all.cjs` — 24/24 suite mock hijau (termasuk Wave 2, Wave 3, Wave 4, outbox-mail,
-  csrf-strict, backup-restore). Bisa juga lewat `npm run verify`.
+- `apps/api/test/run-all.cjs` — 24/24 suite mock hijau saat Wave 4 diperiksa (26/26 pada Wave 6).
+  Bisa juga lewat `npm run verify`.
 - `apps/api/test/outbox-mail.e2e.ts` — 14 pemeriksaan, semua lulus: dengan `NOTIFY_EMAIL_ENABLED=true`
   tetapi SMTP kosong, antrean TIDAK pernah mencoba menghubungi SMTP (`sent=0`, baris menjadi `skipped`
   dengan alasan `MAILER_NOT_CONFIGURED`), dan pesan menunggu ditolak saat dihapus (`409 EMAIL_IN_FLIGHT`).
@@ -419,13 +477,19 @@ Bukan wave baru, hanya penutupan celah yang ditemukan saat Wave 4 diuji.
   **Temuan jujur**: `restore.ts` menyalin berkas apa pun tanpa memeriksa isinya. Berkas yang bukan
   database diterima saat restore dan baru gagal ketika aplikasi membukanya. Restore juga menimpa
   database tujuan tanpa bertanya, jadi jalur pemulihan harus tetap manual dan disengaja.
-- `npm run verify` menjalankan seluruh suite sekaligus (24/24 hijau per 15 Sep 2026).
+- `npm run verify` menjalankan seluruh suite sekaligus (26/26 hijau per 15 Sep 2026, termasuk
+  `wave6.e2e.ts` 91 pemeriksaan dan `jobs.e2e.ts` 51 pemeriksaan).
 - Suite baru `apps/api/test/jobs.e2e.ts` (Wave 5) — 51 pemeriksaan, semua lulus: sewa dan pengambilalihan
   setelah proses mati, jeda percobaan ulang dan batas percobaan, kunci dedupe, larangan pengambilan ganda,
   run yang tersimpan tetapi belum dikirim akhirnya dijalankan, run yang sudah selesai TIDAK dijalankan ulang,
   pemeriksa `WORKER_LOST` untuk run dan eksekusi workflow, serta rute admin (403 untuk non-admin).
   **Catatan jujur**: berkas uji tidak diperiksa tipe oleh `tsc`, karena `apps/api/tsconfig.json` hanya
   memuat `src/**/*.ts`; berkas uji dijalankan dengan `tsx` yang membuang tipe.
+- Suite baru `apps/api/test/wave6.e2e.ts` (Wave 6) — 91 pemeriksaan, semua lulus: schema 14 dan tabel webhook,
+  izin tulis pada kunci, rute tulis publik beserta penolakan viewer dan kunci baca, kuota harian per kunci
+  (permintaan, token, dan pergantian hari), CRUD webhook beserta validasi alamat, tanda tangan HMAC yang
+  diverifikasi oleh penerima uji sungguhan, pengiriman otomatis `run.completed`, percobaan ulang sampai
+  `failed`, dan angka status hub. Catatan jujur yang sama berlaku: berkas uji tidak diperiksa `tsc`.
 
 ## Penghambat eksternal
 
@@ -453,7 +517,7 @@ Cek tipe (tanpa keluaran berarti lulus; saya jalankan 13 Sep 2026):
 Suite end-to-end lokal tanpa jaringan:
 
 - `cd coder-platform && MOCK_ENGINE=true npx tsx apps/api/test/<suite>.e2e.ts`
-- Cara tercepat sekarang: `cd coder-platform && npm run verify` (25 suite, mencetak `ALL_SUITES_PASSED`).
+- Cara tercepat sekarang: `cd coder-platform && npm run verify` (26 suite, mencetak `ALL_SUITES_PASSED`).
 - 21 suite (20 suite lama lulus 14 Sep 2026 sebelum Wave 2 dengan `RUNNER_EXIT=0`; `wave2` lulus
   104/104 pemeriksaan): `account-recovery`, `account-security`, `admin-metrics`, `billing`, `csrf-limits`,
   `delete-flow`, `guards`, `knowledge-team`, `login-identity`, `mailer`, `model-rbac`, `project-runs`,

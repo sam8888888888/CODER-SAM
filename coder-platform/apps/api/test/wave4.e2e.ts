@@ -12,8 +12,9 @@
  * false sehingga pesan hanya masuk antrean, dan tidak ada panggilan jaringan keluar.
  *
  * BATAS YANG DIAKUI APA ADANYA:
- *  1) API publik baru melayani READ. Dua rute POST (kirim pesan, buat percakapan) belum dilayani dan
- *     hanya muncul di `plannedEndpoints`; suite memeriksa status 404-nya, bukan menganggapnya ada.
+ *  1) Sejak Wave 6 API publik juga melayani WRITE (buat percakapan, kirim pesan). Suite ini memakai kunci
+ *     berizin "read", jadi yang diperiksa di sini adalah penolakan 403. Uji tulis penuh ada di
+ *     `wave6.e2e.ts`, termasuk batas harian per kunci dan webhook keluar.
  *  2) RETENTION_ENABLED=false, jadi pembersihan tidak menghapus apa pun. Yang diuji adalah laporan
  *     hitungan dan penolakan menjalankan penghapusan saat flag mati.
  *  3) Preferensi email hanya memengaruhi salinan email; notifikasi dalam aplikasi selalu ditulis.
@@ -189,10 +190,10 @@ check("[Kunci] nilai kunci MENTAH tidak pernah muncul lagi di respons daftar",
 check("[Kunci] kunci baru belum pernah dipakai", listAfterCreate.json?.keys?.[0]?.lastUsedAt === null && listAfterCreate.json?.keys?.[0]?.requestCount === 0, short(listAfterCreate.json?.keys?.[0]));
 
 const docsReply = await admin.call("GET", "/api/v1/api-keys/docs");
-check("[Kunci] dokumentasi menyebut fase 'baca saja'", docsReply.status === 200 && docsReply.json?.phase === "baca saja", short(docsReply.json?.phase));
-check("[Kunci] dokumentasi memuat 7 endpoint yang benar-benar dilayani", Array.isArray(docsReply.json?.endpoints) && docsReply.json.endpoints.length === 7 && docsReply.json.endpoints.every((row: any) => row.available === true), short(docsReply.json?.endpoints?.length));
-check("[Kunci] endpoint tulis dipisah sebagai rencana, bukan sebagai fitur aktif",
-  Array.isArray(docsReply.json?.plannedEndpoints) && docsReply.json.plannedEndpoints.length === 2 && docsReply.json.plannedEndpoints.every((row: any) => row.available === false && row.scope === "write"),
+check("[Kunci] dokumentasi menyebut fase baca dan tulis", docsReply.status === 200 && String(docsReply.json?.phase ?? "").includes("tulis"), short(docsReply.json?.phase));
+check("[Kunci] dokumentasi memuat 9 endpoint yang benar-benar dilayani", Array.isArray(docsReply.json?.endpoints) && docsReply.json.endpoints.length === 9 && docsReply.json.endpoints.every((row: any) => row.available === true), short(docsReply.json?.endpoints?.length));
+check("[Kunci] tidak ada lagi endpoint yang hanya berupa rencana",
+  Array.isArray(docsReply.json?.plannedEndpoints) && docsReply.json.plannedEndpoints.length === 0,
   short(docsReply.json?.plannedEndpoints));
 check("[Kunci] contoh curl memakai header Authorization Bearer",
   typeof docsReply.json?.example?.curl === "string" && docsReply.json.example.curl.includes("Authorization: Bearer ck_"), short(docsReply.json?.example?.curl));
@@ -202,7 +203,8 @@ check("[Kunci] nama kunci terlalu pendek -> 400 INVALID_KEY_NAME", badName.statu
 const noScopes = await admin.call("POST", "/api/v1/api-keys", { name: "Tanpa izin", scopes: [] });
 check("[Kunci] izin kosong -> 400 INVALID_KEY_SCOPES", noScopes.status === 400 && noScopes.json?.error === "INVALID_KEY_SCOPES", `${noScopes.status} ${short(noScopes.json)}`);
 const writeScope = await admin.call("POST", "/api/v1/api-keys", { name: "Izin tulis", scopes: ["write"] });
-check("[Kunci] izin write ditolak jujur -> 400 SCOPE_NOT_AVAILABLE", writeScope.status === 400 && writeScope.json?.error === "SCOPE_NOT_AVAILABLE", `${writeScope.status} ${short(writeScope.json)}`);
+check("[Kunci] izin write diterima karena rute tulis sudah dilayani (Wave 6)",
+  writeScope.status === 201 && String(writeScope.json?.key?.scopes).includes("write"), `${writeScope.status} ${short(writeScope.json)}`);
 const foreignWorkspace = await admin.call("POST", "/api/v1/api-keys", { name: "Workspace orang", workspaceId: outsiderWorkspaceId });
 check("[Kunci] workspace yang bukan milik kita -> 404 WORKSPACE_NOT_FOUND", foreignWorkspace.status === 404 && foreignWorkspace.json?.error === "WORKSPACE_NOT_FOUND", `${foreignWorkspace.status} ${short(foreignWorkspace.json)}`);
 
@@ -292,10 +294,12 @@ check("[Publik] usage lintas workspace juga 404", crossUsage.status === 404 && c
 const crossMessages = await anon.call("GET", `/api/v1/public/v1/conversations/${outsiderConversationId}/messages`, undefined, bearer(mainRaw));
 check("[Publik] pesan lintas workspace 404", crossMessages.status === 404 && crossMessages.json?.error === "CONVERSATION_NOT_FOUND", `${crossMessages.status} ${short(crossMessages.json)}`);
 
-// Rute tulis memang belum dilayani; suite mencatatnya sebagai 404, bukan sebagai fitur.
+// Sejak Wave 6 rute tulis SUDAH dilayani, tetapi kunci uji di sini hanya berizin "read",
+// jadi jawabannya harus 403 dan bukan 201. Rute tulis diuji penuh di wave6.e2e.ts.
 const writeAttempt = await anon.call("POST", `/api/v1/public/v1/projects/${projectAId}/conversations`, { title: "Coba tulis" }, bearer(mainRaw));
-check("[Publik] rute tulis publik belum dilayani -> 404", writeAttempt.status === 404, `${writeAttempt.status} ${short(writeAttempt.json)}`);
-note("API publik Wave 4 masih baca-saja: POST /api/v1/public/v1/... menjawab 404 dan hanya terdaftar sebagai plannedEndpoints.");
+check("[Publik] kunci baca tidak boleh menulis -> 403 API_KEY_SCOPE_REQUIRED",
+  writeAttempt.status === 403 && writeAttempt.json?.error === "API_KEY_SCOPE_REQUIRED", `${writeAttempt.status} ${short(writeAttempt.json)}`);
+note("Sejak Wave 6 rute tulis publik dilayani, jadi kunci berizin read ditolak 403, bukan 404. Uji tulis penuh ada di wave6.e2e.ts.");
 
 // Pemakaian kunci tercatat.
 const afterUse = await admin.call("GET", "/api/v1/api-keys");

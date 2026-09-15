@@ -339,8 +339,9 @@ console.log(`INFO playground model=${playground.json?.model} thinking=${playgrou
 // Wave 4 smoke runs against the live platform. It creates ONE temporary API key, uses it, then revokes
 // it, and creates ONE temporary data export, then deletes it, so production stays clean.
 const keyDocs = await call("GET", "/api/v1/api-keys/docs");
-check("wave4 api key docs describe the read-only phase", keyDocs.status === 200 && keyDocs.json?.phase === "baca saja", JSON.stringify(keyDocs.json)?.slice(0, 200));
-check("wave4 docs list the live public endpoints and split the planned ones", Array.isArray(keyDocs.json?.endpoints) && keyDocs.json.endpoints.length === 7 && keyDocs.json.endpoints.every((row) => row.available === true) && Array.isArray(keyDocs.json?.plannedEndpoints) && keyDocs.json.plannedEndpoints.length === 2, JSON.stringify(keyDocs.json)?.slice(0, 260));
+check("wave6 api key docs describe the read and write phase", keyDocs.status === 200 && keyDocs.json?.phase === "baca dan tulis" && Array.isArray(keyDocs.json?.scopes) && keyDocs.json.scopes.includes("write"), JSON.stringify(keyDocs.json)?.slice(0, 200));
+check("wave6 docs list nine served public endpoints and no planned ones", Array.isArray(keyDocs.json?.endpoints) && keyDocs.json.endpoints.length === 9 && keyDocs.json.endpoints.every((row) => row.available === true) && Array.isArray(keyDocs.json?.plannedEndpoints) && keyDocs.json.plannedEndpoints.length === 0, JSON.stringify(keyDocs.json)?.slice(0, 260));
+check("wave6 docs explain the webhook signature and retry policy", keyDocs.json?.webhooks?.signature?.includes("sha256=") && Array.isArray(keyDocs.json?.webhooks?.events) && keyDocs.json.webhooks.events.length === 2, JSON.stringify(keyDocs.json?.webhooks)?.slice(0, 220));
 
 const smokeKey = await call("POST", "/api/v1/api-keys", { name: `Smoke Wave 4 ${new Date().toISOString().slice(0, 16)}`, scopes: ["read"] });
 const smokeKeyId = smokeKey.json?.key?.id;
@@ -349,8 +350,11 @@ check("wave4 api key is created and the raw value is shown once", smokeKey.statu
 
 const keysAfterCreate = await call("GET", "/api/v1/api-keys");
 check("wave4 key list never repeats the raw secret", keysAfterCreate.status === 200 && !JSON.stringify(keysAfterCreate.json).includes(smokeSecret), `panjang=${JSON.stringify(keysAfterCreate.json)?.length}`);
-const writeScopeRefused = await call("POST", "/api/v1/api-keys", { name: "Smoke izin tulis", scopes: ["write"] });
-check("wave4 write scope is refused honestly instead of promised", writeScopeRefused.status === 400 && writeScopeRefused.json.error === "SCOPE_NOT_AVAILABLE", JSON.stringify(writeScopeRefused.json));
+const smokeWriteKey = await call("POST", "/api/v1/api-keys", { name: `Smoke tulis ${new Date().toISOString().slice(0, 16)}`, scopes: ["write"] });
+const writeScopeRefused = smokeWriteKey;
+const smokeWriteSecret = String(smokeWriteKey.json?.secret ?? "");
+// Wave 6: izin tulis SUDAH dilayani, jadi kunci tulis sekarang diterima.
+check("wave6 write scope is granted because the write routes exist now", writeScopeRefused.status === 201 && String(writeScopeRefused.json?.key?.scopes).includes("write"), JSON.stringify(writeScopeRefused.json)?.slice(0, 260));
 
 async function publicCall(path, key) {
   const response = await fetch(`${BASE}${path}`, { headers: key === undefined ? {} : { authorization: `Bearer ${key}` } });
@@ -369,10 +373,18 @@ const publicUsage = await publicCall(`/api/v1/public/v1/projects/${projectId}/us
 check("wave4 public API reports project usage from real runs", publicUsage.status === 200 && typeof publicUsage.json?.totals?.tokens === "number" && Array.isArray(publicUsage.json?.byModel), JSON.stringify(publicUsage.json)?.slice(0, 220));
 const publicCross = await publicCall("/api/v1/public/v1/projects/00000000-0000-4000-8000-000000000000/usage", smokeSecret);
 check("wave4 public API answers 404 for unknown resources", publicCross.status === 404 && publicCross.json.error === "PROJECT_NOT_FOUND", JSON.stringify(publicCross.json));
-const publicWriteResponse = await fetch(`${BASE}/api/v1/public/v1/projects/${projectId}/conversations`, { method: "POST", headers: { authorization: `Bearer ${smokeSecret}`, "content-type": "application/json" }, body: JSON.stringify({ title: "harus ditolak" }) });
+const readKeyWrite = await fetch(`${BASE}/api/v1/public/v1/projects/${projectId}/conversations`, { method: "POST", headers: { authorization: `Bearer ${smokeSecret}`, "content-type": "application/json" }, body: JSON.stringify({ title: "kunci baca" }) });
+check("wave6 a read key is refused on the write route (403 API_KEY_SCOPE_REQUIRED)", readKeyWrite.status === 403, `${readKeyWrite.status}`);
+const publicWriteResponse = await fetch(`${BASE}/api/v1/public/v1/projects/${projectId}/conversations`, { method: "POST", headers: { authorization: `Bearer ${smokeWriteSecret}`, "content-type": "application/json" }, body: JSON.stringify({ title: "Smoke tulis dari produksi" }) });
 const publicWriteText = await publicWriteResponse.text();
-check("wave4 public API does not pretend to serve the planned write routes", publicWriteResponse.status === 404 && !publicWriteText.includes("harus ditolak"), `${publicWriteResponse.status} ${publicWriteText.slice(0, 120)}`);
+check("wave6 public write route really creates a conversation (201)", publicWriteResponse.status === 201 && publicWriteText.includes("Smoke tulis dari produksi"), `${publicWriteResponse.status} ${publicWriteText.slice(0, 160)}`);
+console.log(`INFO wave6 smoke write key: ${smokeWriteSecret ? "dibuat" : "kosong"}`);
 
+const smokeWriteKeyId = smokeWriteKey.json?.key?.id;
+const smokeWriteRevoke = await call("DELETE", `/api/v1/api-keys/${smokeWriteKeyId}`);
+check("wave6 the temporary write key is revoked so production stays clean", smokeWriteRevoke.status === 200 && smokeWriteRevoke.json.revoked === true, JSON.stringify(smokeWriteRevoke.json));
+const writeAfterRevoke = await fetch(`${BASE}/api/v1/public/v1/projects/${projectId}/conversations`, { method: "POST", headers: { authorization: `Bearer ${smokeWriteSecret}`, "content-type": "application/json" }, body: JSON.stringify({ title: "sesudah dicabut" }) });
+check("wave6 a revoked write key cannot write any more", writeAfterRevoke.status === 401, `${writeAfterRevoke.status}`);
 const smokeRevoke = await call("DELETE", `/api/v1/api-keys/${smokeKeyId}`);
 check("wave4 api key can be revoked", smokeRevoke.status === 200 && smokeRevoke.json.revoked === true, JSON.stringify(smokeRevoke.json));
 const publicAfterRevoke = await publicCall("/api/v1/public/v1/me", smokeSecret);
@@ -412,7 +424,7 @@ const pricingPage = await (await fetch(`${BASE}/harga`)).text();
 check("wave4 public pricing page route serves the app shell", pricingPage.includes("<div id=\"root\">") || pricingPage.includes("<!doctype html"), `${pricingPage.length} byte`);
 
 const statusHubW4 = await call("GET", "/api/v1/status-hub");
-check("wave4 status hub reports the open platform block", statusHubW4.status === 200 && Number(statusHubW4.json?.openPlatform?.publicEndpoints) >= 7 && Number(statusHubW4.json?.openPlatform?.publicEndpointsPlanned) >= 2 && typeof statusHubW4.json?.openPlatform?.emailWorker?.enabled === "boolean" && typeof statusHubW4.json?.openPlatform?.retention?.enabled === "boolean", JSON.stringify(statusHubW4.json?.openPlatform)?.slice(0, 260));
+check("wave4 status hub reports the open platform block", statusHubW4.status === 200 && Number(statusHubW4.json?.openPlatform?.publicEndpoints) >= 9 && Number(statusHubW4.json?.openPlatform?.publicEndpointsPlanned) === 0 && typeof statusHubW4.json?.openPlatform?.emailWorker?.enabled === "boolean" && typeof statusHubW4.json?.openPlatform?.retention?.enabled === "boolean", JSON.stringify(statusHubW4.json?.openPlatform)?.slice(0, 260));
 check("wave4 status hub counts api keys, queued emails, and ready exports from the database",
   typeof statusHubW4.json?.openPlatform?.activeKeys === "number" && typeof statusHubW4.json?.openPlatform?.emailOutbox?.pending === "number" && typeof statusHubW4.json?.openPlatform?.emailOutbox?.total === "number" && typeof statusHubW4.json?.openPlatform?.readyExports === "number",
   JSON.stringify(statusHubW4.json?.openPlatform?.emailOutbox));
@@ -425,6 +437,30 @@ const adminBlocked = await call("GET", "/api/v1/admin/overview");
 check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));
 const metricsBlocked = await call("GET", "/metrics");
 check("metrics stay hidden without a token", metricsBlocked.status === 404, JSON.stringify(metricsBlocked.json));
+
+/* ---------------------------------------- Wave 6: webhook keluar ---------------------------------------- */
+// Uji produksi SENGAJA tidak membuat webhook: setiap pengiriman akan menembak alamat luar. Yang diperiksa
+// hanya bentuk permukaan yang sudah ada, dan itu pun dibaca saja.
+const hookList = await call("GET", "/api/v1/webhooks");
+check("wave6 webhook list answers with stats, events, and limits",
+  hookList.status === 200 && Array.isArray(hookList.json?.webhooks) && typeof hookList.json?.stats?.hooks === "number" && Array.isArray(hookList.json?.events) && hookList.json.events.length === 2 && typeof hookList.json?.limits?.maxAttempts === "number",
+  JSON.stringify(hookList.json)?.slice(0, 240));
+check("wave6 webhook list never carries a signing secret",
+  !JSON.stringify(hookList.json).includes("whsec_"), `panjang=${JSON.stringify(hookList.json)?.length}`);
+const hookBadUrl = await call("POST", "/api/v1/webhooks", { url: "bukan-url" });
+check("wave6 a bad webhook address is refused with a readable code", hookBadUrl.status === 400 && hookBadUrl.json?.error === "WEBHOOK_URL_INVALID", JSON.stringify(hookBadUrl.json));
+const hookMetaUrl = await call("POST", "/api/v1/webhooks", { url: "http://169.254.169.254/latest/meta-data" });
+check("wave6 the cloud metadata address is always refused", hookMetaUrl.status === 400 && hookMetaUrl.json?.error === "WEBHOOK_URL_BLOCKED", JSON.stringify(hookMetaUrl.json));
+const hookMissing = await call("POST", "/api/v1/webhooks/tidak-ada/test");
+check("wave6 testing an unknown webhook answers 404", hookMissing.status === 404, `${hookMissing.status}`);
+check("wave6 status hub reports webhooks and per key ceilings",
+  typeof statusHubW4.json?.openPlatform?.webhooks?.hooks === "number" && typeof statusHubW4.json?.openPlatform?.keyLimits?.dailyRequestsDefault === "number",
+  JSON.stringify(statusHubW4.json?.openPlatform?.webhooks));
+const hubAfterKeys = await call("GET", "/api/v1/status-hub");
+check("wave6 status hub counts 9 served public routes and no planned ones",
+  Number(hubAfterKeys.json?.openPlatform?.publicEndpoints) >= 9 && Number(hubAfterKeys.json?.openPlatform?.publicEndpointsPlanned) === 0,
+  JSON.stringify(hubAfterKeys.json?.openPlatform)?.slice(0, 200));
+console.log(`INFO wave6 webhooks: hooks=${hubAfterKeys.json?.openPlatform?.webhooks?.hooks} active=${hubAfterKeys.json?.openPlatform?.webhooks?.active} delivered=${hubAfterKeys.json?.openPlatform?.webhooks?.delivered} failed=${hubAfterKeys.json?.openPlatform?.webhooks?.failed} allowLocal=${hubAfterKeys.json?.openPlatform?.webhookAllowLocal}`);
 
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

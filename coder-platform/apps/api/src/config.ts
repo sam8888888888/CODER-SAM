@@ -64,6 +64,16 @@ const Env = z.object({
   // if the API is ever started in more than one process at a time.
   JOB_REAP_ON_BOOT: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
   JOB_REAP_BOOT_MIN_AGE_MS: z.coerce.number().int().min(1000).default(60000),
+  // Wave 6: outgoing webhooks. Delivery goes through the durable queue, so a dead process does not lose
+  // an event. The local flag exists for tests and local installs: without it localhost targets are refused.
+  WEBHOOK_DELIVERY_TIMEOUT_MS: z.coerce.number().int().min(500).default(10000),
+  WEBHOOK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(5),
+  WEBHOOK_MAX_PER_WORKSPACE: z.coerce.number().int().min(1).max(50).default(10),
+  WEBHOOK_ALLOW_LOCAL: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
+  // Wave 6: per-key daily ceilings for the public API. Zero means "no key specific ceiling": the account
+  // tier limit still applies, so an owner can hand out a key without thinking about numbers.
+  API_KEY_DAILY_REQUESTS_DEFAULT: z.coerce.number().int().min(0).default(0),
+  API_KEY_DAILY_TOKENS_DEFAULT: z.coerce.number().int().min(0).default(0),
 });
 
 export const config = Env.parse(process.env);

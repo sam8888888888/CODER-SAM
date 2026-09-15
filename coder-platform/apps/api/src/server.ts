@@ -19,9 +19,15 @@ import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, ge
 import { checkRequestOrigin, constantTimeEquals, csrfCookieOptions, generateCsrfToken } from "./csrf.js";
 import { limiterFor } from "./ratelimit.js";
 import {
-  API_KEY_PREFIX, MAX_API_KEYS_PER_USER, PUBLIC_API_ENDPOINTS, authenticateApiKey, checkApiKeyRate, countActiveApiKeys,
-  createApiKey, getApiKey, hasScope, listApiKeys, parseScopes, revokeApiKey, touchApiKey, updateApiKey, type ApiScope,
+  API_KEY_PREFIX, MAX_API_KEYS_PER_USER, PUBLIC_API_ENDPOINTS, PUBLIC_API_LIMITS, apiKeyTokensToday, authenticateApiKey,
+  checkApiKeyDailyQuota, checkApiKeyRate, countActiveApiKeys, countApiKeyRequest,
+  createApiKey, getApiKey, hasScope, listApiKeys, parseScopes, revokeApiKey, touchApiKey, updateApiKey, type ApiKeyRow, type ApiScope,
 } from "./apikeys.js";
+/** Wave 6: outgoing webhooks. Events are queued through the Wave 5 job queue so a restart keeps them. */
+import {
+  createDeliveryRow, deleteWebhook, deliverWebhook, emitProjectEvent, getDelivery, getWebhook, listDeliveries, listWebhooks,
+  updateWebhook, validateWebhookUrl, webhookCatalogue, webhookStats, createWebhook, countWebhooks, parseEvents, type WebhookEvent,
+} from "./webhooks.js";
 import {
   deleteOutboxRow, deliverPending, emailEnabled, emailWorkerState, getOutboxRow,
   listOutbox, notificationPrefs, outboxStats, queueEmail, renderEmail, retryEmail, saveNotificationPrefs, type EmailKind,
@@ -896,11 +902,14 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
     recordRunUsage(runId, projectId, prompt, text, usage);
     db.prepare("UPDATE runs SET status='completed', result=?, finished_at=? WHERE id=?").run(text || null, new Date().toISOString(), runId);
     publishRunEvent(runId, "completed", { result: text });
+    // Wave 6: tell registered webhooks. The delivery is queued, so a slow receiver never delays the run.
+    emitProjectEvent(projectId, "run.completed", { runId, conversationId: conversationId ?? null, model: model ?? null, answerChars: text.length });
     if (conversationId) db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(randomUUID(),conversationId,"assistant",text || "",runId,new Date().toISOString());
   } catch (error) {
     const message = error instanceof Error ? error.message : "RUN_FAILED";
     db.prepare("UPDATE runs SET status='failed', error_code=?, finished_at=? WHERE id=?").run(message, new Date().toISOString(), runId);
     publishRunEvent(runId, "failed", { message });
+    emitProjectEvent(projectId, "run.failed", { runId, conversationId: conversationId ?? null, model: model ?? null, error: message.slice(0, 300) });
     // A failed engine run is worth a notification, because it usually needs a human.
     const owner = db.prepare("SELECT workspace_id AS workspaceId FROM projects WHERE id=?").get(projectId) as { workspaceId: string } | undefined;
     notify(owner?.workspaceId ?? null, null, "run", "Run gagal", `Run ${runId.slice(0, 8)} gagal: ${message.slice(0, 200)}`, "/");
@@ -2649,6 +2658,10 @@ app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) 
       retention: retentionPolicy(),
       readyExports: Number((db.prepare("SELECT COUNT(*) AS n FROM data_exports WHERE status='ready'").get() as { n: number }).n),
       emailEnabled: emailEnabled(),
+      /** Wave 6: outgoing webhooks and the per-key ceilings of the public API. */
+      webhooks: webhookStats(),
+      keyLimits: PUBLIC_API_LIMITS(),
+      webhookAllowLocal: config.WEBHOOK_ALLOW_LOCAL,
     },
     /** Wave 5: the durable queue. These numbers say whether background work is keeping up. */
     backgroundWork: {
@@ -2815,7 +2828,7 @@ const contentTypes: Record<string, string> = { ".html": "text/html; charset=utf-
 const API_KEY_NAME_MIN = 2;
 const API_KEY_NAME_MAX = 60;
 
-type ApiAuth = { key: { id: string; name: string; prefix: string; scopes: string; revokedAt: string | null; lastUsedAt: string | null; createdAt: string }; userId: string; email: string; displayName: string | null; workspaceId: string; workspaceName: string; role: string };
+type ApiAuth = { key: ApiKeyRow; userId: string; email: string; displayName: string | null; workspaceId: string; workspaceName: string; role: string };
 
 /** Rejects a request unless it carries a valid, unrevoked key with the needed scope. */
 function requireApiKey(scope: ApiScope) {
@@ -2826,10 +2839,15 @@ function requireApiKey(scope: ApiScope) {
     const auth = authenticateApiKey(raw);
     if (!auth) return reply.code(401).send({ error: "API_KEY_INVALID", message: "Kunci API tidak dikenal, sudah dicabut, atau keanggotaan workspace-nya hilang." });
     if (!hasScope(auth.key as any, scope)) return reply.code(403).send({ error: "API_KEY_SCOPE_REQUIRED", message: `Kunci ini tidak punya izin "${scope}".` });
+    // Wave 6: the daily ceiling of the key is checked before any work is done. The account tier ceiling
+    // is checked again inside the write routes, so a generous key cannot push the owner past the tier.
+    const daily = checkApiKeyDailyQuota(auth.key as any);
+    if (daily) return reply.code(daily.status).send({ error: daily.error, ...daily.detail });
     const rate = checkApiKeyRate(auth.key.id);
     if (!rate.allowed) return reply.code(429).send({ error: "API_KEY_RATE_LIMITED", message: `Batas ${rate.limit} permintaan per menit untuk kunci ini terlampaui.` });
     (request as any).apiAuth = auth;
     touchApiKey(auth.key.id, request.ip ?? null);
+    countApiKeyRequest(auth.key.id);
   };
 }
 
@@ -2844,40 +2862,50 @@ function apiConversationFor(auth: ApiAuth, conversationId: string) {
 }
 
 app.get("/api/v1/api-keys", { preHandler: requireUser }, async (request: any) => {
-  const keys = listApiKeys(request.user!.id, request.query?.workspaceId ?? null);
+  // Wave 6: every key reports what it spent today, so a per-key ceiling can be chosen with real numbers.
+  const keys = listApiKeys(request.user!.id, request.query?.workspaceId ?? null)
+    .map((key) => ({ ...key, tokensToday: apiKeyTokensToday(key.id) }));
   return {
     keys,
     // The raw value is never returned again, only the visible prefix helps to identify a key.
     note: "Nilai kunci hanya ditampilkan sekali saat dibuat. Yang tersimpan adalah hash-nya.",
-    limits: { maxActive: MAX_API_KEYS_PER_USER, rateLimitPerMinute: config.API_KEY_RATE_LIMIT_PER_MINUTE },
-    scopesAvailable: ["read"],
+    limits: PUBLIC_API_LIMITS(),
+    scopesAvailable: ["read", "write"],
   };
 });
 
 app.get("/api/v1/api-keys/docs", { preHandler: requireUser }, async () => ({
   prefix: API_KEY_PREFIX,
-  scopes: ["read"],
-  phase: "baca saja",
+  scopes: ["read", "write"],
+  phase: "baca dan tulis",
   rateLimitPerMinute: config.API_KEY_RATE_LIMIT_PER_MINUTE,
+  limits: PUBLIC_API_LIMITS(),
   endpoints: PUBLIC_API_ENDPOINTS.filter((endpoint) => endpoint.available),
-  // Daftar rencana dipisah, supaya dokumentasi tidak menyebut rute yang belum dilayani.
+  // Rute yang masih direncanakan tetap dipisah. Setelah Wave 6 daftar ini kosong, dan itu memang benar.
   plannedEndpoints: PUBLIC_API_ENDPOINTS.filter((endpoint) => !endpoint.available),
+  writeNote: "Rute tulis menjawab 202: pekerjaan mesin berjalan di latar, jawabannya muncul di rute pesan.",
+  keyLimitsNote: "Batas per kunci (0 = tanpa batas khusus kunci) adalah lapisan kedua; kuota paket pemilik tetap berlaku.",
+  webhooks: {
+    events: webhookCatalogue(),
+    headers: ["x-coblai-event", "x-coblai-delivery", "x-coblai-timestamp", "x-coblai-signature"],
+    signature: 'x-coblai-signature berisi "sha256=<hmac sha256 dari \"<timestamp>.<body>\">" memakai rahasia webhook.',
+    retry: `Percobaan ulang lewat antrean pekerjaan, maksimal ${config.WEBHOOK_MAX_ATTEMPTS} kali, jeda 5 detik dikali jumlah percobaan.`,
+  },
   example: {
     curl: `curl -H "Authorization: Bearer ${API_KEY_PREFIX}_..." ${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/api/v1/public/v1/me`,
-    note: "Endpoint tulis belum dibuka; fase berikutnya menambah POST pesan dan percakapan.",
+    writeCurl: `curl -X POST -H "Authorization: Bearer ${API_KEY_PREFIX}_..." -H "content-type: application/json" -d '{"content":"Halo"}' ${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/api/v1/public/v1/conversations/<conversationId>/messages`,
   },
 }));
 
-app.post<{ Body: { name?: string; scopes?: unknown; workspaceId?: string } }>("/api/v1/api-keys", { preHandler: requireUser }, async (request: any, reply) => {
+app.post<{ Body: { name?: string; scopes?: unknown; workspaceId?: string; dailyRequestLimit?: unknown; dailyTokenLimit?: unknown } }>("/api/v1/api-keys", { preHandler: requireUser }, async (request: any, reply) => {
   const name = String(request.body?.name ?? "").trim();
   if (name.length < API_KEY_NAME_MIN || name.length > API_KEY_NAME_MAX) {
     return reply.code(400).send({ error: "INVALID_KEY_NAME", message: `Nama kunci ${API_KEY_NAME_MIN}-${API_KEY_NAME_MAX} karakter.` });
   }
   const scopes = parseScopes(request.body?.scopes ?? "read");
-  if (!scopes.length) return reply.code(400).send({ error: "INVALID_KEY_SCOPES", message: "Pilih minimal satu izin: read." });
-  const forbidden = scopes.filter((scope) => scope === "write");
-  // Write endpoints do not exist yet, so the platform refuses to hand out a promise it cannot keep.
-  if (forbidden.length) return reply.code(400).send({ error: "SCOPE_NOT_AVAILABLE", message: "Izin write belum tersedia. Gunakan read." });
+  if (!scopes.length) return reply.code(400).send({ error: "INVALID_KEY_SCOPES", message: 'Pilih minimal satu izin: "read" atau "write".' });
+  // Wave 6: "write" is served now, so it is handed out. The per-key ceilings are optional and default
+  // to the platform value, which is 0 (no key specific ceiling).
   const membership = request.body?.workspaceId
     ? db.prepare("SELECT m.workspace_id AS workspaceId, m.role AS role FROM memberships m WHERE m.user_id=? AND m.workspace_id=?").get(request.user!.id, request.body.workspaceId) as { workspaceId: string; role: string } | undefined
     : db.prepare("SELECT m.workspace_id AS workspaceId, m.role AS role FROM memberships m WHERE m.user_id=? ORDER BY m.created_at ASC LIMIT 1").get(request.user!.id) as { workspaceId: string; role: string } | undefined;
@@ -2886,12 +2914,18 @@ app.post<{ Body: { name?: string; scopes?: unknown; workspaceId?: string } }>("/
   if (countActiveApiKeys(request.user!.id) >= MAX_API_KEYS_PER_USER) {
     return reply.code(409).send({ error: "TOO_MANY_API_KEYS", message: `Maksimal ${MAX_API_KEYS_PER_USER} kunci aktif. Cabut dulu salah satu.` });
   }
-  const created = createApiKey({ userId: request.user!.id, workspaceId: membership.workspaceId, name, scopes: ["read"] });
-  recordAudit(membership.workspaceId, request.user!.id, "api_key.created", { keyId: created.key.id, prefix: created.key.prefix, scopes: created.key.scopes });
+  const created = createApiKey({
+    userId: request.user!.id, workspaceId: membership.workspaceId, name, scopes,
+    dailyRequestLimit: request.body?.dailyRequestLimit, dailyTokenLimit: request.body?.dailyTokenLimit,
+  });
+  recordAudit(membership.workspaceId, request.user!.id, "api_key.created", {
+    keyId: created.key.id, prefix: created.key.prefix, scopes: created.key.scopes,
+    dailyRequestLimit: created.key.dailyRequestLimit, dailyTokenLimit: created.key.dailyTokenLimit,
+  });
   return reply.code(201).send({ key: created.key, secret: created.raw, workspaceId: membership.workspaceId, warning: "Salin sekarang. Nilai ini tidak bisa ditampilkan lagi." });
 });
 
-app.patch<{ Params: { keyId: string }; Body: { name?: string; scopes?: unknown } }>("/api/v1/api-keys/:keyId", { preHandler: requireUser }, async (request: any, reply) => {
+app.patch<{ Params: { keyId: string }; Body: { name?: string; scopes?: unknown; dailyRequestLimit?: unknown; dailyTokenLimit?: unknown } }>("/api/v1/api-keys/:keyId", { preHandler: requireUser }, async (request: any, reply) => {
   const current = getApiKey(request.user!.id, request.params.keyId);
   if (!current) return reply.code(404).send({ error: "API_KEY_NOT_FOUND" });
   if (request.body?.name !== undefined) {
@@ -2901,10 +2935,12 @@ app.patch<{ Params: { keyId: string }; Body: { name?: string; scopes?: unknown }
   if (request.body?.scopes !== undefined) {
     const scopes = parseScopes(request.body.scopes);
     if (!scopes.length) return reply.code(400).send({ error: "INVALID_KEY_SCOPES", message: "Pilih minimal satu izin." });
-    if (scopes.includes("write")) return reply.code(400).send({ error: "SCOPE_NOT_AVAILABLE", message: "Izin write belum tersedia." });
   }
-  const updated = updateApiKey(request.user!.id, request.params.keyId, { name: request.body?.name, scopes: request.body?.scopes });
-  recordAudit(current.workspaceId, request.user!.id, "api_key.updated", { keyId: current.id });
+  const updated = updateApiKey(request.user!.id, request.params.keyId, {
+    name: request.body?.name, scopes: request.body?.scopes,
+    dailyRequestLimit: request.body?.dailyRequestLimit, dailyTokenLimit: request.body?.dailyTokenLimit,
+  });
+  recordAudit(current.workspaceId, request.user!.id, "api_key.updated", { keyId: current.id, scopes: updated?.scopes ?? current.scopes });
   return { key: updated };
 });
 
@@ -2926,7 +2962,12 @@ app.get("/api/v1/public/v1/me", { preHandler: requireApiKey("read") }, async (re
   return {
     user: { id: auth.userId, email: auth.email, displayName: auth.displayName },
     workspace: { id: auth.workspaceId, name: auth.workspaceName, role: auth.role },
-    key: { id: auth.key.id, name: auth.key.name, prefix: auth.key.prefix, scopes: auth.key.scopes },
+    key: {
+      id: auth.key.id, name: auth.key.name, prefix: auth.key.prefix, scopes: auth.key.scopes,
+      // Wave 6: pemakai kunci bisa melihat batas hariannya sendiri dan pemakaian hari ini.
+      dailyRequestLimit: auth.key.dailyRequestLimit, dailyTokenLimit: auth.key.dailyTokenLimit,
+      requestsToday: auth.key.requestsToday, tokensToday: apiKeyTokensToday(auth.key.id),
+    },
     quota: { tier: quota.tier, usedToday: quota.usedToday, dailyLimit: quota.dailyLimit, usedMonth: quota.usedMonth, monthlyLimit: quota.monthlyLimit },
   };
 });
@@ -2976,6 +3017,175 @@ app.get<{ Params: { projectId: string } }>("/api/v1/public/v1/projects/:projectI
   // Metadata only: a key cannot pull file contents out of the platform.
   const artifacts = db.prepare("SELECT id, name, mime_type AS mimeType, size_bytes AS sizeBytes, sha256, created_at AS createdAt FROM artifacts WHERE project_id=? ORDER BY created_at DESC LIMIT 200").all(project.id);
   return { project: { id: project.id, name: project.name }, artifacts, note: "Isi berkas tidak disajikan lewat API kunci." };
+});
+
+// ------------------------------------------------- public write API (Bearer, scope "write") (Wave 6)
+// A write call is charged to the key owner. Two ceilings apply: the account tier (checked here with
+// quotaGuard) and the per-key daily ceiling (checked in requireApiKey). The engine call itself runs in
+// the background, so the HTTP answer is 202 and the caller reads the answer from the message route.
+
+app.post<{ Params: { projectId: string }; Body: { title?: string } }>("/api/v1/public/v1/projects/:projectId/conversations", { preHandler: requireApiKey("write") }, async (request: any, reply) => {
+  const auth = request.apiAuth as ApiAuth;
+  const project = apiProjectFor(auth, request.params.projectId);
+  if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  if (auth.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY", message: "Kunci milik anggota viewer tidak boleh mengubah data." });
+  const title = String(request.body?.title ?? "").trim().slice(0, 120) || "Percakapan API";
+  const id = randomUUID(); const now = new Date().toISOString();
+  db.prepare("INSERT INTO conversations (id,project_id,title,created_at,updated_at) VALUES (?,?,?,?,?)").run(id, project.id, title, now, now);
+  recordAudit(auth.workspaceId, auth.userId, "public.conversation.created", { conversationId: id, projectId: project.id, keyId: auth.key.id });
+  return reply.code(201).send({ conversation: { id, projectId: project.id, title, createdAt: now, updatedAt: now } });
+});
+
+app.post<{ Params: { conversationId: string }; Body: { content?: string; model?: string; thinking?: string } }>(
+  "/api/v1/public/v1/conversations/:conversationId/messages",
+  { preHandler: requireApiKey("write") },
+  async (request: any, reply) => {
+    const auth = request.apiAuth as ApiAuth;
+    const model = typeof request.body?.model === "string" && request.body.model.trim() ? request.body.model.trim() : undefined;
+    if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
+    const thinking = typeof request.body?.thinking === "string" ? request.body.thinking.trim() : "";
+    if (thinking && !isThinkingLevel(thinking)) return reply.code(400).send({ error: "INVALID_THINKING_LEVEL", allowed: THINKING_LEVELS });
+    const content = String(request.body?.content ?? "").trim();
+    if (!content || content.length > 100_000) return reply.code(400).send({ error: "INVALID_MESSAGE", message: "Isi pesan wajib diisi, maksimal 100000 karakter." });
+    const conversation = apiConversationFor(auth, request.params.conversationId);
+    if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+    if (auth.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY", message: "Kunci milik anggota viewer tidak boleh mengirim pesan." });
+    const quotaBlock = quotaGuard(auth.userId, "");
+    if (quotaBlock) return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
+
+    const runId = randomUUID(); const messageId = randomUUID();
+    const now = new Date().toISOString();
+    const knowledge = knowledgeFor(conversation.projectId, content);
+    // Attachments are not part of the public write API: a key may send text only. That limit is stated
+    // in the docs instead of being discovered by a 400.
+    const transaction = db.transaction(() => {
+      db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,api_key_id,created_at) VALUES (?,?,?,?,?,?,?)")
+        .run(runId, conversation.projectId, "queued", content, model ?? config.PRIME_AGENT_MODEL, auth.key.id, now);
+      db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(messageId, conversation.id, "user", content, runId, now);
+      db.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversation.id);
+    });
+    transaction();
+    queueRunJob({ runId, projectId: conversation.projectId, prompt: content, conversationId: conversation.id, model, userId: auth.userId, thinking: thinking || undefined, personaId: null, autonomous: false });
+    recordAudit(auth.workspaceId, auth.userId, "public.message.created", { conversationId: conversation.id, projectId: conversation.projectId, runId, keyId: auth.key.id, model: model ?? null });
+    const settings = agentSettings(auth.userId);
+    void (async () => {
+      await executeRun(runId, conversation.projectId, content, conversation.id, knowledge, model, auth.userId, { thinking: thinking || undefined, personaId: null, autonomous: false });
+    })();
+    return reply.code(202).send({
+      message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now },
+      run: { id: runId, status: "queued", model: model ?? config.PRIME_AGENT_MODEL, thinkingLevel: thinking || settings.thinking_level },
+      read: { messages: `/api/v1/public/v1/conversations/${conversation.id}/messages` },
+    });
+  },
+);
+
+// ---------------------------------------------------------------- outgoing webhooks (Wave 6)
+
+/** The workspace a session request works in: the asked one, or the oldest membership. */
+function sessionWorkspaceFor(userId: string, requested?: unknown): { workspaceId: string; role: string } | null {
+  const wanted = typeof requested === "string" ? requested.trim() : "";
+  const row = wanted
+    ? db.prepare("SELECT m.workspace_id AS workspaceId, m.role AS role FROM memberships m WHERE m.user_id=? AND m.workspace_id=?").get(userId, wanted)
+    : db.prepare("SELECT m.workspace_id AS workspaceId, m.role AS role FROM memberships m WHERE m.user_id=? ORDER BY m.created_at ASC LIMIT 1").get(userId);
+  return (row as { workspaceId: string; role: string } | undefined) ?? null;
+}
+
+function mayManageWebhooks(role: string): boolean { return role === "owner" || role === "admin"; }
+
+app.get<{ Querystring: { workspaceId?: string } }>("/api/v1/webhooks", { preHandler: requireUser }, async (request: any, reply) => {
+  const workspace = sessionWorkspaceFor(request.user!.id, request.query?.workspaceId);
+  if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  return {
+    webhooks: listWebhooks(workspace.workspaceId),
+    stats: webhookStats(workspace.workspaceId),
+    events: webhookCatalogue(),
+    limits: {
+      maxPerWorkspace: config.WEBHOOK_MAX_PER_WORKSPACE, maxAttempts: config.WEBHOOK_MAX_ATTEMPTS,
+      timeoutMs: config.WEBHOOK_DELIVERY_TIMEOUT_MS, allowLocal: config.WEBHOOK_ALLOW_LOCAL,
+    },
+    note: "Rahasia penandatanganan hanya tampil sekali saat webhook dibuat. Alamat lokal ditolak kecuali WEBHOOK_ALLOW_LOCAL=true.",
+    canManage: mayManageWebhooks(workspace.role),
+  };
+});
+
+app.post<{ Body: { url?: string; events?: unknown; description?: string; workspaceId?: string } }>("/api/v1/webhooks", { preHandler: requireUser }, async (request: any, reply) => {
+  const workspace = sessionWorkspaceFor(request.user!.id, request.body?.workspaceId);
+  if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (!mayManageWebhooks(workspace.role)) return reply.code(403).send({ error: "OWNER_REQUIRED", message: "Hanya owner atau admin workspace yang boleh mendaftarkan webhook." });
+  const url = validateWebhookUrl(request.body?.url);
+  if (!url.ok) return reply.code(400).send({ error: url.error, message: url.message });
+  if (countWebhooks(workspace.workspaceId) >= config.WEBHOOK_MAX_PER_WORKSPACE) {
+    return reply.code(409).send({ error: "TOO_MANY_WEBHOOKS", message: `Maksimal ${config.WEBHOOK_MAX_PER_WORKSPACE} webhook per workspace.` });
+  }
+  const created = createWebhook({
+    workspaceId: workspace.workspaceId, userId: request.user!.id, url: url.url,
+    events: parseEvents(request.body?.events), description: request.body?.description ?? null,
+  });
+  recordAudit(workspace.workspaceId, request.user!.id, "webhook.created", { webhookId: created.webhook.id, url: created.webhook.url, events: created.webhook.events });
+  return reply.code(201).send({
+    webhook: created.webhook, secret: created.secret,
+    warning: "Salin rahasia ini sekarang. Dipakai untuk memeriksa header x-coblai-signature.",
+  });
+});
+
+app.patch<{ Params: { id: string }; Body: { url?: string; events?: unknown; active?: boolean; description?: string | null; workspaceId?: string } }>("/api/v1/webhooks/:id", { preHandler: requireUser }, async (request: any, reply) => {
+  const workspace = sessionWorkspaceFor(request.user!.id, request.body?.workspaceId ?? request.query?.workspaceId);
+  if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (!mayManageWebhooks(workspace.role)) return reply.code(403).send({ error: "OWNER_REQUIRED", message: "Hanya owner atau admin workspace yang boleh mengubah webhook." });
+  const current = getWebhook(workspace.workspaceId, request.params.id);
+  if (!current) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND" });
+  if (request.body?.url !== undefined) {
+    const url = validateWebhookUrl(request.body.url);
+    if (!url.ok) return reply.code(400).send({ error: url.error, message: url.message });
+  }
+  const updated = updateWebhook(workspace.workspaceId, request.params.id, {
+    url: request.body?.url, events: request.body?.events, active: request.body?.active, description: request.body?.description,
+  });
+  recordAudit(workspace.workspaceId, request.user!.id, "webhook.updated", { webhookId: current.id, active: updated?.active ?? current.active });
+  return { webhook: updated };
+});
+
+app.delete<{ Params: { id: string } }>("/api/v1/webhooks/:id", { preHandler: requireUser }, async (request: any, reply) => {
+  const workspace = sessionWorkspaceFor(request.user!.id, request.query?.workspaceId);
+  if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (!mayManageWebhooks(workspace.role)) return reply.code(403).send({ error: "OWNER_REQUIRED", message: "Hanya owner atau admin workspace yang boleh menghapus webhook." });
+  const current = getWebhook(workspace.workspaceId, request.params.id);
+  if (!current) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND" });
+  deleteWebhook(workspace.workspaceId, request.params.id);
+  recordAudit(workspace.workspaceId, request.user!.id, "webhook.deleted", { webhookId: current.id, url: current.url });
+  // Riwayat pengiriman ikut terhapus karena barisnya menempel pada webhook (ON DELETE CASCADE).
+  return { deleted: true, webhookId: current.id, note: "Riwayat pengiriman webhook ini ikut terhapus." };
+});
+
+app.get<{ Params: { id: string }; Querystring: { limit?: string; workspaceId?: string } }>("/api/v1/webhooks/:id/deliveries", { preHandler: requireUser }, async (request: any, reply) => {
+  const workspace = sessionWorkspaceFor(request.user!.id, request.query?.workspaceId);
+  if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  const hook = getWebhook(workspace.workspaceId, request.params.id);
+  if (!hook) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND" });
+  return { webhook: hook, deliveries: listDeliveries(hook.id, Number(request.query?.limit ?? 50) || 50) };
+});
+
+/** One immediate attempt, so a human can see the receiver answer without waiting for an event. */
+app.post<{ Params: { id: string }; Querystring: { workspaceId?: string } }>("/api/v1/webhooks/:id/test", { preHandler: requireUser }, async (request: any, reply) => {
+  const workspace = sessionWorkspaceFor(request.user!.id, request.query?.workspaceId);
+  if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (!mayManageWebhooks(workspace.role)) return reply.code(403).send({ error: "OWNER_REQUIRED", message: "Hanya owner atau admin workspace yang boleh menguji webhook." });
+  const hook = getWebhook(workspace.workspaceId, request.params.id);
+  if (!hook) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND" });
+  const delivery = createDeliveryRow({
+    webhookId: hook.id, event: "webhook.test",
+    payload: { message: "Pesan uji dari COBLAI Coder.", url: hook.url, triggeredBy: request.user!.id },
+  });
+  let report: { status: string; responseStatus: number | null; error: string | null; durationMs: number } = { status: "failed", responseStatus: null, error: "Uji gagal.", durationMs: 0 };
+  try {
+    const result = await deliverWebhook(delivery.id);
+    report = { status: result.status, responseStatus: result.responseStatus, error: result.error, durationMs: result.durationMs };
+  } catch (error) {
+    // Kegagalan penerima bukan kegagalan server ini: jawabannya tetap 200 dengan laporan jujur.
+    report = { status: "failed", responseStatus: null, error: error instanceof Error ? error.message : "Pengiriman gagal.", durationMs: 0 };
+  }
+  recordAudit(workspace.workspaceId, request.user!.id, "webhook.tested", { webhookId: hook.id, status: report.status, responseStatus: report.responseStatus });
+  return { report, delivery: getDelivery(delivery.id) };
 });
 
 // ---------------------------------------------------------------- public pricing (no session)
@@ -3251,6 +3461,14 @@ function registerBackgroundHandlers() {
       recordAudit(projectAuditWorkspace(projectIdOfExecution(execution.id)), null, "workflow.execution.reaped", { executionId: execution.id, reason: "WORKER_LOST" });
     }
     return { marked: report.marked };
+  });
+
+  // Wave 6: one delivery attempt per job. The queue supplies the retry and its backoff, so a receiver
+  // that is down for a while still gets the event once it comes back (up to WEBHOOK_MAX_ATTEMPTS).
+  registerJobHandler("webhook.deliver", async (payload: any) => {
+    const deliveryId = String(payload?.deliveryId ?? "");
+    const report = await deliverWebhook(deliveryId);
+    return { deliveryId, status: report.status, responseStatus: report.responseStatus, durationMs: report.durationMs };
   });
 }
 

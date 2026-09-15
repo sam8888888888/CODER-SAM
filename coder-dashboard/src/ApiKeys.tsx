@@ -38,7 +38,12 @@ const LINK_BTN = 'link-button';
 type CreatedKey = { name: string; secret: string; warning: string; workspaceId: string };
 
 /** Batas pemakaian kunci dari server. */
-type KeyLimits = { maxActive: number; rateLimitPerMinute: number };
+type KeyLimits = {
+  maxActive: number;
+  rateLimitPerMinute: number;
+  dailyRequestsDefault?: number;
+  dailyTokensDefault?: number;
+};
 
 /** Ubah nilai apa pun menjadi angka aman supaya tampilan tidak pernah memuat NaN. */
 function num(value: unknown): number {
@@ -78,9 +83,12 @@ function apiKeyErrorMessage(error: unknown, fallback: string): string {
   if (code.includes('INVALID_KEY_NAME')) {
     return 'Nama kunci harus ' + NAME_MIN + '-' + NAME_MAX + ' karakter.';
   }
-  if (code.includes('INVALID_KEY_SCOPES')) return 'Pilih minimal satu izin: baca (read).';
+  if (code.includes('INVALID_KEY_SCOPES')) return 'Pilih minimal satu izin: baca (read) atau tulis (write).';
+  if (code.includes('API_KEY_DAILY_REQUEST_LIMIT') || code.includes('API_KEY_DAILY_TOKEN_LIMIT')) {
+    return 'Batas harian kunci ini sudah tercapai. Tunggu sampai besok, naikkan batasnya, atau pakai kunci lain.';
+  }
   if (code.includes('SCOPE_NOT_AVAILABLE')) {
-    return 'Izin tulis (write) belum tersedia di fase ini. Pakai izin baca (read).';
+    return 'Izin itu belum tersedia di server ini. Muat ulang halaman lalu coba lagi.';
   }
   if (code.includes('WORKSPACE_NOT_FOUND')) {
     return 'Workspace itu tidak ditemukan untuk akun Anda. Pilih workspace lain, lalu coba lagi.';
@@ -241,6 +249,10 @@ export function ApiKeys({ onError }: Props) {
   // Formulir pembuatan kunci.
   const [name, setName] = useState('');
   const [readScope, setReadScope] = useState(true);
+  // Wave 6: izin tulis sudah dilayani, dan setiap kunci boleh punya batas harian sendiri.
+  const [writeScope, setWriteScope] = useState(false);
+  const [dailyRequests, setDailyRequests] = useState('0');
+  const [dailyTokens, setDailyTokens] = useState('0');
   const [creating, setCreating] = useState(false);
   const [formError, setFormError] = useState('');
   const [created, setCreated] = useState<CreatedKey | null>(null);
@@ -251,6 +263,13 @@ export function ApiKeys({ onError }: Props) {
   const [editName, setEditName] = useState('');
   const [editError, setEditError] = useState('');
   const [savingId, setSavingId] = useState('');
+
+  // Wave 6: ubah batas harian per kunci (satu baris terbuka sekaligus).
+  const [limitId, setLimitId] = useState<string | null>(null);
+  const [limitRequests, setLimitRequests] = useState('0');
+  const [limitTokens, setLimitTokens] = useState('0');
+  const [limitSaving, setLimitSaving] = useState(false);
+  const [limitError, setLimitError] = useState('');
 
   // Keadaan umum halaman.
   const [loading, setLoading] = useState(false);
@@ -331,17 +350,23 @@ export function ApiKeys({ onError }: Props) {
       setFormError(message);
       return;
     }
-    if (!readScope) {
-      const message = 'Izin baca (read) wajib dipilih pada fase ini.';
+    if (!readScope && !writeScope) {
+      const message = 'Pilih minimal satu izin: baca (read) atau tulis (write).';
       setFormError(message);
       return;
     }
+    const requestLimit = Math.max(0, Math.trunc(Number(dailyRequests) || 0));
+    const tokenLimit = Math.max(0, Math.trunc(Number(dailyTokens) || 0));
     setCreating(true);
     try {
       const result = await api.createApiKey({
         name: clean,
-        scopes: readScope ? ['read'] : [],
+        // Izin tulis otomatis menambahkan izin baca di server; daftar ini dikirim apa adanya.
+        scopes: [...(readScope ? ['read'] : []), ...(writeScope ? ['write'] : [])],
         ...(workspaceId ? { workspaceId } : {}),
+        // 0 berarti tanpa batas khusus untuk kunci ini.
+        dailyRequestLimit: requestLimit,
+        dailyTokenLimit: tokenLimit,
       });
       // Nilai kunci hanya disimpan di state halaman ini, bukan di localStorage.
       setCreated({
@@ -441,6 +466,38 @@ export function ApiKeys({ onError }: Props) {
     }
   }
 
+  /** Buka editor batas harian untuk satu kunci. */
+  function startLimit(row: ApiKeyRow): void {
+    setLimitId(row.id);
+    setLimitRequests(String(num(row.dailyRequestLimit)));
+    setLimitTokens(String(num(row.dailyTokenLimit)));
+    setLimitError('');
+  }
+
+  /** Tutup editor batas harian tanpa menyimpan. */
+  function cancelLimit(): void {
+    setLimitId(null);
+    setLimitError('');
+  }
+
+  /** Simpan batas harian; 0 berarti tanpa batas khusus untuk kunci ini. */
+  async function saveLimit(row: ApiKeyRow): Promise<void> {
+    const requests = Math.max(0, Math.trunc(Number(limitRequests) || 0));
+    const tokens = Math.max(0, Math.trunc(Number(limitTokens) || 0));
+    setLimitSaving(true);
+    setLimitError('');
+    try {
+      await api.updateApiKey(row.id, { dailyRequestLimit: requests, dailyTokenLimit: tokens });
+      setNotice('Batas harian kunci "' + String(row.name ?? '') + '" sudah disimpan.');
+      cancelLimit();
+      await loadKeys();
+    } catch (caught) {
+      setLimitError(apiKeyErrorMessage(caught, 'Batas harian gagal disimpan. Coba lagi sebentar lagi.'));
+    } finally {
+      setLimitSaving(false);
+    }
+  }
+
   const activeCount = keys.filter((row) => !isRevoked(row)).length;
   const activeEndpoints = (docs?.endpoints ?? []).filter((endpoint) => endpoint.available !== false);
   const plannedEndpoints =
@@ -498,7 +555,8 @@ export function ApiKeys({ onError }: Props) {
           </label>
         </div>
         <p className="settings-hint">
-          Nama kunci {NAME_MIN}-{NAME_MAX} karakter. Kunci hanya bisa membaca data di workspace yang dipilih.
+          Nama kunci {NAME_MIN}-{NAME_MAX} karakter. Kunci hanya bisa memakai data di workspace yang dipilih. Batas
+          harian per kunci berguna untuk membatasi kerugian bila kunci bocor.
         </p>
 
         <div className="mt-1 flex flex-col gap-1">
@@ -511,15 +569,45 @@ export function ApiKeys({ onError }: Props) {
             />
             Izin baca (read) — membaca profil kunci, proyek, percakapan, pesan, pemakaian, dan artefak.
           </label>
-          <label className="flex items-center gap-2 text-slate-400">
+          <label className="flex items-center gap-2 text-slate-300">
             <input
               type="checkbox"
-              checked={false}
-              readOnly
-              disabled
-              aria-label="Izin tulis belum tersedia di fase ini"
+              checked={writeScope}
+              disabled={creating}
+              onChange={(event) => setWriteScope(event.target.checked)}
             />
-            Izin tulis (write) — belum tersedia di fase ini
+            Izin tulis (write) — membuat percakapan dan mengirim pesan lewat API publik. Kunci tulis juga boleh
+            membaca.
+          </label>
+        </div>
+
+        {/* Wave 6: batas harian per kunci. 0 berarti tanpa batas khusus. */}
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <label className="block">
+            <span className={LABEL}>Batas permintaan per hari</span>
+            <input
+              className={FIELD + ' mt-1 w-full'}
+              type="number"
+              min="0"
+              step="1"
+              value={dailyRequests}
+              disabled={creating}
+              onChange={(event) => setDailyRequests(event.target.value)}
+            />
+            <span className="settings-hint">0 = tanpa batas khusus. Isi 0 bila tidak yakin.</span>
+          </label>
+          <label className="block">
+            <span className={LABEL}>Batas token per hari</span>
+            <input
+              className={FIELD + ' mt-1 w-full'}
+              type="number"
+              min="0"
+              step="1"
+              value={dailyTokens}
+              disabled={creating}
+              onChange={(event) => setDailyTokens(event.target.value)}
+            />
+            <span className="settings-hint">0 = tanpa batas khusus. Dihitung dari pemakaian token run kunci ini.</span>
           </label>
         </div>
 
@@ -527,7 +615,7 @@ export function ApiKeys({ onError }: Props) {
           <button
             type="button"
             className={BTN_PRIMARY}
-            disabled={creating || !readScope || name.trim().length < NAME_MIN}
+            disabled={creating || (!readScope && !writeScope) || name.trim().length < NAME_MIN}
             onClick={() => {
               void createKey();
             }}
@@ -606,11 +694,25 @@ export function ApiKeys({ onError }: Props) {
               label="Izin tersedia"
               value={scopesAvailable.length > 0 ? scopesAvailable.map(scopeLabel).join(', ') : 'baca (read)'}
             />
+            <StatCard
+              label="Batas bawaan per kunci"
+              value={
+                (num(limits.dailyRequestsDefault) > 0
+                  ? numberText(limits.dailyRequestsDefault) + ' permintaan/hari'
+                  : 'permintaan: tanpa batas') +
+                ' · ' +
+                (num(limits.dailyTokensDefault) > 0
+                  ? numberText(limits.dailyTokensDefault) + ' token/hari'
+                  : 'token: tanpa batas')
+              }
+            />
           </div>
         ) : null}
         {note ? <p className="settings-hint">{note}</p> : null}
         <p className="settings-hint">
-          Kolom Prefix memuat 8 karakter heksadesimal dari nilai kunci. Nilai penuh selalu diawali
+          Kolom Batas harian memakai angka 0 untuk "tanpa batas khusus". Pemakaian token dihitung dari run yang
+          memakai kunci itu pada hari ini. Kolom Prefix memuat 8 karakter heksadesimal dari nilai kunci. Nilai penuh
+          selalu diawali
           <code className="font-mono"> ck_</code> dan hanya tampil sekali saat kunci dibuat, jadi pakai prefix ini untuk
           mengenali kunci yang dipakai skrip Anda.
         </p>
@@ -645,6 +747,9 @@ export function ApiKeys({ onError }: Props) {
                   </th>
                   <th scope="col" className={TH}>
                     Jumlah permintaan
+                  </th>
+                  <th scope="col" className={TH}>
+                    Batas harian
                   </th>
                   <th scope="col" className={TH}>
                     Status
@@ -705,6 +810,77 @@ export function ApiKeys({ onError }: Props) {
                         {row.lastUsedIp ? <span className="ml-1 text-xs text-slate-400">({row.lastUsedIp})</span> : null}
                       </td>
                       <td className={TD}>{numberText(row.requestCount)}</td>
+                      <td className={TD}>
+                        {limitId === row.id ? (
+                          <div className="flex flex-col gap-1">
+                            <label className="block text-xs text-slate-400">
+                              Permintaan/hari
+                              <input
+                                className={FIELD + ' mt-1 w-full'}
+                                type="number"
+                                min="0"
+                                step="1"
+                                value={limitRequests}
+                                disabled={limitSaving}
+                                onChange={(event) => setLimitRequests(event.target.value)}
+                              />
+                            </label>
+                            <label className="block text-xs text-slate-400">
+                              Token/hari
+                              <input
+                                className={FIELD + ' mt-1 w-full'}
+                                type="number"
+                                min="0"
+                                step="1"
+                                value={limitTokens}
+                                disabled={limitSaving}
+                                onChange={(event) => setLimitTokens(event.target.value)}
+                              />
+                            </label>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <button
+                                type="button"
+                                className={BTN}
+                                disabled={limitSaving}
+                                onClick={() => {
+                                  void saveLimit(row);
+                                }}
+                              >
+                                {limitSaving ? 'Menyimpan…' : 'Simpan batas'}
+                              </button>
+                              <button type="button" className={LINK_BTN} disabled={limitSaving} onClick={cancelLimit}>
+                                Batal
+                              </button>
+                            </div>
+                            {limitError ? <span className="text-xs text-rose-300">{limitError}</span> : null}
+                          </div>
+                        ) : (
+                          <div className="flex flex-col gap-1">
+                            <span className="text-slate-300">
+                              {num(row.dailyRequestLimit) > 0
+                                ? numberText(row.dailyRequestLimit) + ' permintaan/hari'
+                                : 'Permintaan: tanpa batas khusus'}
+                            </span>
+                            <span className="text-slate-300">
+                              {num(row.dailyTokenLimit) > 0
+                                ? numberText(row.dailyTokenLimit) + ' token/hari'
+                                : 'Token: tanpa batas khusus'}
+                            </span>
+                            <span className="text-xs text-slate-400">
+                              Hari ini: {numberText(row.requestsToday)} permintaan · {numberText(row.tokensToday)} token
+                            </span>
+                            <button
+                              type="button"
+                              className={LINK_BTN}
+                              disabled={revoked || busy || limitSaving}
+                              title={revoked ? 'Kunci ini sudah dicabut' : 'Ubah batas harian kunci ini'}
+                              onClick={() => startLimit(row)}
+                            >
+                              Ubah batas
+                            </button>
+                          </div>
+                        )}
+                      </td>
                       <td className={TD}>
                         <span className="badge">{statusLabel(row)}</span>
                         {revoked ? (
@@ -792,16 +968,19 @@ export function ApiKeys({ onError }: Props) {
 
             <EndpointTable
               title="Endpoint publik yang aktif"
-              hint="Semua rute di bawah ini hanya membaca data di workspace yang terikat pada kunci."
+              hint="Semua rute di bawah ini dilayani server. Rute berizin read hanya membaca; rute berizin write membuat percakapan atau mengirim pesan."
               rows={activeEndpoints}
               muted={false}
             />
-            <EndpointTable
-              title="Direncanakan (belum tersedia)"
-              hint="Rute ini belum dilayani server, jadi jangan dipakai dulu. Daftar ini hanya gambaran rencana fase berikutnya."
-              rows={plannedEndpoints}
-              muted
-            />
+            {/* Wave 6: tidak ada lagi rute tulis yang hanya berupa rencana, jadi panel ini hilang sendiri. */}
+            {plannedEndpoints.length > 0 ? (
+              <EndpointTable
+                title="Direncanakan (belum tersedia)"
+                hint="Rute ini belum dilayani server, jadi jangan dipakai dulu. Daftar ini hanya gambaran rencana fase berikutnya."
+                rows={plannedEndpoints}
+                muted
+              />
+            ) : null}
 
             <h4 className="mt-3 text-sm font-semibold text-slate-100">Contoh pemakaian</h4>
             <pre className={FIELD + ' mt-1 w-full overflow-x-auto whitespace-pre-wrap break-all border-slate-700 bg-slate-900/60 font-mono text-xs'}>

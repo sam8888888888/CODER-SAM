@@ -85,8 +85,23 @@ export type DiffLine = { type: ' ' | '-' | '+' | '@@'; text: string; left?: numb
 export type DiffResult = { left: { name: string; lines: number }; right: { name: string; lines: number }; added: number; removed: number; changes: number; hunks: DiffLine[] };
 export type ConversationSummary = { id: string; summary: string; messagesCovered: number; charsBefore: number; charsAfter: number; createdAt: string };
 
+// --- Wave 6: API tulis publik, webhook keluar, batas harian per kunci --------
+/** Nama peristiwa webhook yang dikenal server. */
+export type WebhookEventName = 'run.completed' | 'run.failed';
+export type WebhookEventInfo = { event: string; description: string };
+export type Webhook = { id: string; workspaceId: string; userId: string; url: string; events: string[]; active: boolean; description: string | null;
+  createdAt: string; updatedAt: string; lastDeliveryAt: string | null; lastStatus: string | null; failureCount: number };
+export type WebhookDelivery = { id: string; webhookId: string; event: string; payload: unknown; status: 'queued' | 'delivered' | 'failed' | string; attempts: number;
+  responseStatus: number | null; lastError: string | null; durationMs: number | null; jobId: string | null; createdAt: string; updatedAt: string; deliveredAt: string | null };
+export type WebhookStats = { hooks: number; active: number; deliveries: number; queued: number; delivered: number; failed: number; lastDeliveryAt: string | null };
+export type WebhookLimits = { maxPerWorkspace: number; maxAttempts: number; timeoutMs: number; allowLocal: boolean };
+export type WebhooksResponse = { webhooks: Webhook[]; stats: WebhookStats; events: WebhookEventInfo[]; limits: WebhookLimits; note: string; canManage: boolean };
+export type WebhookTestReport = { status: string; responseStatus: number | null; error: string | null; durationMs: number };
+
 // --- Wave 4: platform terbuka, notifikasi email dan kepatuhan data -----------
-export type ApiKeyRow = { id: string; name: string; prefix: string; scopes: string; workspaceId: string; createdAt: string; lastUsedAt: string | null; lastUsedIp?: string | null; requestCount: number; revokedAt: string | null };
+export type ApiKeyRow = { id: string; name: string; prefix: string; scopes: string; workspaceId: string; createdAt: string; lastUsedAt: string | null; lastUsedIp?: string | null; requestCount: number; revokedAt: string | null;
+  /** Wave 6: batas harian per kunci dan pemakaian hari ini. 0 berarti tanpa batas khusus. */
+  dailyRequestLimit?: number; dailyTokenLimit?: number; requestsToday?: number; tokensToday?: number };
 export type PublicEndpoint = { method: string; path: string; scope: string; description: string; available?: boolean };
 export type ApiKeyDocs = { prefix: string; scopes: string[]; phase: string; rateLimitPerMinute: number; endpoints: PublicEndpoint[]; plannedEndpoints?: PublicEndpoint[]; example: { curl: string; note: string } };
 export type NotificationPrefs = { userId: string; emailQuota: number; emailRuns: number; emailBilling: number; emailTeam: number; emailSecurity: number; updatedAt: string };
@@ -258,10 +273,10 @@ export const api = {
   reportUrl: (projectId: string, kind: 'project' | 'conversation' = 'project', conversationId?: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/report.md?kind=${kind}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ''}`,
 
   // --- Wave 4: kunci API, API publik, notifikasi email, privasi data ----------
-  apiKeys: (workspaceId?: string) => request<{ keys: ApiKeyRow[]; note: string; limits: { maxActive: number; rateLimitPerMinute: number }; scopesAvailable: string[] }>(`/v1/api-keys${workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''}`),
+  apiKeys: (workspaceId?: string) => request<{ keys: ApiKeyRow[]; note: string; limits: { maxActive: number; rateLimitPerMinute: number; dailyRequestsDefault?: number; dailyTokensDefault?: number }; scopesAvailable: string[] }>(`/v1/api-keys${workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''}`),
   apiKeyDocs: () => request<ApiKeyDocs>('/v1/api-keys/docs'),
-  createApiKey: (input: { name: string; scopes?: string[]; workspaceId?: string }) => request<{ key: ApiKeyRow; secret: string; workspaceId: string; warning: string }>('/v1/api-keys', { method: 'POST', body: JSON.stringify(input) }),
-  updateApiKey: (keyId: string, patch: { name?: string; scopes?: string[] }) => request<{ key: ApiKeyRow }>(`/v1/api-keys/${encodeURIComponent(keyId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  createApiKey: (input: { name: string; scopes?: string[]; workspaceId?: string; dailyRequestLimit?: number; dailyTokenLimit?: number }) => request<{ key: ApiKeyRow; secret: string; workspaceId: string; warning: string }>('/v1/api-keys', { method: 'POST', body: JSON.stringify(input) }),
+  updateApiKey: (keyId: string, patch: { name?: string; scopes?: string[]; dailyRequestLimit?: number; dailyTokenLimit?: number }) => request<{ key: ApiKeyRow }>(`/v1/api-keys/${encodeURIComponent(keyId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   revokeApiKey: (keyId: string) => request<{ revoked: boolean; keyId: string }>(`/v1/api-keys/${encodeURIComponent(keyId)}`, { method: 'DELETE' }),
   publicPlans: () => request<PublicPricing>('/v1/public/plans'),
   notificationPrefs: () => request<{ preferences: NotificationPrefs; email: EmailWorkerState; kinds: { key: string; label: string }[]; note: string }>('/v1/account/notification-preferences'),
@@ -279,6 +294,18 @@ export const api = {
   retryAdminJob: (jobId: string) => request<{ retried: boolean; job: BackgroundJob }>(`/v1/admin/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' }),
   runAdminJobCycle: () => request<{ cycle: JobCycleReport; stats: JobStats; worker: JobWorkerInfo }>('/v1/admin/jobs/tick', { method: 'POST' }),
   deleteOutboxEmail: (emailId: string) => request<{ deleted: boolean; emailId: string }>(`/v1/admin/email-outbox/${encodeURIComponent(emailId)}`, { method: 'DELETE' }),
+  /** Wave 6: webhook keluar. Rahasia penandatanganan hanya muncul sekali, saat webhook dibuat. */
+  webhooks: (workspaceId?: string) => request<WebhooksResponse>(`/v1/webhooks${workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''}`),
+  createWebhook: (input: { url: string; events?: string[]; description?: string; workspaceId?: string }) =>
+    request<{ webhook: Webhook; secret: string; warning: string }>('/v1/webhooks', { method: 'POST', body: JSON.stringify(input) }),
+  updateWebhook: (webhookId: string, patch: { url?: string; events?: string[]; active?: boolean; description?: string | null }) =>
+    request<{ webhook: Webhook }>(`/v1/webhooks/${encodeURIComponent(webhookId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  deleteWebhook: (webhookId: string) =>
+    request<{ deleted: boolean; webhookId: string; note?: string }>(`/v1/webhooks/${encodeURIComponent(webhookId)}`, { method: 'DELETE' }),
+  webhookDeliveries: (webhookId: string, limit = 50) =>
+    request<{ webhook: Webhook; deliveries: WebhookDelivery[] }>(`/v1/webhooks/${encodeURIComponent(webhookId)}/deliveries?limit=${encodeURIComponent(String(limit))}`),
+  testWebhook: (webhookId: string) =>
+    request<{ report: WebhookTestReport; delivery: WebhookDelivery | null }>(`/v1/webhooks/${encodeURIComponent(webhookId)}/test`, { method: 'POST' }),
   retentionReport: () => request<RetentionReport>('/v1/admin/retention'),
   runRetention: (dryRun = true) => request<RetentionReport & { dryRun: boolean; totalRemoved: number; expiredExports: { marked: number; filesRemoved: number }; message: string }>('/v1/admin/retention/run', { method: 'POST', body: JSON.stringify({ dryRun }) }),
 };

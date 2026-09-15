@@ -399,6 +399,26 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(status, run_after ASC);
 CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key) WHERE dedupe_key IS NOT NULL;
+
+/* Wave 6: outgoing webhooks. The secret is shown once at creation; deliveries keep their own row so an
+   operator can see what was sent, what came back, and why a delivery is still waiting. */
+CREATE TABLE IF NOT EXISTS webhooks (
+ id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ url TEXT NOT NULL, secret TEXT NOT NULL, events TEXT NOT NULL DEFAULT 'run.completed',
+ active INTEGER NOT NULL DEFAULT 1, description TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_delivery_at TEXT, last_status TEXT, failure_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_webhooks_workspace ON webhooks(workspace_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+ id TEXT PRIMARY KEY, webhook_id TEXT NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+ event TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'queued'
+   CHECK(status IN ('queued','delivered','failed')),
+ attempts INTEGER NOT NULL DEFAULT 0, response_status INTEGER, last_error TEXT, duration_ms INTEGER,
+ job_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, delivered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_hook ON webhook_deliveries(webhook_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status ON webhook_deliveries(status, created_at DESC);
 `);
 /** Wave 3 columns: an engine session can rotate (compaction), and a conversation can hold a persona. */
 try { db.exec("ALTER TABLE conversations ADD COLUMN engine_session_id TEXT"); } catch {}
@@ -411,10 +431,17 @@ try { db.exec("ALTER TABLE runs ADD COLUMN parent_run_id TEXT"); } catch {}
 try { db.exec("ALTER TABLE runs ADD COLUMN prompt_chars INTEGER"); } catch {}
 try { db.exec("ALTER TABLE runs ADD COLUMN append_system_chars INTEGER"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN default_persona_id TEXT"); } catch {}
+/** Wave 6 columns: a public write call is charged to the key that made it, and each key can have its own
+    daily ceiling. 0 means "no key-specific ceiling": the account tier still applies. */
+try { db.exec("ALTER TABLE runs ADD COLUMN api_key_id TEXT"); } catch {}
+try { db.exec("ALTER TABLE api_keys ADD COLUMN daily_request_limit INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE api_keys ADD COLUMN daily_token_limit INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE api_keys ADD COLUMN requests_today INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE api_keys ADD COLUMN usage_day TEXT"); } catch {}
 
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 13;
-export const SCHEMA_VERSION_NOTE = "Durable background job queue with leases, on top of the API key, email outbox, export and agent workspace tables";
+const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION_NOTE = "Public write API, outgoing webhooks and per-key daily ceilings, on top of the durable job queue";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

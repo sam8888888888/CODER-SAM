@@ -1,5 +1,5 @@
 /** Pages of the workspace shell. Shared by the sidebar, the dashboard cards and the tool panels. */
-export type PageKey = 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'billing' | 'admin' | 'settings' | 'memory' | 'templates' | 'personas' | 'playground' | 'skills' | 'status' | 'agents' | 'diff' | 'tokenSaver' | 'apiKeys' | 'privacy' | 'adminEmail' | 'adminJobs';
+export type PageKey = 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'billing' | 'admin' | 'settings' | 'memory' | 'templates' | 'personas' | 'playground' | 'skills' | 'status' | 'agents' | 'diff' | 'tokenSaver' | 'apiKeys' | 'privacy' | 'adminEmail' | 'adminJobs' | 'apiWebhooks';
 
 export type NavItem = { key: PageKey; label: string; icon: string; blurb: string };
 
@@ -30,6 +30,7 @@ export const NAV_ITEMS: NavItem[] = [
   { key: 'privacy', label: 'Privasi & data', icon: '⛨', blurb: 'Unduh data akun Anda, atur email notifikasi, lihat kebijakan retensi' },
   { key: 'adminEmail', label: 'Antrean email', icon: '✉', blurb: 'Lihat pesan keluar, kirim ulang, dan jalankan pembersihan retensi' },
   { key: 'adminJobs', label: 'Antrean pekerjaan', icon: '⧖', blurb: 'Pekerjaan latar yang tahan restart: antrean, sewa, percobaan, dan perbaikan otomatis' },
+  { key: 'apiWebhooks', label: 'Webhook', icon: '⇄', blurb: 'Kirim peristiwa run ke sistem lain dengan tanda tangan HMAC dan percobaan ulang' },
 ];
 
 export const TOOL_PAGES: PageKey[] = ['knowledge', 'workflow', 'team', 'artifacts', 'usage', 'audit'];

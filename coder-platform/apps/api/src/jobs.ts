@@ -26,7 +26,7 @@ import { db } from "./db.js";
 export type JobStatus = "queued" | "running" | "done" | "failed";
 
 /** Jenis pekerjaan yang dikenal platform. Jenis lain tetap boleh (dipakai uji), tetapi bukan bawaan. */
-export const JOB_KINDS = ["run.execute", "email.deliver", "retention.run", "run.reap", "workflow.reap"] as const;
+export const JOB_KINDS = ["run.execute", "email.deliver", "retention.run", "run.reap", "workflow.reap", "webhook.deliver"] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 export type JobRow = {

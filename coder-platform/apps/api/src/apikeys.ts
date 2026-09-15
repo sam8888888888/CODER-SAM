@@ -12,6 +12,8 @@ export type ApiKeyRow = {
   id: string; workspaceId: string | null; userId: string; name: string; prefix: string;
   scopes: string; createdAt: string; lastUsedAt: string | null; revokedAt: string | null;
   requestCount: number; lastIp: string | null;
+  /** Wave 6: per-key daily ceilings. 0 means "no key specific ceiling". */
+  dailyRequestLimit: number; dailyTokenLimit: number; requestsToday: number; usageDay: string | null;
 };
 
 export const API_KEY_PREFIX = "ck";
@@ -47,23 +49,38 @@ function toRow(value: any): ApiKeyRow | null {
     createdAt: String(value.createdAt), lastUsedAt: value.lastUsedAt ?? null,
     revokedAt: value.revokedAt ?? null, requestCount: Number(value.requestCount ?? 0),
     lastIp: value.lastIp ?? null,
+    dailyRequestLimit: Number(value.dailyRequestLimit ?? 0), dailyTokenLimit: Number(value.dailyTokenLimit ?? 0),
+    requestsToday: Number(value.requestsToday ?? 0), usageDay: value.usageDay ?? null,
   };
 }
 
-const SELECT = "SELECT id, workspace_id AS workspaceId, user_id AS userId, name, prefix, scopes, created_at AS createdAt, last_used_at AS lastUsedAt, revoked_at AS revokedAt, request_count AS requestCount, last_ip AS lastIp FROM api_keys";
+const SELECT = `SELECT id, workspace_id AS workspaceId, user_id AS userId, name, prefix, scopes,
+  created_at AS createdAt, last_used_at AS lastUsedAt, revoked_at AS revokedAt, request_count AS requestCount, last_ip AS lastIp,
+  daily_request_limit AS dailyRequestLimit, daily_token_limit AS dailyTokenLimit, requests_today AS requestsToday, usage_day AS usageDay
+  FROM api_keys`;
 
 export function countActiveApiKeys(userId: string): number {
   const row = db.prepare("SELECT COUNT(*) AS total FROM api_keys WHERE user_id=? AND revoked_at IS NULL").get(userId) as { total: number };
   return row.total;
 }
 
-export function createApiKey(input: { userId: string; workspaceId: string | null; name: string; scopes: ApiScope[] | string }): { key: ApiKeyRow; raw: string } {
+/** A ceiling of 0 means "no key specific ceiling": the account tier limit still applies. */
+export function cleanLimit(value: unknown, fallback = 0): number {
+  if (value === undefined || value === null || value === "") return fallback;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return fallback;
+  return Math.min(Math.round(number), 1_000_000_000);
+}
+
+export function createApiKey(input: { userId: string; workspaceId: string | null; name: string; scopes: ApiScope[] | string; dailyRequestLimit?: unknown; dailyTokenLimit?: unknown }): { key: ApiKeyRow; raw: string } {
   const generated = generateApiKey();
   const id = randomUUID();
   const createdAt = new Date().toISOString();
   const scopes = scopesToString(Array.isArray(input.scopes) ? input.scopes : parseScopes(input.scopes));
-  db.prepare("INSERT INTO api_keys (id,workspace_id,user_id,name,prefix,key_hash,scopes,created_at,request_count) VALUES (?,?,?,?,?,?,?,?,0)")
-    .run(id, input.workspaceId ?? null, input.userId, input.name, generated.prefix, generated.hash, scopes, createdAt);
+  const dailyRequestLimit = cleanLimit(input.dailyRequestLimit ?? config.API_KEY_DAILY_REQUESTS_DEFAULT);
+  const dailyTokenLimit = cleanLimit(input.dailyTokenLimit ?? config.API_KEY_DAILY_TOKENS_DEFAULT);
+  db.prepare("INSERT INTO api_keys (id,workspace_id,user_id,name,prefix,key_hash,scopes,created_at,request_count,daily_request_limit,daily_token_limit,requests_today,usage_day) VALUES (?,?,?,?,?,?,?,?,0,?,?,0,?)")
+    .run(id, input.workspaceId ?? null, input.userId, input.name, generated.prefix, generated.hash, scopes, createdAt, dailyRequestLimit, dailyTokenLimit, todayKey());
   const key = toRow(db.prepare(`${SELECT} WHERE id=?`).get(id));
   return { key: key as ApiKeyRow, raw: generated.raw };
 }
@@ -79,12 +96,15 @@ export function getApiKey(userId: string, keyId: string): ApiKeyRow | null {
   return toRow(db.prepare(`${SELECT} WHERE id=? AND user_id=?`).get(keyId, userId));
 }
 
-export function updateApiKey(userId: string, keyId: string, patch: { name?: unknown; scopes?: unknown }): ApiKeyRow | null {
+export function updateApiKey(userId: string, keyId: string, patch: { name?: unknown; scopes?: unknown; dailyRequestLimit?: unknown; dailyTokenLimit?: unknown }): ApiKeyRow | null {
   const current = getApiKey(userId, keyId);
   if (!current) return null;
   const name = typeof patch.name === "string" ? patch.name.trim() : current.name;
   const scopes = patch.scopes === undefined ? current.scopes : scopesToString(Array.isArray(patch.scopes) ? (patch.scopes as ApiScope[]) : parseScopes(patch.scopes));
-  db.prepare("UPDATE api_keys SET name=?, scopes=? WHERE id=? AND user_id=?").run(name, scopes, keyId, userId);
+  const dailyRequestLimit = patch.dailyRequestLimit === undefined ? current.dailyRequestLimit : cleanLimit(patch.dailyRequestLimit, current.dailyRequestLimit);
+  const dailyTokenLimit = patch.dailyTokenLimit === undefined ? current.dailyTokenLimit : cleanLimit(patch.dailyTokenLimit, current.dailyTokenLimit);
+  db.prepare("UPDATE api_keys SET name=?, scopes=?, daily_request_limit=?, daily_token_limit=? WHERE id=? AND user_id=?")
+    .run(name, scopes, dailyRequestLimit, dailyTokenLimit, keyId, userId);
   return getApiKey(userId, keyId);
 }
 
@@ -121,6 +141,49 @@ export function touchApiKey(keyId: string, ip?: string | null): void {
   db.prepare("UPDATE api_keys SET last_used_at=?, request_count=request_count+1, last_ip=? WHERE id=?").run(new Date().toISOString(), ip ?? null, keyId);
 }
 
+/** The day key used for the per-key ceilings. UTC keeps it stable whatever the server clock zone is. */
+export function todayKey(at: Date = new Date()): string { return at.toISOString().slice(0, 10); }
+
+/** Restarts the per-key daily counter when the day changed, and returns the fresh number. */
+export function refreshApiKeyDay(row: ApiKeyRow): number {
+  const today = todayKey();
+  if (row.usageDay === today) return row.requestsToday;
+  db.prepare("UPDATE api_keys SET requests_today=0, usage_day=? WHERE id=?").run(today, row.id);
+  return 0;
+}
+
+/** Counts one request against the key. Called after the request itself was accepted. */
+export function countApiKeyRequest(keyId: string): void {
+  const today = todayKey();
+  db.prepare("UPDATE api_keys SET requests_today = CASE WHEN usage_day=? THEN requests_today+1 ELSE 1 END, usage_day=? WHERE id=?").run(today, today, keyId);
+}
+
+/** Tokens spent today by the public API calls that used this key. */
+export function apiKeyTokensToday(keyId: string): number {
+  const row = db.prepare(`SELECT COALESCE(SUM(u.total_tokens),0) AS tokens FROM run_usage u
+      JOIN runs r ON r.id=u.run_id WHERE r.api_key_id=? AND substr(u.created_at,1,10)=?`).get(keyId, todayKey()) as { tokens: number };
+  return Number(row?.tokens ?? 0);
+}
+
+/**
+ * Checks the daily ceilings of one key before the work is done. Returns null when the call may go on.
+ * The account tier limit is checked separately by the caller, so an owner ceiling can never be bypassed
+ * by handing out a key with a high per-key ceiling.
+ */
+export function checkApiKeyDailyQuota(row: ApiKeyRow): { status: number; error: string; detail: Record<string, unknown> } | null {
+  const usedRequests = refreshApiKeyDay(row);
+  if (row.dailyRequestLimit > 0 && usedRequests >= row.dailyRequestLimit) {
+    return { status: 429, error: "API_KEY_DAILY_REQUEST_LIMIT", detail: { limit: row.dailyRequestLimit, used: usedRequests, message: `Kunci ini sudah memakai ${usedRequests} dari ${row.dailyRequestLimit} permintaan hari ini.` } };
+  }
+  if (row.dailyTokenLimit > 0) {
+    const usedTokens = apiKeyTokensToday(row.id);
+    if (usedTokens >= row.dailyTokenLimit) {
+      return { status: 429, error: "API_KEY_DAILY_TOKEN_LIMIT", detail: { limit: row.dailyTokenLimit, used: usedTokens, message: `Kunci ini sudah memakai ${usedTokens} dari ${row.dailyTokenLimit} token hari ini.` } };
+    }
+  }
+  return null;
+}
+
 /** Simple in-memory limiter per key. It protects the engine from a runaway script; a restart clears it. */
 const hits = new Map<string, number[]>();
 export function checkApiKeyRate(keyId: string): { allowed: boolean; limit: number; used: number } {
@@ -134,6 +197,20 @@ export function checkApiKeyRate(keyId: string): { allowed: boolean; limit: numbe
   return { allowed, limit, used: window.length };
 }
 
+/**
+ * Wave 6: limits a caller can expect. Read from config so the docs and the guard never disagree.
+ *
+ * `maxActive` dipertahankan karena sudah dipakai halaman Kunci API dan suite Wave 4; `maxKeys` adalah
+ * nama barunya. Keduanya memuat angka yang sama supaya tidak ada dua kebenaran.
+ */
+export const PUBLIC_API_LIMITS = () => ({
+  maxActive: MAX_API_KEYS_PER_USER,
+  maxKeys: MAX_API_KEYS_PER_USER,
+  rateLimitPerMinute: config.API_KEY_RATE_LIMIT_PER_MINUTE,
+  dailyRequestsDefault: config.API_KEY_DAILY_REQUESTS_DEFAULT,
+  dailyTokensDefault: config.API_KEY_DAILY_TOKENS_DEFAULT,
+});
+
 /** Documents the public API surface. Kept next to the keys so both stay in step. */
 export const PUBLIC_API_ENDPOINTS: { method: string; path: string; scope: ApiScope; description: string; available: boolean }[] = [
   { method: "GET", path: "/api/v1/public/v1/me", scope: "read", description: "Pemilik kunci dan workspace yang terikat.", available: true },
@@ -143,8 +220,7 @@ export const PUBLIC_API_ENDPOINTS: { method: string; path: string; scope: ApiSco
   { method: "GET", path: "/api/v1/public/v1/conversations/:conversationId/messages", scope: "read", description: "Pesan dalam satu percakapan.", available: true },
   { method: "GET", path: "/api/v1/public/v1/projects/:projectId/usage", scope: "read", description: "Ringkasan token dan biaya proyek.", available: true },
   { method: "GET", path: "/api/v1/public/v1/projects/:projectId/artifacts", scope: "read", description: "Metadata artefak (tanpa isi berkas).", available: true },
-  // The write pair is listed so the plan is visible, but it is NOT served yet. `available: false`
-  // keeps the documentation honest instead of promising a route that answers 404.
-  { method: "POST", path: "/api/v1/public/v1/conversations/:conversationId/messages", scope: "write", description: "Kirim pesan dan jalankan mesin AI.", available: false },
-  { method: "POST", path: "/api/v1/public/v1/projects/:projectId/conversations", scope: "write", description: "Buat percakapan baru.", available: false },
+  // Wave 6: the write pair is served now, so `available` is true and the documentation may promise it.
+  { method: "POST", path: "/api/v1/public/v1/projects/:projectId/conversations", scope: "write", description: "Buat percakapan baru.", available: true },
+  { method: "POST", path: "/api/v1/public/v1/conversations/:conversationId/messages", scope: "write", description: "Kirim pesan dan jalankan mesin AI. Jawaban menyusul lewat rute pesan.", available: true },
 ];
