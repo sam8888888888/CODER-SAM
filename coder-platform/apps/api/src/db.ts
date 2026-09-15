@@ -389,6 +389,16 @@ CREATE TABLE IF NOT EXISTS data_exports (
  created_at TEXT NOT NULL, expires_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_data_exports_user ON data_exports(user_id, created_at DESC);
+/* Wave 5: durable background work. One row per job, with a lease so a dead process cannot keep it. */
+CREATE TABLE IF NOT EXISTS jobs (
+ id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','done','failed')),
+ payload TEXT NOT NULL DEFAULT '{}', result TEXT, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 3,
+ run_after TEXT NOT NULL, lock_owner TEXT, lock_expires_at TEXT, last_error TEXT, dedupe_key TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(status, run_after ASC);
+CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key) WHERE dedupe_key IS NOT NULL;
 `);
 /** Wave 3 columns: an engine session can rotate (compaction), and a conversation can hold a persona. */
 try { db.exec("ALTER TABLE conversations ADD COLUMN engine_session_id TEXT"); } catch {}
@@ -403,8 +413,8 @@ try { db.exec("ALTER TABLE runs ADD COLUMN append_system_chars INTEGER"); } catc
 try { db.exec("ALTER TABLE users ADD COLUMN default_persona_id TEXT"); } catch {}
 
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 12;
-export const SCHEMA_VERSION_NOTE = "API keys, email outbox and notification preferences, personal data exports, on top of the agent workspace tables";
+const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION_NOTE = "Durable background job queue with leases, on top of the API key, email outbox, export and agent workspace tables";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

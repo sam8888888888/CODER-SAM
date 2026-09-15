@@ -23,10 +23,14 @@ import {
   createApiKey, getApiKey, hasScope, listApiKeys, parseScopes, revokeApiKey, touchApiKey, updateApiKey, type ApiScope,
 } from "./apikeys.js";
 import {
-  EMAIL_WORKER_INTERVAL_MS, deleteOutboxRow, deliverPending, emailEnabled, emailWorkerState, getOutboxRow,
+  deleteOutboxRow, deliverPending, emailEnabled, emailWorkerState, getOutboxRow,
   listOutbox, notificationPrefs, outboxStats, queueEmail, renderEmail, retryEmail, saveNotificationPrefs, type EmailKind,
 } from "./outbox.js";
-import { RETENTION_JOB_INTERVAL_MS, retentionPolicy, retentionReport, runRetention } from "./retention.js";
+import { retentionPolicy, retentionReport, runRetention } from "./retention.js";
+import {
+  enqueueJob, getJob, jobStats, jobWorkerState, listJobs, reapAbandonedExecutions, reapAbandonedRuns,
+  recoverExpiredLeases, registerJobHandler, retryJob, runJobCycleOnce, startJobWorker, type JobRow,
+} from "./jobs.js";
 import { collectUserData, createExport, deleteExport, expireExports, exportFilePath, getExport, listExports } from "./dataexport.js";
 import { describeCron, nextCronRun, validateCronExpression } from "./cron.js";
 import {
@@ -744,7 +748,8 @@ app.post<{ Params: { conversationId: string }; Body: { fromMessageId?: string; t
     if (quotaBlock) return reply.code(201).send({ conversation: { id: newId, projectId: source.projectId, title, createdAt: now }, run: null, warning: quotaBlock.error });
     runId = randomUUID();
     db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(runId, source.projectId, "queued", lastUser.content, model ?? config.PRIME_AGENT_MODEL, now);
-    void executeRun(runId, source.projectId, lastUser.content, newId, undefined, model, request.user!.id);
+    queueRunJob({ runId, projectId: source.projectId, prompt: lastUser.content, conversationId: newId, model, userId: request.user!.id });
+  void executeRun(runId, source.projectId, lastUser.content, newId, undefined, model, request.user!.id);
   }
   return reply.code(201).send({ conversation: { id: newId, projectId: source.projectId, title, createdAt: now }, run: runId ? { id: runId, status: "queued" } : null });
 });
@@ -784,6 +789,36 @@ type KnowledgeContext = { text: string; hits: { documentId: string; title: strin
 function withKnowledge(prompt: string, knowledge?: KnowledgeContext) {
   if (!knowledge?.text) return prompt;
   return `Gunakan konteks pengetahuan proyek berikut bila relevan. Rujuk sumbernya dengan penanda [1], [2].\n\n${knowledge.text}\n\n---\n\nPertanyaan pengguna:\n${prompt}`;
+}
+
+/** Builds the knowledge block for a prompt. Both the route and the queue worker use this. */
+function knowledgeFor(projectId: string, prompt: string): KnowledgeContext | undefined {
+  const retrieved = buildKnowledgeContext(projectId, prompt);
+  if (!retrieved.hits.length) return undefined;
+  return { text: retrieved.text, hits: retrieved.hits.map((hit) => ({ documentId: hit.documentId, title: hit.title, chunkIndex: hit.chunkIndex })) };
+}
+
+/**
+ * Wave 5: records a run in the durable queue right after it is stored. The queue entry is the safety
+ * net: the route still dispatches the engine call straight away, and the entry only acts when that
+ * dispatch never happened (for example the container stopped right after the HTTP reply).
+ * `maxAttempts` is 1 on purpose: repeating a run that already reached the engine would spend tokens twice.
+ */
+function queueRunJob(input: {
+  runId: string; projectId: string; prompt: string; conversationId?: string; model?: string; userId: string;
+  thinking?: string; personaId?: string | null; autonomous?: boolean;
+}) {
+  return enqueueJob({
+    kind: "run.execute",
+    payload: {
+      runId: input.runId, projectId: input.projectId, prompt: input.prompt, conversationId: input.conversationId,
+      model: input.model, userId: input.userId, thinking: input.thinking, personaId: input.personaId ?? null,
+      autonomous: Boolean(input.autonomous),
+    },
+    maxAttempts: 1,
+    runAfter: new Date(Date.now() + 10_000),
+    dedupeKey: `run.execute:${input.runId}`,
+  });
 }
 
 /**
@@ -969,8 +1004,7 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
   const attachmentBlock = prepared.filter((file) => file.text).map((file) => `Lampiran ${file.name}:
 ${file.text}`).join("\n\n");
   const prompt = attachmentBlock ? `${content}\n\n---\n${attachmentBlock}` : content;
-  const retrieved = buildKnowledgeContext(conversation.projectId, content);
-  const knowledge: KnowledgeContext | undefined = retrieved.hits.length ? { text: retrieved.text, hits: retrieved.hits.map((hit) => ({ documentId: hit.documentId, title: hit.title, chunkIndex: hit.chunkIndex })) } : undefined;
+  const knowledge = knowledgeFor(conversation.projectId, content);
   const transaction = db.transaction(() => {
     db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(runId, conversation.projectId, "queued", prompt, model ?? config.PRIME_AGENT_MODEL, now);
     db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(messageId, conversation.id, "user", content, runId, now);
@@ -980,6 +1014,9 @@ ${file.text}`).join("\n\n");
     }
     db.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversation.id);
   }); transaction();
+  // Wave 5: the same run is also an entry in the durable queue. If the process dies before or during
+  // the engine call, the next process picks the entry up and either dispatches the run or reports it.
+  queueRunJob({ runId, projectId: conversation.projectId, prompt, conversationId: conversation.id, model, userId: request.user!.id, thinking, personaId, autonomous });
   // Auto-compaction runs before the engine call, so a long conversation sends a summary instead of
   // the whole history. The run waits for it, while the HTTP reply returns straight away.
   const settings = agentSettings(request.user!.id);
@@ -1049,6 +1086,7 @@ app.post<{ Params: { projectId: string }; Body: { prompt?: string; model?: strin
   if (quotaBlock) return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
   const id = randomUUID(); const createdAt = new Date().toISOString();
   db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(id, project.id, "queued", prompt, model ?? config.PRIME_AGENT_MODEL, createdAt);
+  queueRunJob({ runId: id, projectId: project.id, prompt, model, userId: request.user!.id });
   void executeRun(id, project.id, prompt, undefined, undefined, model, request.user!.id);
   return reply.code(202).send({ id, projectId: project.id, status: "queued", prompt, model: model ?? config.PRIME_AGENT_MODEL ?? null, createdAt });
 });
@@ -2610,6 +2648,15 @@ app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) 
       emailWorker: emailWorkerState(),
       retention: retentionPolicy(),
       readyExports: Number((db.prepare("SELECT COUNT(*) AS n FROM data_exports WHERE status='ready'").get() as { n: number }).n),
+      emailEnabled: emailEnabled(),
+    },
+    /** Wave 5: the durable queue. These numbers say whether background work is keeping up. */
+    backgroundWork: {
+      queue: jobStats(),
+      worker: jobWorkerState(),
+      reapOnBoot: config.JOB_REAP_ON_BOOT,
+      leaseMs: config.JOB_LEASE_MS,
+      orphanAfterMs: config.JOB_ORPHAN_AFTER_MS,
     },
     storage: { data: await dirStats(config.DATA_DIR), engineSessions: await dirStats(config.ENGINE_ROOT_DIR) },
     lastRuns,
@@ -3024,6 +3071,41 @@ app.put("/api/v1/account/notification-preferences", { preHandler: requireUser },
   return { preferences, message: "Preferensi email disimpan." };
 });
 
+// ---------------------------------------------------------------- admin: background jobs (Wave 5)
+
+/** Queue health for the admin console: what is waiting, what failed, and what the worker is doing. */
+app.get("/api/v1/admin/jobs", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat antrean pekerjaan." });
+  const status = typeof request.query?.status === "string" ? request.query.status : undefined;
+  const kind = typeof request.query?.kind === "string" ? request.query.kind : undefined;
+  const limit = Number(request.query?.limit ?? 50);
+  return {
+    worker: jobWorkerState(),
+    stats: jobStats(),
+    jobs: listJobs({ status, kind, limit }),
+    kinds: ["run.execute", "email.deliver", "retention.run", "run.reap", "workflow.reap"],
+  };
+});
+
+/** Puts a finished or failed job back in the queue. A job that is still pending is refused. */
+app.post<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId/retry", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengulang pekerjaan." });
+  const job = getJob(request.params.jobId);
+  if (!job) return reply.code(404).send({ error: "JOB_NOT_FOUND", message: "Pekerjaan itu tidak ada di antrean." });
+  const result = retryJob(job.id);
+  if (!result.ok) return reply.code(409).send({ error: result.reason, message: "Pekerjaan masih menunggu atau sedang dikerjakan." });
+  recordAudit(accountAuditWorkspace(request.user!.id), request.user!.id, "admin.job.retried", { jobId: job.id, kind: job.kind, previousStatus: job.status });
+  return { retried: true, job: getJob(job.id) };
+});
+
+/** One queue cycle on demand. Useful right after a deploy, and used by the test suite. */
+app.post("/api/v1/admin/jobs/tick", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh menjalankan antrean." });
+  const cycle = await runJobCycleOnce({ owner: `admin-${request.user!.id}`, limit: 5 });
+  recordAudit(accountAuditWorkspace(request.user!.id), request.user!.id, "admin.job.cycle", { claimed: cycle.claimed, succeeded: cycle.succeeded, failed: cycle.failed });
+  return { cycle, stats: jobStats(), worker: jobWorkerState() };
+});
+
 // ---------------------------------------------------------------- admin: email outbox and retention (Wave 4)
 
 app.get("/api/v1/admin/email-outbox", { preHandler: requireUser }, async (request: any, reply) => {
@@ -3114,30 +3196,95 @@ app.setNotFoundHandler(async (request, reply) => {
 mkdirSync(config.DATA_DIR, { recursive: true });
 startWorkflowScheduler();
 
-/** Wave 4: sends queued email every minute. It stays idle while NOTIFY_EMAIL_ENABLED is false. */
-function startEmailWorker() {
-  const timer = setInterval(() => {
-    try { if (config.NOTIFY_EMAIL_ENABLED) void deliverPending(20).catch(() => undefined); } catch { /* the worker never takes the API down */ }
-  }, EMAIL_WORKER_INTERVAL_MS);
-  timer.unref?.();
-  return timer;
+/* ---------------- Wave 5: pekerjaan latar yang tahan restart ---------------- */
+
+/** Finds the workspace of a project, so background repairs can be written to the audit log. */
+function projectAuditWorkspace(projectId: string): string | null {
+  const row = db.prepare("SELECT workspace_id FROM projects WHERE id=?").get(projectId) as { workspace_id?: string } | undefined;
+  return row?.workspace_id ?? null;
 }
 
-/** Wave 4: retention pass every six hours. It reports only until RETENTION_ENABLED=true. */
-function startRetentionWorker() {
-  const timer = setInterval(() => {
-    try {
-      const result = runRetention();
-      void expireExports().catch(() => undefined);
-      if (!result.dryRun && result.totalRemoved > 0) console.log(`[retention] removed ${result.totalRemoved} rows`);
-    } catch { /* a failed pass is retried on the next tick */ }
-  }, RETENTION_JOB_INTERVAL_MS);
-  timer.unref?.();
-  return timer;
+/**
+ * Wave 4 used two in-process timers (email every minute, retention every six hours). Both are replaced
+ * by the durable queue: each pass is a row in `jobs`, so a restart does not lose the pass and two
+ * processes cannot run the same pass at once.
+ */
+function registerBackgroundHandlers() {
+  // The safety net for a run whose dispatch never happened because the process stopped.
+  registerJobHandler("run.execute", async (payload: any) => {
+    const runId = String(payload?.runId ?? "");
+    const row = db.prepare("SELECT status FROM runs WHERE id=?").get(runId) as { status?: string } | undefined;
+    if (!row) return { skipped: "RUN_NOT_FOUND" };
+    if (row.status !== "queued") return { skipped: `RUN_${String(row.status).toUpperCase()}` };
+    const knowledge = knowledgeFor(String(payload.projectId), String(payload.prompt));
+    void executeRun(runId, String(payload.projectId), String(payload.prompt), payload.conversationId ?? undefined, knowledge,
+      payload.model ?? undefined, String(payload.userId), {
+        thinking: payload.thinking ?? undefined, personaId: payload.personaId ?? null, autonomous: Boolean(payload.autonomous),
+      });
+    return { dispatched: true };
+  });
+
+  registerJobHandler("email.deliver", async () => {
+    const report = await deliverPending(20);
+    return { enabled: report.enabled, sent: report.sent, failed: report.failed, skipped: report.skipped, pending: report.pending };
+  });
+
+  registerJobHandler("retention.run", async () => {
+    const result = runRetention();
+    await expireExports().catch(() => undefined);
+    if (!result.dryRun && result.totalRemoved > 0) console.log(`[retention] removed ${result.totalRemoved} rows`);
+    return { dryRun: result.dryRun, totalRemoved: result.totalRemoved, reason: result.reason ?? null };
+  });
+
+  // Repairs abandoned runs. Nothing is touched while it is still inside the lease window.
+  registerJobHandler("run.reap", async () => {
+    const report = reapAbandonedRuns();
+    for (const run of report.runs) {
+      recordAudit(projectAuditWorkspace(run.projectId), null, "run.reaped", { runId: run.id, reason: "WORKER_LOST", startedAt: run.startedAt });
+    }
+    return { marked: report.marked };
+  });
+
+  registerJobHandler("workflow.reap", async () => {
+    const report = reapAbandonedExecutions();
+    for (const execution of report.executions) {
+      recordAudit(projectAuditWorkspace(projectIdOfExecution(execution.id)), null, "workflow.execution.reaped", { executionId: execution.id, reason: "WORKER_LOST" });
+    }
+    return { marked: report.marked };
+  });
 }
 
-startEmailWorker();
-startRetentionWorker();
+/** A workflow execution stores its project, which is used for the audit entry of a repair. */
+function projectIdOfExecution(executionId: string): string {
+  const row = db.prepare("SELECT project_id FROM workflow_executions WHERE id=?").get(executionId) as { project_id?: string } | undefined;
+  return row?.project_id ?? "";
+}
+
+/**
+ * Starts the queue worker. At start-up this process owns no work yet, so a run still marked running (or
+ * a workflow execution still marked running) was left behind by the previous process. Single-process
+ * deployments repair those rows at once; set JOB_REAP_ON_BOOT=false if the API ever runs in more than
+ * one process at a time.
+ */
+function startBackgroundWork() {
+  registerBackgroundHandlers();
+  const recovered = recoverExpiredLeases();
+  let boot = { runs: 0, executions: 0 };
+  if (config.JOB_REAP_ON_BOOT) {
+    const runs = reapAbandonedRuns(new Date(), config.JOB_REAP_BOOT_MIN_AGE_MS);
+    const executions = reapAbandonedExecutions(new Date(), config.JOB_REAP_BOOT_MIN_AGE_MS);
+    for (const run of runs.runs) recordAudit(projectAuditWorkspace(run.projectId), null, "run.reaped", { runId: run.id, reason: "WORKER_LOST_ON_BOOT", startedAt: run.startedAt });
+    for (const execution of executions.executions) {
+      recordAudit(projectAuditWorkspace(projectIdOfExecution(execution.id)), null, "workflow.execution.reaped", { executionId: execution.id, reason: "WORKER_LOST_ON_BOOT" });
+    }
+    boot = { runs: runs.marked, executions: executions.marked };
+  }
+  startJobWorker();
+  void runJobCycleOnce({ owner: `boot-${process.pid}` }).catch(() => undefined);
+  console.log(`[jobs] worker aktif (setiap ${config.JOB_WORKER_INTERVAL_MS} ms): sewa-dipulihkan=${recovered} run-ditinggalkan=${boot.runs} eksekusi-ditinggalkan=${boot.executions}`);
+}
+
+startBackgroundWork();
 ensureCommerceSeed();
 await app.listen({ host: config.HOST, port: config.PORT });
 

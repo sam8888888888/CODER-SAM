@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 15 Sep 2026 (versi 0.14.1)
+Terakhir diperbarui: 15 Sep 2026 (versi 0.15.0)
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel
@@ -8,12 +8,57 @@ di `apps/api/src/db.ts`, halaman di `coder-dashboard/src/nav.ts`, dan suite di `
 Bila ragu, tulis "belum diverifikasi".
 
 Catatan snapshot: berkas ini diperiksa saat repo sedang diedit, jadi beberapa perubahan belum di-commit
-(Wave 4: `server.ts`, `db.ts`, `config.ts`, 4 modul baru `apikeys.ts`/`outbox.ts`/`retention.ts`/`dataexport.ts`,
-`api.ts`, `nav.ts`, `App.tsx`, dan 4 halaman baru).
-Jumlah rute `server.ts` saat diperiksa: 168 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2
+(Wave 5: `server.ts`, `config.ts`, `jobs.ts` baru, `db.ts`, `api.ts`, `nav.ts`, `App.tsx`, `AdminJobs.tsx` baru).
+Jumlah rute `server.ts` saat diperiksa: 171 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2
 untuk lampiran, cabang dan hapus massal; 25 rute Wave 3 untuk ruang kerja agen; 28 rute Wave 4 untuk kunci API,
-API publik, antrean email, ekspor data, retensi, dan harga publik).
+API publik, antrean email, ekspor data, retensi, dan harga publik; 3 rute Wave 5 untuk melihat antrean pekerjaan,
+mengulang pekerjaan, dan memaksa satu putaran).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
+
+## Wave 5 (v0.15.0) — ketahanan & operasi
+
+Tema: pekerjaan latar tidak boleh hilang ketika container dimatikan. Versi sebelumnya memakai `setInterval`
+di dalam proses API, sehingga pekerjaan yang sedang berjalan lenyap tanpa jejak saat restart.
+
+- Modul baru `apps/api/src/jobs.ts`: antrean pekerjaan persisten di tabel `jobs` (schema 13). Setiap pekerjaan
+  ditulis ke basis data sebelum dikerjakan, jadi restart tidak menghapus pekerjaan.
+- Sewa (lease): pekerjaan yang diambil satu worker diberi `lock_owner` dan `lock_expires_at`. Worker lain tidak
+  boleh mengambilnya selagi sewa masih berlaku. Sewa yang kedaluwarsa dikembalikan ke antrean (`WORKER_LOST`),
+  jadi pekerjaan yang ditinggal proses mati tetap selesai pada proses berikutnya.
+- Percobaan ulang: `attempts` dinaikkan saat pekerjaan DIAMBIL, bukan saat selesai. Kegagalan mengembalikan
+  pekerjaan ke antrean dengan jeda `5 detik x attempts` sampai `max_attempts`, lalu berakhir `failed` dengan
+  `last_error` yang bisa dibaca manusia.
+- Kunci dedupe unik (`dedupe_key`) mencegah pekerjaan kembar, misalnya dua permintaan bersamaan untuk run yang sama.
+- Jenis pekerjaan bawaan: `run.execute`, `email.deliver`, `retention.run`, `run.reap`, `workflow.reap`.
+  Tiga yang terakhir dijadwalkan ulang otomatis oleh antrean, jadi tidak ada lagi timer in-memory untuk email
+  dan retensi (`startEmailWorker()` dan `startRetentionWorker()` dihapus).
+- Perbaikan otomatis sesudah restart: pemeriksa menandai run dan eksekusi workflow yang berstatus `running`
+  lebih lama dari `JOB_ORPHAN_AFTER_MS` (bawaan 45 menit, harus lebih panjang dari `ENGINE_TIMEOUT_MS` 30 menit)
+  menjadi `failed` dengan `error_code='WORKER_LOST'`. Tanpa ini, run yang ditinggal proses mati akan
+  menggantung "berjalan" selamanya.
+- Jaring pengaman `run.execute`: rute tetap menjalankan run langsung supaya latensi tidak berubah, tetapi
+  pekerjaan `run.execute` juga ditulis ke antrean dengan `max_attempts=1`. Bila proses mati sebelum atau
+  sesudah balasan HTTP, pekerjaan itu diambil nanti dan hanya dijalankan bila run masih `queued`, sehingga
+  run tidak dikerjakan dua kali.
+- Rute admin: `GET /api/v1/admin/jobs` (statistik, daftar, saringan `status`/`kind`), `POST /api/v1/admin/jobs/:jobId/retry`
+  (`404 JOB_NOT_FOUND`, `409 JOB_ALREADY_PENDING`), `POST /api/v1/admin/jobs/tick` (satu putaran paksa, dicatat
+  ke audit sebagai `admin.job.cycle`). Semuanya di balik gerbang admin platform (`403 ADMIN_REQUIRED`).
+- Halaman dashboard "Antrean pekerjaan" (`coder-dashboard/src/AdminJobs.tsx`) menampilkan ringkasan, keadaan
+  worker, saringan, tabel pekerjaan, dan tombol ulangi.
+- Env baru: `JOB_WORKER_INTERVAL_MS` (15000), `JOB_LEASE_MS` (1800000), `JOB_BATCH_SIZE` (10, maksimum 200),
+  `JOB_ORPHAN_AFTER_MS` (2700000), `JOB_REAP_ON_BOOT` (true), `JOB_REAP_BOOT_MIN_AGE_MS` (60000).
+- `GET /api/v1/status-hub` menambah blok `backgroundWork` (antrean, keadaan worker, `leaseMs`, `orphanAfterMs`).
+
+Keterbatasan jujur Wave 5 (belum ada, jangan diklaim ada):
+- Antrean masih satu proses: sewa mencegah dua worker mengambil pekerjaan yang sama, tetapi belum ada
+  pembagian beban antar container dan belum ada Redis/broker.
+- Pemeriksa pekerjaan menggantung memakai umur `started_at`. Bila sebuah run sah berjalan lebih lama dari
+  `JOB_ORPHAN_AFTER_MS`, run itu akan ditandai gagal walaupun prosesnya sehat. Batas bawaan 45 menit
+  dipilih supaya tetap di atas batas mesin 30 menit, jadi kejadian ini hanya mungkin bila batas mesin dinaikkan
+  tanpa menaikkan `JOB_ORPHAN_AFTER_MS`.
+- Jaring pengaman `run.execute` hanya menolong bila baris run masih ada di basis data. Bila transaksi
+  pembuatan run benar-benar gagal, tidak ada yang bisa dipulihkan.
+- Belum ada metrik Prometheus khusus antrean; keadaan antrean hanya terlihat lewat rute admin dan status hub.
 
 ## Wave 4 (v0.14.0) — platform terbuka & kepatuhan
 
@@ -344,9 +389,9 @@ Sudah ada sekarang (dulu tertulis "belum dibuat"):
 Masih benar-benar belum ada:
 - OAuth/SSO (Google, GitHub, SAML).
 - Notifikasi push (browser/HP). Notifikasi email ada, tetapi masih dimatikan.
-- Worker/queue persisten dan Redis: penjadwal workflow, worker email, dan worker retensi semuanya
-  `setInterval` di dalam proses API. Kalau container dimatikan, jadwal yang sedang berjalan hilang dan
-  tidak ada percobaan ulang lintas restart.
+- Redis atau broker pesan luar: antrean pekerjaan sekarang PERSISTEN (tabel `jobs`, schema 13, dengan sewa
+  dan percobaan ulang lintas restart), tetapi masih memakai basis data yang sama dengan aplikasi dan belum
+  ada broker terpisah. Antrean tetap satu proses: satu worker per container.
 - Penskalaan horizontal: satu container, satu berkas SQLite, sesi di memori proses API.
 - Object storage: artefak dan berkas ekspor disimpan di disk container.
 - Pencarian pengetahuan berbasis vektor/embedding (sekarang FTS5 `bm25`), dan unggah dari URL.
@@ -375,6 +420,12 @@ Bukan wave baru, hanya penutupan celah yang ditemukan saat Wave 4 diuji.
   database diterima saat restore dan baru gagal ketika aplikasi membukanya. Restore juga menimpa
   database tujuan tanpa bertanya, jadi jalur pemulihan harus tetap manual dan disengaja.
 - `npm run verify` menjalankan seluruh suite sekaligus (24/24 hijau per 15 Sep 2026).
+- Suite baru `apps/api/test/jobs.e2e.ts` (Wave 5) — 51 pemeriksaan, semua lulus: sewa dan pengambilalihan
+  setelah proses mati, jeda percobaan ulang dan batas percobaan, kunci dedupe, larangan pengambilan ganda,
+  run yang tersimpan tetapi belum dikirim akhirnya dijalankan, run yang sudah selesai TIDAK dijalankan ulang,
+  pemeriksa `WORKER_LOST` untuk run dan eksekusi workflow, serta rute admin (403 untuk non-admin).
+  **Catatan jujur**: berkas uji tidak diperiksa tipe oleh `tsc`, karena `apps/api/tsconfig.json` hanya
+  memuat `src/**/*.ts`; berkas uji dijalankan dengan `tsx` yang membuang tipe.
 
 ## Penghambat eksternal
 
@@ -402,7 +453,7 @@ Cek tipe (tanpa keluaran berarti lulus; saya jalankan 13 Sep 2026):
 Suite end-to-end lokal tanpa jaringan:
 
 - `cd coder-platform && MOCK_ENGINE=true npx tsx apps/api/test/<suite>.e2e.ts`
-- Cara tercepat sekarang: `cd coder-platform && npm run verify` (24 suite, mencetak `ALL_SUITES_PASSED`).
+- Cara tercepat sekarang: `cd coder-platform && npm run verify` (25 suite, mencetak `ALL_SUITES_PASSED`).
 - 21 suite (20 suite lama lulus 14 Sep 2026 sebelum Wave 2 dengan `RUNNER_EXIT=0`; `wave2` lulus
   104/104 pemeriksaan): `account-recovery`, `account-security`, `admin-metrics`, `billing`, `csrf-limits`,
   `delete-flow`, `guards`, `knowledge-team`, `login-identity`, `mailer`, `model-rbac`, `project-runs`,

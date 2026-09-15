@@ -51,6 +51,19 @@ const Env = z.object({
   RETENTION_NOTIFICATION_DAYS: z.coerce.number().int().min(1).default(90),
   RETENTION_RUN_EVENT_DAYS: z.coerce.number().int().min(1).default(30),
   RETENTION_EXPORT_DAYS: z.coerce.number().int().min(1).default(7),
+  // Wave 5: background work runs from a durable queue in the database, so a restart never loses a job.
+  // The lease is how long a worker may hold a job before another worker may take it over.
+  JOB_WORKER_INTERVAL_MS: z.coerce.number().int().min(1000).default(15000),
+  JOB_LEASE_MS: z.coerce.number().int().min(10000).default(1800000),
+  JOB_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(10),
+  // Abandoned runs and workflow executions are marked failed after this long. It must stay above the
+  // engine timeout (ENGINE_TIMEOUT_MS), otherwise a healthy long run would be reported as lost.
+  JOB_ORPHAN_AFTER_MS: z.coerce.number().int().min(60000).default(2700000),
+  // At start-up the API owns no work yet, so a run still marked running must have been left by the
+  // previous process. Single-process deployments can reap it after this grace period. Turn this off
+  // if the API is ever started in more than one process at a time.
+  JOB_REAP_ON_BOOT: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
+  JOB_REAP_BOOT_MIN_AGE_MS: z.coerce.number().int().min(1000).default(60000),
 });
 
 export const config = Env.parse(process.env);

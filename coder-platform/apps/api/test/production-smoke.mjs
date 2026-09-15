@@ -401,6 +401,9 @@ check("wave4 export can be deleted and stops downloading", smokeExportDelete.sta
 const outboxBlocked = await call("GET", "/api/v1/admin/email-outbox");
 const retentionBlocked = await call("GET", "/api/v1/admin/retention");
 check("wave4 email outbox and retention stay behind the admin gate", outboxBlocked.status === 403 && outboxBlocked.json.error === "ADMIN_REQUIRED" && retentionBlocked.status === 403, `${outboxBlocked.status}/${retentionBlocked.status}`);
+const jobsBlocked = await call("GET", "/api/v1/admin/jobs");
+const jobsRetryBlocked = await call("POST", "/api/v1/admin/jobs/tidak-ada/retry");
+check("wave5 background job queue stays behind the admin gate", jobsBlocked.status === 403 && jobsBlocked.json.error === "ADMIN_REQUIRED" && jobsRetryBlocked.status === 403, `${jobsBlocked.status}/${jobsRetryBlocked.status}`);
 
 const publicPlans = await publicCall("/api/v1/public/plans");
 check("wave4 public pricing page data is open and lists real plans", publicPlans.status === 200 && (publicPlans.json?.plans ?? []).length >= 3 && publicPlans.json?.currency === "IDR", JSON.stringify(publicPlans.json)?.slice(0, 220));
@@ -414,6 +417,9 @@ check("wave4 status hub counts api keys, queued emails, and ready exports from t
   typeof statusHubW4.json?.openPlatform?.activeKeys === "number" && typeof statusHubW4.json?.openPlatform?.emailOutbox?.pending === "number" && typeof statusHubW4.json?.openPlatform?.emailOutbox?.total === "number" && typeof statusHubW4.json?.openPlatform?.readyExports === "number",
   JSON.stringify(statusHubW4.json?.openPlatform?.emailOutbox));
 console.log(`INFO wave4 open platform: activeKeys=${statusHubW4.json?.openPlatform?.activeKeys} outboxPending=${statusHubW4.json?.openPlatform?.emailOutbox?.pending} readyExports=${statusHubW4.json?.openPlatform?.readyExports}`);
+check("wave5 status hub reports the background work queue", Number.isFinite(Number(statusHubW4.json?.backgroundWork?.queue?.total)) && Number(statusHubW4.json?.backgroundWork?.queue?.queued) >= 0 && statusHubW4.json?.backgroundWork?.worker?.running === true && statusHubW4.json?.backgroundWork?.reapOnBoot === true, JSON.stringify(statusHubW4.json?.backgroundWork)?.slice(0, 240));
+check("wave5 the recovery window is longer than the engine timeout, so healthy runs are never flagged", Number(statusHubW4.json?.backgroundWork?.orphanAfterMs) > 1_800_000 && Number(statusHubW4.json?.backgroundWork?.leaseMs) >= 60_000, JSON.stringify(statusHubW4.json?.backgroundWork)?.slice(0, 200));
+console.log(`INFO wave5 background work: queued=${statusHubW4.json?.backgroundWork?.queue?.queued} running=${statusHubW4.json?.backgroundWork?.queue?.running} done=${statusHubW4.json?.backgroundWork?.queue?.done} failed=${statusHubW4.json?.backgroundWork?.queue?.failed} leaseMs=${statusHubW4.json?.backgroundWork?.leaseMs} orphanAfterMs=${statusHubW4.json?.backgroundWork?.orphanAfterMs}`);
 
 const adminBlocked = await call("GET", "/api/v1/admin/overview");
 check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));

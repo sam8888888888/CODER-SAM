@@ -101,6 +101,12 @@ export type RetentionReport = { policy: RetentionPolicy; generatedAt: string; ta
 export type PrivacySummary = { policy: RetentionPolicy; sectionsInExport: ExportSection[]; storedTotals: { sections: number; rows: number }; exports: DataExport[]; email: EmailWorkerState; notes: string[] };
 export type PublicPackage = { code: string; name: string; description: string; priceIdr: number; periodDays: number; tier: string; dailyTokenLimit: number; monthlyTokenLimit: number; bonusTokens: number; features: unknown };
 export type PublicPricing = { branding: any; currency: string; usdToIdrRate: number; gateways: { xendit: boolean; midtrans: boolean; manualTransfer: boolean }; plans: PublicPackage[] };
+/** Wave 5: one durable background job. Same shape as the row the server keeps in the jobs table. */
+export type BackgroundJob = { id: string; kind: string; status: 'queued' | 'running' | 'done' | 'failed'; payload: string; result: string | null; attempts: number; maxAttempts: number; runAfter: string; lockOwner: string | null; lockExpiresAt: string | null; lastError: string | null; dedupeKey: string | null; createdAt: string; updatedAt: string; finishedAt: string | null };
+export type JobStats = { queued: number; running: number; done: number; failed: number; total: number; oldestQueuedAt: string | null; lastFinishedAt: string | null; byKind: Record<string, number> };
+export type JobCycleReport = { owner: string; startedAt: string; finishedAt: string; recoveredLeases: number; scheduled: string[]; claimed: number; succeeded: number; failed: number; details: { id: string; kind: string; outcome: 'done' | 'failed' | 'retry'; note?: string }[] };
+export type JobWorkerInfo = { running: boolean; intervalMs: number; leaseMs: number; batchSize: number; orphanAfterMs: number; handlers: string[]; cyclesRun: number; lastCycle: JobCycleReport | null };
+export type AdminJobsResponse = { worker: JobWorkerInfo; stats: JobStats; jobs: BackgroundJob[]; kinds: string[] };
 
 export const api = {
   me: () => request<{ user: User }>('/v1/auth/me'),
@@ -268,6 +274,10 @@ export const api = {
   adminEmailOutbox: (status?: string) => request<{ worker: EmailWorkerState; stats: OutboxStats; emails: OutboxEmail[]; note: string }>(`/v1/admin/email-outbox${status ? `?status=${encodeURIComponent(status)}` : ''}`),
   retryOutboxEmail: (emailId: string) => request<{ retried: boolean; emailId: string }>(`/v1/admin/email-outbox/${encodeURIComponent(emailId)}/retry`, { method: 'POST' }),
   deliverOutbox: () => request<{ enabled: boolean; mailerConfigured: boolean; considered: number; sent: number; failed: number; skipped: number; pending: number; reason?: string }>('/v1/admin/email-outbox/deliver', { method: 'POST' }),
+  /** Wave 5: daftar pekerjaan latar, statistik antrean, dan keadaan worker. */
+  adminJobs: (status?: string, kind?: string) => request<AdminJobsResponse>(`/v1/admin/jobs${status || kind ? `?${status ? `status=${encodeURIComponent(status)}` : ''}${status && kind ? '&' : ''}${kind ? `kind=${encodeURIComponent(kind)}` : ''}` : ''}`),
+  retryAdminJob: (jobId: string) => request<{ retried: boolean; job: BackgroundJob }>(`/v1/admin/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' }),
+  runAdminJobCycle: () => request<{ cycle: JobCycleReport; stats: JobStats; worker: JobWorkerInfo }>('/v1/admin/jobs/tick', { method: 'POST' }),
   deleteOutboxEmail: (emailId: string) => request<{ deleted: boolean; emailId: string }>(`/v1/admin/email-outbox/${encodeURIComponent(emailId)}`, { method: 'DELETE' }),
   retentionReport: () => request<RetentionReport>('/v1/admin/retention'),
   runRetention: (dryRun = true) => request<RetentionReport & { dryRun: boolean; totalRemoved: number; expiredExports: { marked: number; filesRemoved: number }; message: string }>('/v1/admin/retention/run', { method: 'POST', body: JSON.stringify({ dryRun }) }),
