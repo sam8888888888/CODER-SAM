@@ -154,8 +154,13 @@ Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
 ## Sebagian
 
 - Email transaksional: alur dan isi surat lengkap, klien SMTP sendiri di `apps/api/src/mailer.ts`
-  (tanpa pustaka tambahan), tetapi SMTP belum diisi sehingga jawabannya `EMAIL_NOT_CONFIGURED`.
-  Verifikasi email dan reset sandi lewat surat belum bisa dipakai pengguna asli.
+  (tanpa pustaka tambahan). **SMTP SUDAH HIDUP sejak 15 Sep 2026** (`mail.ilmupelet.com:587`, STARTTLS,
+  pengirim `COBLAI Coder <noreply@coblai.com>`; rahasia hanya di `/home/dinda/coder-app/.env`).
+  Bukti uji sungguhan: pendaftaran mengirim surat verifikasi dan tautannya bekerja (`verified: true`),
+  `/auth/password/forgot` menjawab `delivery: "email"`, surat reset sampai ke kotak masuk, tautannya
+  dipakai untuk mengganti sandi, lalu login dengan sandi baru berhasil. Akun uji dan surat uji sudah
+  dihapus kembali. Sisa pekerjaan: DNS `coblai.com` belum punya SPF/DKIM/MX, jadi surat ke Gmail dan
+  penyedia lain berisiko masuk spam sampai catatan DNS itu dipublikasikan (lihat Penghambat eksternal).
 - Klien SMTP: dua bug nyata ditemukan dan diperbaiki pada 13 Sep 2026 saat mencoba server surat
   sungguhan. (1) Baris lanjutan balasan `EHLO` (mis. `250-STARTTLS`) dibuang, sehingga klien tidak
   pernah memulai STARTTLS dan server menjawab `530 Must issue a STARTTLS command first`; kini seluruh
@@ -210,6 +215,9 @@ Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
 
 ## Penghambat eksternal
 
+- **Catatan DNS `coblai.com` (belum dipublikasikan, wajib untuk pengiriman ke luar)**: SPF
+  `"v=spf1 a mx ip4:152.53.67.115 ~all"`, `dkim._domainkey` (kunci publik diambil dari mailcow,
+  selector `dkim`), dan MX `10 mail.ilmupelet.com.` agar balasan atau pantulan surat bisa masuk.
 - Kredensial SMTP (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`): tanpa itu email verifikasi dan reset
   sandi tidak terkirim.
 - Kunci provider model (`DEEPSEEK_API_KEY` atau `OPENROUTER_API_KEY`) serta isi `PRIME_AGENT_PROVIDER`
