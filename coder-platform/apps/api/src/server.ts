@@ -4,7 +4,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { extname, join, normalize, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
-import { copyFile, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
 import { estimateCostMicros } from "./model-prices.js";
 import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
@@ -790,15 +790,37 @@ function recordRunUsage(runId: string, projectId: string, prompt: string, answer
   if (payerId) chargeQuota(payerId, totalTokens);
 }
 
-async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext, model?: string, userId?: string) {
+type RunEngineOptions = { text?: string; thinking?: string; personaId?: string | null; autonomous?: boolean };
+
+async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext, model?: string, userId?: string, engineOptions?: RunEngineOptions) {
   const startedAt = new Date().toISOString();
   db.prepare("UPDATE runs SET status='running', started_at=? WHERE id=?").run(startedAt, runId);
   let text = "";
   try {
     if (knowledge?.hits?.length) publishRunEvent(runId, "knowledge", { hits: knowledge.hits });
-    // The conversation id is the engine session id, so follow-up questions keep the earlier turns.
+    // Wave 3: the conversation holds its engine session, which compaction can rotate. The prompt keeps
+    // the earlier turns because the engine session does; after compaction the stored summary carries them.
+    const settings = userId ? agentSettings(userId) : null;
+    const thinking = isThinkingLevel(engineOptions?.thinking) ? String(engineOptions?.thinking)
+      : isThinkingLevel(settings?.thinking_level) ? String(settings?.thinking_level) : undefined;
+    const personaId = engineOptions?.personaId ?? conversationPersonaId(conversationId);
+    const appendSystem = userId ? systemBlocksFor(userId, personaId, conversationId ?? null) : [];
+    const tools = parseToolsAllow(settings?.tools_allow);
+    const autonomous = engineOptions?.autonomous ?? Boolean(settings?.autonomous_default);
+    db.prepare("UPDATE runs SET thinking_level=?, persona_id=?, autonomous=?, prompt_chars=?, append_system_chars=? WHERE id=?")
+      .run(thinking ?? null, personaId ?? null, autonomous ? 1 : 0, prompt.length, appendSystem.join("").length, runId);
     let usage: any = null;
-    for await (const event of engine.run({ runId, sessionId: conversationId ?? runId, prompt: withKnowledge(prompt, knowledge), model: model || config.PRIME_AGENT_MODEL, provider: model ? providerForModel(model) : config.PRIME_AGENT_PROVIDER })) {
+    for await (const event of engine.run({
+      runId,
+      sessionId: conversationId ? engineSessionFor(conversationId) : runId,
+      prompt: withKnowledge(prompt, knowledge),
+      model: model || config.PRIME_AGENT_MODEL,
+      provider: model ? providerForModel(model) : config.PRIME_AGENT_PROVIDER,
+      thinking,
+      appendSystem,
+      tools,
+      autonomous: autonomous ? { maxTurns: settings?.autonomous_max_turns ?? 6, maxTokens: settings?.autonomous_max_tokens ?? 40000 } : undefined,
+    })) {
       if (event.type !== "completed") publishRunEvent(runId, event.type, event.data);
       if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
       if (event.type === "completed") usage = (event.data as { usage?: unknown })?.usage ?? null;
@@ -855,9 +877,13 @@ function attachmentsForConversation(conversationId: string): Map<string, Attachm
   return grouped;
 }
 
-app.post<{ Params: { conversationId: string }; Body: { content?: string; model?: string; attachments?: { name?: string; mimeType?: string; contentBase64?: string }[] } }>("/api/v1/conversations/:conversationId/messages", { preHandler: requireUser, bodyLimit: 40 * 1024 * 1024 }, async (request: any, reply) => {
+app.post<{ Params: { conversationId: string }; Body: { content?: string; model?: string; thinking?: string; autonomous?: boolean; personaId?: string; attachments?: { name?: string; mimeType?: string; contentBase64?: string }[] } }>("/api/v1/conversations/:conversationId/messages", { preHandler: requireUser, bodyLimit: 40 * 1024 * 1024 }, async (request: any, reply) => {
   const model = request.body?.model?.trim() || undefined;
   if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
+  const thinking = request.body?.thinking?.trim() || undefined;
+  if (thinking && !isThinkingLevel(thinking)) return reply.code(400).send({ error: "INVALID_THINKING_LEVEL", allowed: THINKING_LEVELS });
+  const personaId = request.body?.personaId?.trim() || undefined;
+  const autonomous = Boolean(request.body?.autonomous);
 
   // Attachments arrive as base64. They are validated and written to disk before the transaction,
   // because the prompt needs the text of the readable ones straight away.
@@ -922,8 +948,16 @@ ${file.text}`).join("\n\n");
     }
     db.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversation.id);
   }); transaction();
-  void executeRun(runId, conversation.projectId, prompt, conversation.id, knowledge, model, request.user!.id);
-  return reply.code(202).send({ message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now, attachments: prepared.map((file) => ({ id: file.id, messageId, name: file.name, mimeType: file.mimeType, sizeBytes: file.buffer.length })) }, run: { id: runId, status: "queued" } });
+  // Auto-compaction runs before the engine call, so a long conversation sends a summary instead of
+  // the whole history. The run waits for it, while the HTTP reply returns straight away.
+  const settings = agentSettings(request.user!.id);
+  const messagesNow = messageCount(conversation.id);
+  const willCompact = Boolean(settings.auto_compact) && messagesNow >= Number(settings.compact_after_messages);
+  void (async () => {
+    if (willCompact) await compactConversation(conversation!.id, request.user!.id).catch(() => null);
+    await executeRun(runId, conversation!.projectId, prompt, conversation!.id, knowledge, model, request.user!.id, { thinking, personaId, autonomous });
+  })();
+  return reply.code(202).send({ message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now, attachments: prepared.map((file) => ({ id: file.id, messageId, name: file.name, mimeType: file.mimeType, sizeBytes: file.buffer.length })) }, run: { id: runId, status: "queued", thinkingLevel: thinking ?? settings.thinking_level, autonomous, willCompact, messages: messagesNow } });
 });
 
 /** Run history for one project, newest first. Optional ?conversationId= filter. */
@@ -1991,6 +2025,695 @@ app.get<{ Params: { artifactId: string } }>("/api/v1/artifacts/:artifactId/raw",
       .type(artifact.mimeType)
       .send(content);
   } catch { return reply.code(404).send({ error: "ARTIFACT_FILE_MISSING" }); }
+});
+
+
+// ============================================================
+// WAVE 3: agent workspace (memory bank, templates, personas,
+// token saver with real compaction, skills, status hub,
+// playground, agent map, diff, markdown report)
+// ============================================================
+
+/** Reasoning levels the engine really accepts, taken from `prime-agent --help`. */
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+function isThinkingLevel(value: unknown): boolean { return typeof value === "string" && THINKING_LEVELS.includes(value); }
+
+type AgentSettingsRow = {
+  thinking_level: string; auto_compact: number; compact_after_messages: number; tools_allow: string;
+  autonomous_default: number; autonomous_max_turns: number; autonomous_max_tokens: number;
+};
+const AGENT_SETTINGS_DEFAULTS: AgentSettingsRow = { thinking_level: "medium", auto_compact: 1, compact_after_messages: 24, tools_allow: "", autonomous_default: 0, autonomous_max_turns: 6, autonomous_max_tokens: 40000 };
+/** Tools allowlist is free text because the engine owns the tool names: "" = engine default, "none" = no tools. */
+function parseToolsAllow(raw: unknown): string[] | undefined {
+  const value = String(raw ?? "").trim();
+  if (!value) return undefined;
+  if (value === "none") return [];
+  return value.split(",").map((item) => item.trim()).filter(Boolean).slice(0, 40);
+}
+
+function agentSettings(userId: string): AgentSettingsRow {
+  const row = db.prepare("SELECT thinking_level,auto_compact,compact_after_messages,tools_allow,autonomous_default,autonomous_max_turns,autonomous_max_tokens FROM agent_settings WHERE user_id=?").get(userId) as AgentSettingsRow | undefined;
+  return row ? { ...AGENT_SETTINGS_DEFAULTS, ...row } : { ...AGENT_SETTINGS_DEFAULTS };
+}
+
+function saveAgentSettings(userId: string, patch: Partial<AgentSettingsRow>): AgentSettingsRow {
+  const next = { ...agentSettings(userId), ...patch };
+  db.prepare(`INSERT INTO agent_settings (user_id,thinking_level,auto_compact,compact_after_messages,tools_allow,autonomous_default,autonomous_max_turns,autonomous_max_tokens,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(user_id) DO UPDATE SET thinking_level=excluded.thinking_level, auto_compact=excluded.auto_compact,
+      compact_after_messages=excluded.compact_after_messages, tools_allow=excluded.tools_allow,
+      autonomous_default=excluded.autonomous_default, autonomous_max_turns=excluded.autonomous_max_turns,
+      autonomous_max_tokens=excluded.autonomous_max_tokens, updated_at=excluded.updated_at`)
+    .run(userId, next.thinking_level, next.auto_compact, next.compact_after_messages, next.tools_allow, next.autonomous_default, next.autonomous_max_turns, next.autonomous_max_tokens, new Date().toISOString());
+  return next;
+}
+
+/** The default persona of a user, or the requested one when it belongs to that user. */
+function personaRow(userId: string, personaId?: string | null) {
+  if (personaId) {
+    const chosen = db.prepare("SELECT id,name,system_prompt AS systemPrompt,tone,language,model,thinking_level AS thinkingLevel FROM agent_personas WHERE id=? AND user_id=?").get(personaId, userId) as any;
+    if (chosen) return chosen;
+  }
+  return db.prepare("SELECT id,name,system_prompt AS systemPrompt,tone,language,model,thinking_level AS thinkingLevel FROM agent_personas WHERE user_id=? AND is_default=1 ORDER BY updated_at DESC LIMIT 1").get(userId) as any;
+}
+
+function conversationPersonaId(conversationId?: string | null): string | null {
+  if (!conversationId) return null;
+  const row = db.prepare("SELECT persona_id AS personaId FROM conversations WHERE id=?").get(conversationId) as { personaId?: string | null } | undefined;
+  return row?.personaId ?? null;
+}
+
+/** Extra system prompt blocks: persona, memory bank, and the newest compaction summary. */
+function systemBlocksFor(userId?: string | null, personaId?: string | null, conversationId?: string | null): string[] {
+  const blocks: string[] = [];
+  if (userId) {
+    const persona = personaRow(userId, personaId);
+    if (persona) {
+      const parts = [`Persona aktif: ${persona.name}.`, String(persona.systemPrompt ?? "").trim()];
+      if (String(persona.tone ?? "").trim()) parts.push(`Gaya bicara: ${persona.tone}.`);
+      if (persona.language === "id") parts.push("Jawab dalam Bahasa Indonesia yang baku, ringkas, dan jelas.");
+      blocks.push(parts.filter(Boolean).join(" ").slice(0, 4000));
+    }
+    const memories = db.prepare("SELECT title, body FROM agent_memories WHERE user_id=? AND enabled=1 ORDER BY pinned DESC, updated_at DESC LIMIT 12").all(userId) as { title: string; body: string }[];
+    if (memories.length) {
+      blocks.push(`Bank memori pengguna (pakai bila relevan, jangan dibacakan mentah):\n${memories.map((memory) => `- ${memory.title}: ${String(memory.body).replace(/\s+/g, " ").slice(0, 400)}`).join("\n")}`);
+    }
+  }
+  if (conversationId) {
+    const summary = db.prepare("SELECT summary FROM conversation_summaries WHERE conversation_id=? ORDER BY created_at DESC LIMIT 1").get(conversationId) as { summary: string } | undefined;
+    if (summary?.summary) blocks.push(`Ringkasan percakapan sebelum pemadatan (pakai sebagai konteks, jangan minta diulang):\n${String(summary.summary).slice(0, 6000)}`);
+  }
+  return blocks;
+}
+
+/** The engine session of a conversation. Compaction replaces it, so the column is the source of truth. */
+function engineSessionFor(conversationId: string): string {
+  const row = db.prepare("SELECT engine_session_id AS engineSessionId FROM conversations WHERE id=?").get(conversationId) as { engineSessionId?: string | null } | undefined;
+  if (row?.engineSessionId) return row.engineSessionId;
+  const fresh = randomUUID();
+  db.prepare("UPDATE conversations SET engine_session_id=? WHERE id=?").run(fresh, conversationId);
+  return fresh;
+}
+
+/** Message count of a conversation; used by the auto-compaction trigger. */
+function messageCount(conversationId: string): number {
+  return Number((db.prepare("SELECT COUNT(*) AS n FROM messages WHERE conversation_id=?").get(conversationId) as { n: number }).n);
+}
+
+type CompactionResult = { summary: string; messagesCovered: number; charsBefore: number; charsAfter: number; engineSessionId: string; usage: unknown; source: "engine" | "fallback" };
+
+/**
+ * Compaction: the engine summarises the conversation it already holds, the summary is stored, and the
+ * engine session is rotated. Later runs get the summary as a system block instead of the full history,
+ * which is what actually cuts the tokens sent to the model.
+ */
+async function compactConversation(conversationId: string, userId: string): Promise<CompactionResult | null> {
+  const conversation = db.prepare("SELECT c.id, c.project_id AS projectId, c.engine_session_id AS engineSessionId FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?")
+    .get(conversationId, userId) as { id: string; projectId: string; engineSessionId?: string | null } | undefined;
+  if (!conversation) return null;
+  const messages = db.prepare("SELECT role, content FROM messages WHERE conversation_id=? ORDER BY created_at ASC").all(conversationId) as { role: string; content: string }[];
+  const charsBefore = messages.reduce((total, message) => total + message.content.length, 0);
+  const sessionId = conversation.engineSessionId ?? conversationId;
+  const instruction = "Ringkas seluruh percakapan ini untuk dipakai sebagai konteks lanjutan. Sebutkan: tujuan, keputusan, fakta penting (nama, berkas, angka), dan tugas yang masih terbuka. Padat, maksimal 1200 kata, tanpa basa-basi.";
+  let summary = ""; let usage: unknown = null; let source: "engine" | "fallback" = "engine";
+  try {
+    for await (const event of engine.run({ runId: randomUUID(), sessionId, prompt: instruction, model: config.PRIME_AGENT_MODEL, provider: config.PRIME_AGENT_PROVIDER })) {
+      if (event.type === "text") summary += typeof event.data === "string" ? event.data : "";
+      if (event.type === "completed") usage = (event.data as { usage?: unknown })?.usage ?? null;
+      if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "COMPACT_FAILED"));
+    }
+  } catch { summary = ""; }
+  if (!summary.trim()) {
+    // Honest fallback: a trimmed transcript, so compaction never loses the thread entirely.
+    source = "fallback";
+    summary = messages.slice(-40).map((message) => `${message.role}: ${String(message.content).slice(0, 400)}`).join("\n").slice(0, 6000);
+  }
+  const freshSession = randomUUID(); const now = new Date().toISOString();
+  db.prepare("INSERT INTO conversation_summaries (id,conversation_id,summary,messages_covered,chars_before,chars_after,created_at) VALUES (?,?,?,?,?,?,?)")
+    .run(randomUUID(), conversationId, summary, messages.length, charsBefore, summary.length, now);
+  db.prepare("UPDATE conversations SET engine_session_id=?, compacted_at=? WHERE id=?").run(freshSession, now, conversationId);
+  return { summary, messagesCovered: messages.length, charsBefore, charsAfter: summary.length, engineSessionId: freshSession, usage, source };
+}
+
+/** A small unified diff (line based, LCS) for comparing two text artifacts. */
+function unifiedDiff(aName: string, aText: string, bName: string, bText: string, context = 3) {
+  const a = aText.split("\n").slice(0, 4000); const b = bText.split("\n").slice(0, 4000);
+  const n = a.length; const m = b.length;
+  const table: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i -= 1) for (let j = m - 1; j >= 0; j -= 1) table[i][j] = a[i] === b[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+  type Line = { type: " " | "-" | "+"; text: string; left?: number; right?: number };
+  const all: Line[] = []; let i = 0; let j = 0; let added = 0; let removed = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { all.push({ type: " ", text: a[i], left: i + 1, right: j + 1 }); i += 1; j += 1; }
+    else if (table[i + 1][j] >= table[i][j + 1]) { all.push({ type: "-", text: a[i], left: i + 1 }); removed += 1; i += 1; }
+    else { all.push({ type: "+", text: b[j], right: j + 1 }); added += 1; j += 1; }
+  }
+  while (i < n) { all.push({ type: "-", text: a[i], left: i + 1 }); removed += 1; i += 1; }
+  while (j < m) { all.push({ type: "+", text: b[j], right: j + 1 }); added += 1; j += 1; }
+  const keep = new Set<number>();
+  all.forEach((line, index) => { if (line.type === " ") return; for (let k = index - context; k <= index + context; k += 1) if (k >= 0 && k < all.length) keep.add(k); });
+  const lines: Line[] = []; let lastKept = -2;
+  for (let index = 0; index < all.length; index += 1) {
+    if (!keep.has(index)) continue;
+    if (index !== lastKept + 1 && lines.length) lines.push({ type: " ", text: "@@" });
+    lines.push(all[index]); lastKept = index;
+  }
+  return { left: { name: aName, lines: n }, right: { name: bName, lines: m }, added, removed, changes: added + removed, hunks: lines };
+}
+
+/** Markdown report: one place that turns stored data into a document the user can keep. */
+function markdownReport(kind: string, projectId: string, userId: string, conversationId?: string) {
+  const project = db.prepare("SELECT p.id, p.name, p.description, p.created_at AS createdAt, w.name AS workspaceName FROM projects p JOIN workspaces w ON w.id=p.workspace_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(projectId, userId) as any;
+  if (!project) return null;
+  const now = new Date().toISOString();
+  const stamp = `Dibuat: ${now}`;
+  if (kind === "conversation") {
+    const conversation = conversationId
+      ? db.prepare("SELECT id,title,created_at AS createdAt FROM conversations WHERE id=? AND project_id=?").get(conversationId, projectId) as any
+      : db.prepare("SELECT id,title,created_at AS createdAt FROM conversations WHERE project_id=? ORDER BY updated_at DESC LIMIT 1").get(projectId) as any;
+    if (!conversation) return null;
+    const messages = db.prepare("SELECT role, content, created_at AS createdAt FROM messages WHERE conversation_id=? ORDER BY created_at ASC").all(conversation.id) as any[];
+    const summaries = db.prepare("SELECT summary, messages_covered AS covered, created_at AS createdAt FROM conversation_summaries WHERE conversation_id=? ORDER BY created_at DESC").all(conversation.id) as any[];
+    const body = [`# Laporan percakapan: ${conversation.title}`, "", `Proyek: **${project.name}** (${project.workspaceName})`, stamp, `Pesan: ${messages.length}`, "", "## Ringkasan pemadatan", summaries.length ? summaries.map((row) => `- (${row.covered} pesan, ${row.createdAt}) ${String(row.summary).slice(0, 800)}`).join("\n") : "_Belum ada pemadatan._", "", "## Isi percakapan", ...messages.map((message) => `### ${message.role === "user" ? "Pengguna" : "Asisten"} — ${message.createdAt}\n\n${message.content}`)];
+    return { filename: `laporan-percakapan-${conversation.id.slice(0, 8)}.md`, markdown: body.join("\n") };
+  }
+  if (kind === "project") {
+    const conversations = db.prepare("SELECT c.id, c.title, (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id) AS messages FROM conversations c WHERE c.project_id=? ORDER BY c.updated_at DESC LIMIT 50").all(projectId) as any[];
+    const artifacts = db.prepare("SELECT name, mime_type AS mimeType, size_bytes AS sizeBytes, created_at AS createdAt FROM artifacts WHERE project_id=? ORDER BY created_at DESC LIMIT 50").all(projectId) as any[];
+    const runs = db.prepare("SELECT id, status, error_code AS errorCode, created_at AS createdAt, finished_at AS finishedAt FROM runs WHERE project_id=? ORDER BY created_at DESC LIMIT 50").all(projectId) as any[];
+    const docs = db.prepare("SELECT COUNT(*) AS n FROM knowledge_documents WHERE project_id=?").get(projectId) as { n: number };
+    const workflowRows = db.prepare("SELECT name, status, schedule_enabled AS scheduleEnabled, schedule_cron AS scheduleCron, schedule_interval_minutes AS intervalMinutes FROM workflows WHERE project_id=?").all(projectId) as any[];
+    const body = [`# Laporan proyek: ${project.name}`, "", `Workspace: **${project.workspaceName}**`, stamp, project.description ? `\n${project.description}` : "", "", "## Angka ringkas", `- Percakapan: ${conversations.length}`, `- Run: ${runs.length} (gagal: ${runs.filter((run) => run.status === "failed").length})`, `- Artefak: ${artifacts.length}`, `- Dokumen pengetahuan: ${docs.n}`, `- Workflow: ${workflowRows.length}`, "", "## Percakapan", conversations.length ? conversations.map((row) => `- ${row.title} (${row.messages} pesan) — ${row.id}`).join("\n") : "_Belum ada._", "", "## Artefak", artifacts.length ? artifacts.map((row) => `- ${row.name} (${row.mimeType}, ${row.sizeBytes} byte) — ${row.createdAt}`).join("\n") : "_Belum ada._", "", "## Run terakhir", runs.length ? runs.map((run) => `- ${run.createdAt} ${run.status}${run.errorCode ? ` (${run.errorCode})` : ""} — ${run.id.slice(0, 8)}`).join("\n") : "_Belum ada._", "", "## Workflow", workflowRows.length ? workflowRows.map((row) => `- ${row.name} — ${row.scheduleEnabled ? "berjadwal" : "manual"}, status ${row.status}${row.scheduleCron ? `, cron ${row.scheduleCron}` : row.intervalMinutes ? `, tiap ${row.intervalMinutes} menit` : ""}`).join("\n") : "_Belum ada._"];
+    return { filename: `laporan-proyek-${String(project.name).replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 40)}.md`, markdown: body.join("\n") };
+  }
+  return null;
+}
+
+
+/** Byte/file statistics of a directory, used by the status hub. Missing paths return null, not zero. */
+type DirStats = { files: number; bytes: number; newest: string | null };
+async function dirStats(path: string, cap = 4000): Promise<DirStats | null> {
+  try {
+    const entries = await readdir(path, { withFileTypes: true });
+    let files = 0; let bytes = 0; let newest: string | null = null;
+    const keepNewest = (stamp: string | null) => { if (stamp && (!newest || stamp > newest)) newest = stamp; };
+    for (const entry of entries.slice(0, cap)) {
+      const full = join(path, entry.name);
+      if (entry.isDirectory()) {
+        const inner = await dirStats(full, 200);
+        if (inner) { files += inner.files; bytes += inner.bytes; keepNewest(inner.newest); }
+        continue;
+      }
+      try { const info = await stat(full); files += 1; bytes += info.size; keepNewest(info.mtime.toISOString()); } catch { /* unreadable entry is skipped on purpose */ }
+    }
+    return { files, bytes, newest };
+  } catch { return null; }
+}
+
+// ------------------------------------------------------------
+// Token saver & engine options
+// ------------------------------------------------------------
+app.get("/api/v1/agents/settings", { preHandler: requireUser }, async (request: any) => {
+  const userId = request.user!.id;
+  return {
+    settings: agentSettings(userId),
+    thinkingLevels: THINKING_LEVELS,
+    toolsAllowHelp: "Kosong = bawaan mesin. Isi 'none' untuk tanpa alat. Atau daftar nama alat dipisah koma.",
+    autonomousHelp: "Mode otonom menjalankan mesin sampai batas langkah/token, bukan sekali jawab.",
+    quota: quotaState(userId),
+  };
+});
+
+app.patch<{ Body: { thinkingLevel?: string; autoCompact?: boolean; compactAfterMessages?: number; toolsAllow?: string; autonomousDefault?: boolean; autonomousMaxTurns?: number; autonomousMaxTokens?: number } }>("/api/v1/agents/settings", { preHandler: requireUser }, async (request: any, reply) => {
+  const userId = request.user!.id; const body = request.body ?? {}; const patch: Partial<AgentSettingsRow> = {};
+  if (body.thinkingLevel !== undefined) {
+    if (!isThinkingLevel(body.thinkingLevel)) return reply.code(400).send({ error: "INVALID_THINKING_LEVEL", allowed: THINKING_LEVELS });
+    patch.thinking_level = String(body.thinkingLevel);
+  }
+  if (body.autoCompact !== undefined) patch.auto_compact = body.autoCompact ? 1 : 0;
+  if (body.compactAfterMessages !== undefined) {
+    const value = Number(body.compactAfterMessages);
+    if (!Number.isFinite(value) || value < 4 || value > 500) return reply.code(400).send({ error: "INVALID_COMPACT_THRESHOLD", message: "Ambang pemadatan antara 4 dan 500 pesan." });
+    patch.compact_after_messages = Math.round(value);
+  }
+  if (body.toolsAllow !== undefined) patch.tools_allow = String(body.toolsAllow).trim().slice(0, 400);
+  if (body.autonomousDefault !== undefined) patch.autonomous_default = body.autonomousDefault ? 1 : 0;
+  if (body.autonomousMaxTurns !== undefined) {
+    const value = Number(body.autonomousMaxTurns);
+    if (!Number.isFinite(value) || value < 1 || value > 50) return reply.code(400).send({ error: "INVALID_AUTONOMOUS_TURNS", message: "Batas langkah antara 1 dan 50." });
+    patch.autonomous_max_turns = Math.round(value);
+  }
+  if (body.autonomousMaxTokens !== undefined) {
+    const value = Number(body.autonomousMaxTokens);
+    if (!Number.isFinite(value) || value < 1000 || value > 500000) return reply.code(400).send({ error: "INVALID_AUTONOMOUS_TOKENS", message: "Batas token antara 1.000 dan 500.000." });
+    patch.autonomous_max_tokens = Math.round(value);
+  }
+  return { settings: saveAgentSettings(userId, patch) };
+});
+
+/** Honest preview of what the platform will send to the engine for a conversation. */
+app.get<{ Querystring: { conversationId?: string; personaId?: string } }>("/api/v1/agents/preview", { preHandler: requireUser }, async (request: any, reply) => {
+  const userId = request.user!.id;
+  const settings = agentSettings(userId);
+  const conversationId = request.query?.conversationId?.trim() || null;
+  if (conversationId) {
+    const allowed = db.prepare("SELECT 1 FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(conversationId, userId);
+    if (!allowed) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  }
+  const askedPersonaId = request.query?.personaId?.trim() || conversationPersonaId(conversationId);
+  // systemBlocksFor() falls back to the account default persona, so the preview reports that same
+  // persona instead of "null" while blocks are plainly being sent.
+  const blocks = systemBlocksFor(userId, askedPersonaId, conversationId);
+  const effectivePersona = personaRow(userId, askedPersonaId);
+  const currentPersona = blocks.length && effectivePersona ? effectivePersona : null;
+  const conversation = conversationId
+    ? db.prepare("SELECT id, engine_session_id AS engineSessionId, compacted_at AS compactedAt, persona_id AS personaId FROM conversations WHERE id=?").get(conversationId) as any
+    : null;
+  const summaryCount = conversationId ? Number((db.prepare("SELECT COUNT(*) AS n FROM conversation_summaries WHERE conversation_id=?").get(conversationId) as { n: number }).n) : 0;
+  const flags: string[] = [];
+  flags.push(`--model ${config.PRIME_AGENT_MODEL ?? "(bawaan)"}`);
+  flags.push(`--thinking ${settings.thinking_level}`);
+  blocks.forEach(() => flags.push("--append-system-prompt <blok>"));
+  const tools = parseToolsAllow(settings.tools_allow);
+  if (tools) flags.push(tools.length ? `--tools ${tools.join(",")}` : "--no-tools");
+  if (settings.autonomous_default) flags.push(`--autonomous --autonomous-max-turns ${settings.autonomous_max_turns} --autonomous-max-tokens ${settings.autonomous_max_tokens}`);
+  return {
+    settings,
+    persona: currentPersona ?? null,
+    personaSource: currentPersona ? (askedPersonaId ? "dipilih" : "bawaan akun") : null,
+    blocks,
+    flags,
+    conversation,
+    session: conversation?.engineSessionId ? await dirStats(join(config.ENGINE_ROOT_DIR, conversation.engineSessionId)) : null,
+    summaryCount,
+    messages: conversationId ? messageCount(conversationId) : 0,
+    notes: [
+      "Blok di atas dikirim sebagai --append-system-prompt, jadi bukan bagian dari pesan pengguna.",
+      "Pemadatan mengganti sesi mesin; ringkasan lama tetap dikirim sebagai satu blok.",
+      tools === undefined ? "Allowlist alat kosong: mesin memakai bawaannya." : tools.length ? "Allowlist alat aktif." : "Semua alat dimatikan untuk akun ini.",
+    ],
+  };
+});
+
+// ------------------------------------------------------------
+// Memory bank
+// ------------------------------------------------------------
+app.get<{ Querystring: { limit?: string } }>("/api/v1/memories", { preHandler: requireUser }, async (request: any) => {
+  const limit = Math.min(Math.max(Number(request.query?.limit ?? 100) || 100, 1), 300);
+  const memories = db.prepare("SELECT id,title,body,tags,pinned,enabled,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM agent_memories WHERE user_id=? ORDER BY pinned DESC, updated_at DESC LIMIT ?").all(request.user!.id, limit);
+  return { memories };
+});
+
+app.post<{ Body: { title?: string; body?: string; tags?: string; pinned?: boolean } }>("/api/v1/memories", { preHandler: requireUser }, async (request: any, reply) => {
+  const title = String(request.body?.title ?? "").trim().slice(0, 200);
+  const body = String(request.body?.body ?? "").trim().slice(0, 8000);
+  if (!title || !body) return reply.code(400).send({ error: "INVALID_MEMORY", message: "Judul dan isi memori wajib diisi." });
+  const id = randomUUID(); const now = new Date().toISOString();
+  db.prepare("INSERT INTO agent_memories (id,user_id,title,body,tags,pinned,enabled,use_count,created_at,updated_at) VALUES (?,?,?,?,?,?,1,0,?,?)")
+    .run(id, request.user!.id, title, body, String(request.body?.tags ?? "").trim().slice(0, 200), request.body?.pinned ? 1 : 0, now, now);
+  return reply.code(201).send({ memory: db.prepare("SELECT id,title,body,tags,pinned,enabled,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM agent_memories WHERE id=?").get(id) });
+});
+
+app.patch<{ Params: { memoryId: string }; Body: { title?: string; body?: string; tags?: string; pinned?: boolean; enabled?: boolean } }>("/api/v1/memories/:memoryId", { preHandler: requireUser }, async (request: any, reply) => {
+  const existing = db.prepare("SELECT id,user_id AS userId FROM agent_memories WHERE id=?").get(request.params.memoryId) as { id: string; userId: string } | undefined;
+  if (!existing || existing.userId !== request.user!.id) return reply.code(404).send({ error: "MEMORY_NOT_FOUND" });
+  const body = request.body ?? {};
+  const title = body.title !== undefined ? String(body.title).trim().slice(0, 200) : undefined;
+  if (title === "") return reply.code(400).send({ error: "INVALID_MEMORY", message: "Judul tidak boleh kosong." });
+  db.prepare(`UPDATE agent_memories SET title=COALESCE(?,title), body=COALESCE(?,body), tags=COALESCE(?,tags),
+    pinned=COALESCE(?,pinned), enabled=COALESCE(?,enabled), updated_at=? WHERE id=?`)
+    .run(title ?? null, body.body !== undefined ? String(body.body).slice(0, 8000) : null, body.tags !== undefined ? String(body.tags).slice(0, 200) : null,
+      body.pinned !== undefined ? (body.pinned ? 1 : 0) : null, body.enabled !== undefined ? (body.enabled ? 1 : 0) : null, new Date().toISOString(), existing.id);
+  return { memory: db.prepare("SELECT id,title,body,tags,pinned,enabled,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM agent_memories WHERE id=?").get(existing.id) };
+});
+
+app.delete<{ Params: { memoryId: string } }>("/api/v1/memories/:memoryId", { preHandler: requireUser }, async (request: any, reply) => {
+  const existing = db.prepare("SELECT id,user_id AS userId FROM agent_memories WHERE id=?").get(request.params.memoryId) as { id: string; userId: string } | undefined;
+  if (!existing || existing.userId !== request.user!.id) return reply.code(404).send({ error: "MEMORY_NOT_FOUND" });
+  db.prepare("DELETE FROM agent_memories WHERE id=?").run(existing.id);
+  return { deleted: true };
+});
+
+// ------------------------------------------------------------
+// Prompt templates and slash commands
+// ------------------------------------------------------------
+app.get("/api/v1/prompt-templates", { preHandler: requireUser }, async (request: any) => {
+  const templates = db.prepare("SELECT id,name,body,description,slash,tags,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM prompt_templates WHERE user_id=? ORDER BY use_count DESC, name LIMIT 300").all(request.user!.id);
+  return { templates };
+});
+
+app.post<{ Body: { name?: string; body?: string; description?: string; slash?: string; tags?: string } }>("/api/v1/prompt-templates", { preHandler: requireUser }, async (request: any, reply) => {
+  const name = String(request.body?.name ?? "").trim().slice(0, 120);
+  const body = String(request.body?.body ?? "").trim().slice(0, 10000);
+  if (!name || !body) return reply.code(400).send({ error: "INVALID_TEMPLATE", message: "Nama dan isi template wajib diisi." });
+  const slash = String(request.body?.slash ?? "").trim().replace(/^\/+/, "").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || null;
+  if (slash) {
+    const taken = db.prepare("SELECT 1 FROM prompt_templates WHERE user_id=? AND slash=?").get(request.user!.id, slash);
+    if (taken) return reply.code(409).send({ error: "SLASH_TAKEN", message: `Perintah /${slash} sudah dipakai.` });
+  }
+  const id = randomUUID(); const now = new Date().toISOString();
+  db.prepare("INSERT INTO prompt_templates (id,user_id,name,body,description,slash,tags,use_count,created_at,updated_at) VALUES (?,?,?,?,?,?,?,0,?,?)")
+    .run(id, request.user!.id, name, body, String(request.body?.description ?? "").trim().slice(0, 400), slash, String(request.body?.tags ?? "").trim().slice(0, 200), now, now);
+  return reply.code(201).send({ template: db.prepare("SELECT id,name,body,description,slash,tags,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM prompt_templates WHERE id=?").get(id) });
+});
+
+app.patch<{ Params: { templateId: string }; Body: { name?: string; body?: string; description?: string; slash?: string; tags?: string } }>("/api/v1/prompt-templates/:templateId", { preHandler: requireUser }, async (request: any, reply) => {
+  const existing = db.prepare("SELECT id,user_id AS userId FROM prompt_templates WHERE id=?").get(request.params.templateId) as { id: string; userId: string } | undefined;
+  if (!existing || existing.userId !== request.user!.id) return reply.code(404).send({ error: "TEMPLATE_NOT_FOUND" });
+  const body = request.body ?? {};
+  const slash = body.slash !== undefined ? (String(body.slash).trim().replace(/^\/+/, "").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) || null) : undefined;
+  if (slash) {
+    const taken = db.prepare("SELECT 1 FROM prompt_templates WHERE user_id=? AND slash=? AND id<>?").get(request.user!.id, slash, existing.id);
+    if (taken) return reply.code(409).send({ error: "SLASH_TAKEN", message: `Perintah /${slash} sudah dipakai.` });
+  }
+  db.prepare(`UPDATE prompt_templates SET name=COALESCE(?,name), body=COALESCE(?,body), description=COALESCE(?,description),
+    slash=COALESCE(?,slash), tags=COALESCE(?,tags), updated_at=? WHERE id=?`)
+    .run(body.name !== undefined ? String(body.name).trim().slice(0, 120) : null, body.body !== undefined ? String(body.body).slice(0, 10000) : null,
+      body.description !== undefined ? String(body.description).slice(0, 400) : null, slash ?? null, body.tags !== undefined ? String(body.tags).slice(0, 200) : null,
+      new Date().toISOString(), existing.id);
+  return { template: db.prepare("SELECT id,name,body,description,slash,tags,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM prompt_templates WHERE id=?").get(existing.id) };
+});
+
+app.delete<{ Params: { templateId: string } }>("/api/v1/prompt-templates/:templateId", { preHandler: requireUser }, async (request: any, reply) => {
+  const existing = db.prepare("SELECT id,user_id AS userId FROM prompt_templates WHERE id=?").get(request.params.templateId) as { id: string; userId: string } | undefined;
+  if (!existing || existing.userId !== request.user!.id) return reply.code(404).send({ error: "TEMPLATE_NOT_FOUND" });
+  db.prepare("DELETE FROM prompt_templates WHERE id=?").run(existing.id);
+  return { deleted: true };
+});
+
+/** Marks a template as used and returns the filled text, so the composer can insert it. */
+app.post<{ Params: { templateId: string }; Body: { variables?: Record<string, string> } }>("/api/v1/prompt-templates/:templateId/use", { preHandler: requireUser }, async (request: any, reply) => {
+  const template = db.prepare("SELECT id,body,name FROM prompt_templates WHERE id=? AND user_id=?").get(request.params.templateId, request.user!.id) as { id: string; body: string; name: string } | undefined;
+  if (!template) return reply.code(404).send({ error: "TEMPLATE_NOT_FOUND" });
+  let text = template.body;
+  const variables = request.body?.variables ?? {};
+  for (const [key, value] of Object.entries(variables)) text = text.split(`{{${key}}}`).join(String(value).slice(0, 2000));
+  db.prepare("UPDATE prompt_templates SET use_count=use_count+1, updated_at=? WHERE id=?").run(new Date().toISOString(), template.id);
+  return { id: template.id, name: template.name, text, remainingVariables: [...text.matchAll(/\{\{([A-Za-z0-9_]+)\}\}/g)].map((match) => match[1]) };
+});
+
+// ------------------------------------------------------------
+// Agent personas
+// ------------------------------------------------------------
+app.get("/api/v1/personas", { preHandler: requireUser }, async (request: any) => {
+  const personas = db.prepare("SELECT id,name,system_prompt AS systemPrompt,tone,language,model,thinking_level AS thinkingLevel,is_default AS isDefault,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM agent_personas WHERE user_id=? ORDER BY is_default DESC, name LIMIT 200").all(request.user!.id);
+  return { personas };
+});
+
+app.post<{ Body: { name?: string; systemPrompt?: string; tone?: string; language?: string; model?: string; thinkingLevel?: string; makeDefault?: boolean } }>("/api/v1/personas", { preHandler: requireUser }, async (request: any, reply) => {
+  const name = String(request.body?.name ?? "").trim().slice(0, 120);
+  const systemPrompt = String(request.body?.systemPrompt ?? "").trim().slice(0, 8000);
+  if (!name || !systemPrompt) return reply.code(400).send({ error: "INVALID_PERSONA", message: "Nama dan system prompt wajib diisi." });
+  const model = request.body?.model?.trim() || null;
+  if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
+  const thinkingLevel = request.body?.thinkingLevel && isThinkingLevel(request.body.thinkingLevel) ? String(request.body.thinkingLevel) : "medium";
+  const id = randomUUID(); const now = new Date().toISOString();
+  db.prepare("INSERT INTO agent_personas (id,user_id,name,system_prompt,tone,language,model,thinking_level,is_default,use_count,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,0,?,?)")
+    .run(id, request.user!.id, name, systemPrompt, String(request.body?.tone ?? "").trim().slice(0, 300), request.body?.language === "en" ? "en" : "id", model, thinkingLevel, request.body?.makeDefault ? 1 : 0, now, now);
+  if (request.body?.makeDefault) db.prepare("UPDATE agent_personas SET is_default=0 WHERE user_id=? AND id<>?").run(request.user!.id, id);
+  return reply.code(201).send({ persona: db.prepare("SELECT id,name,system_prompt AS systemPrompt,tone,language,model,thinking_level AS thinkingLevel,is_default AS isDefault,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM agent_personas WHERE id=?").get(id) });
+});
+
+app.patch<{ Params: { personaId: string }; Body: { name?: string; systemPrompt?: string; tone?: string; language?: string; model?: string; thinkingLevel?: string } }>("/api/v1/personas/:personaId", { preHandler: requireUser }, async (request: any, reply) => {
+  const existing = db.prepare("SELECT id,user_id AS userId FROM agent_personas WHERE id=?").get(request.params.personaId) as { id: string; userId: string } | undefined;
+  if (!existing || existing.userId !== request.user!.id) return reply.code(404).send({ error: "PERSONA_NOT_FOUND" });
+  const body = request.body ?? {};
+  const model = body.model !== undefined ? (body.model.trim() || null) : undefined;
+  if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
+  const thinkingLevel = body.thinkingLevel !== undefined ? (isThinkingLevel(body.thinkingLevel) ? String(body.thinkingLevel) : null) : undefined;
+  if (thinkingLevel === null) return reply.code(400).send({ error: "INVALID_THINKING_LEVEL", allowed: THINKING_LEVELS });
+  db.prepare(`UPDATE agent_personas SET name=COALESCE(?,name), system_prompt=COALESCE(?,system_prompt), tone=COALESCE(?,tone),
+    language=COALESCE(?,language), model=COALESCE(?,model), thinking_level=COALESCE(?,thinking_level), updated_at=? WHERE id=?`)
+    .run(body.name !== undefined ? String(body.name).trim().slice(0, 120) : null, body.systemPrompt !== undefined ? String(body.systemPrompt).slice(0, 8000) : null,
+      body.tone !== undefined ? String(body.tone).slice(0, 300) : null, body.language !== undefined ? (body.language === "en" ? "en" : "id") : null,
+      model ?? null, thinkingLevel ?? null, new Date().toISOString(), existing.id);
+  return { persona: db.prepare("SELECT id,name,system_prompt AS systemPrompt,tone,language,model,thinking_level AS thinkingLevel,is_default AS isDefault,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM agent_personas WHERE id=?").get(existing.id) };
+});
+
+app.delete<{ Params: { personaId: string } }>("/api/v1/personas/:personaId", { preHandler: requireUser }, async (request: any, reply) => {
+  const existing = db.prepare("SELECT id,user_id AS userId FROM agent_personas WHERE id=?").get(request.params.personaId) as { id: string; userId: string } | undefined;
+  if (!existing || existing.userId !== request.user!.id) return reply.code(404).send({ error: "PERSONA_NOT_FOUND" });
+  db.prepare("DELETE FROM agent_personas WHERE id=?").run(existing.id);
+  db.prepare("UPDATE users SET default_persona_id=NULL WHERE id=? AND default_persona_id=?").run(request.user!.id, existing.id);
+  // Conversations that used it fall back to the user default persona.
+  db.prepare("UPDATE conversations SET persona_id=NULL WHERE persona_id=?").run(existing.id);
+  return { deleted: true };
+});
+
+app.post<{ Params: { personaId: string } }>("/api/v1/personas/:personaId/default", { preHandler: requireUser }, async (request: any, reply) => {
+  const existing = db.prepare("SELECT id,user_id AS userId FROM agent_personas WHERE id=?").get(request.params.personaId) as { id: string; userId: string } | undefined;
+  if (!existing || existing.userId !== request.user!.id) return reply.code(404).send({ error: "PERSONA_NOT_FOUND" });
+  db.prepare("UPDATE agent_personas SET is_default=0 WHERE user_id=?").run(request.user!.id);
+  db.prepare("UPDATE agent_personas SET is_default=1, updated_at=? WHERE id=?").run(new Date().toISOString(), existing.id);
+  db.prepare("UPDATE users SET default_persona_id=? WHERE id=?").run(existing.id, request.user!.id);
+  return { isDefault: true, personaId: existing.id };
+});
+
+/** Persona per conversation: the agent keeps its role when the user returns to the thread. */
+app.patch<{ Params: { conversationId: string }; Body: { personaId?: string | null; title?: string } }>("/api/v1/conversations/:conversationId/persona", { preHandler: requireUser }, async (request: any, reply) => {
+  const conversation = db.prepare("SELECT c.id, c.project_id AS projectId, m.role AS role FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; projectId: string; role: string } | undefined;
+  if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  if (conversation.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  const personaId = request.body?.personaId === null || request.body?.personaId === "" ? null : String(request.body?.personaId ?? "").trim() || null;
+  if (personaId) {
+    const persona = db.prepare("SELECT 1 FROM agent_personas WHERE id=? AND user_id=?").get(personaId, request.user!.id);
+    if (!persona) return reply.code(404).send({ error: "PERSONA_NOT_FOUND" });
+  }
+  db.prepare("UPDATE conversations SET persona_id=? WHERE id=?").run(personaId, conversation.id);
+  return { conversationId: conversation.id, personaId };
+});
+
+
+// ------------------------------------------------------------
+// Skills catalogue and status hub
+// ------------------------------------------------------------
+/** The catalogue only lists capabilities the platform really has, with the value it can prove. */
+app.get("/api/v1/skills", { preHandler: requireUser }, async (request: any) => {
+  const userId = request.user!.id;
+  const health = await engine.health();
+  const catalogue = engineModelCatalogue();
+  const payments = paymentConfig();
+  const counts = {
+    memories: Number((db.prepare("SELECT COUNT(*) AS n FROM agent_memories WHERE user_id=?").get(userId) as { n: number }).n),
+    templates: Number((db.prepare("SELECT COUNT(*) AS n FROM prompt_templates WHERE user_id=?").get(userId) as { n: number }).n),
+    personas: Number((db.prepare("SELECT COUNT(*) AS n FROM agent_personas WHERE user_id=?").get(userId) as { n: number }).n),
+    knowledge: Number((db.prepare("SELECT COUNT(*) AS n FROM knowledge_documents d JOIN projects p ON p.id=d.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=?").get(userId) as { n: number }).n),
+    artifacts: Number((db.prepare("SELECT COUNT(*) AS n FROM artifacts a JOIN projects p ON p.id=a.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=?").get(userId) as { n: number }).n),
+    workflows: Number((db.prepare("SELECT COUNT(*) AS n FROM workflows w JOIN projects p ON p.id=w.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=?").get(userId) as { n: number }).n),
+    conversations: Number((db.prepare("SELECT COUNT(*) AS n FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=?").get(userId) as { n: number }).n),
+  };
+  const skills = [
+    { key: "engine", name: "Mesin AI", available: health.available, detail: health.available ? `terhubung (${health.version ?? "versi tidak dilaporkan"})` : "tidak terhubung", needs: health.available ? null : "mesin agen harus hidup", group: "Inti" },
+    { key: "models", name: "Katalog model", available: catalogue.models.length > 0, detail: `${catalogue.models.length} model terdaftar`, needs: catalogue.models.length ? null : "katalog mesin kosong", group: "Inti" },
+    { key: "thinking", name: "Tingkat penalaran", available: true, detail: `pilihan: ${THINKING_LEVELS.join(", ")}`, needs: null, group: "Penghemat token" },
+    { key: "tools", name: "Allowlist alat", available: true, detail: "atur daftar alat, atau matikan semua alat", needs: null, group: "Penghemat token" },
+    { key: "compact", name: "Pemadatan percakapan", available: true, detail: `otomatis setelah ${agentSettings(userId).compact_after_messages} pesan (bisa diatur)`, needs: null, group: "Penghemat token" },
+    { key: "autonomous", name: "Mode otonom", available: true, detail: "mesin lanjut sampai batas langkah dan token", needs: null, group: "Eksekusi" },
+    { key: "memory", name: "Bank memori", available: true, detail: `${counts.memories} catatan aktif`, needs: null, group: "Konteks" },
+    { key: "templates", name: "Template prompt & slash", available: true, detail: `${counts.templates} template`, needs: null, group: "Konteks" },
+    { key: "personas", name: "Persona agen", available: true, detail: `${counts.personas} persona`, needs: null, group: "Konteks" },
+    { key: "knowledge", name: "Pencarian pengetahuan (FTS5)", available: true, detail: `${counts.knowledge} dokumen terindeks`, needs: null, group: "Konteks" },
+    { key: "chat", name: "Percakapan + lampiran", available: true, detail: `${counts.conversations} percakapan milik Anda`, needs: null, group: "Kerja" },
+    { key: "artifacts", name: "Artefak & unduhan", available: true, detail: `${counts.artifacts} artefak`, needs: null, group: "Kerja" },
+    { key: "workflows", name: "Workflow + gerbang persetujuan", available: true, detail: `${counts.workflows} workflow`, needs: null, group: "Kerja" },
+    { key: "diff", name: "Pembanding artefak (diff)", available: true, detail: "bandingkan dua artefak teks", needs: null, group: "Bukti" },
+    { key: "report", name: "Laporan Markdown", available: true, detail: "percakapan atau proyek", needs: null, group: "Bukti" },
+    { key: "status", name: "Status hub", available: true, detail: "kesehatan mesin, basis data, dan penyimpanan", needs: null, group: "Ops" },
+    { key: "mail", name: "Surat transaksional", available: mailerConfigured(), detail: mailerConfigured() ? `pengirim ${config.SMTP_FROM}` : "SMTP belum diisi", needs: mailerConfigured() ? null : "kredensial SMTP", group: "Ops" },
+    { key: "gateway", name: "Gateway pembayaran", available: payments.xenditEnabled || payments.midtransEnabled, detail: payments.xenditEnabled || payments.midtransEnabled ? `aktif: ${payments.gateway}` : "belum aktif", needs: payments.xenditEnabled || payments.midtransEnabled ? null : "kunci Xendit/Midtrans", group: "Ops" },
+    { key: "manual_payment", name: "Transfer manual + bukti", available: true, detail: "pesanan manual dan unggah bukti", needs: null, group: "Komersial" },
+    { key: "quota", name: "Kuota token & kredit", available: true, detail: `${quotaState(userId).usedToday ?? 0} token terpakai hari ini`, needs: null, group: "Komersial" },
+    { key: "pwa", name: "PWA (bisa dipasang)", available: true, detail: "manifest + ikon 192/512/maskable", needs: null, group: "Antarmuka" },
+    { key: "theme_palette", name: "Tema & palet perintah", available: true, detail: "tema terang/gelap, Ctrl+K", needs: null, group: "Antarmuka" },
+  ];
+  const groups = [...new Set(skills.map((skill) => skill.group))];
+  return { skills, groups, engine: health, storage: { data: await dirStats(config.DATA_DIR), engineSessions: await dirStats(config.ENGINE_ROOT_DIR) } };
+});
+
+/** One screen with the platform health an operator needs, all values read from the running system. */
+app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) => {
+  const userId = request.user!.id;
+  const health = await engine.health();
+  const startedAt = Date.now();
+  let databaseOk = false; let databaseDetail = "";
+  try {
+    const row = db.prepare("PRAGMA quick_check").get() as Record<string, unknown> | undefined;
+    databaseDetail = String(row ? Object.values(row)[0] ?? "" : "");
+    databaseOk = databaseDetail.toLowerCase() === "ok";
+  } catch (error) { databaseDetail = error instanceof Error ? error.message : "unknown"; }
+  const migrations = db.prepare("SELECT version, note, applied_at AS appliedAt FROM schema_migrations ORDER BY version DESC LIMIT 5").all();
+  const tables = Number((db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table'").get() as { n: number }).n);
+  const counts = {
+    users: Number((db.prepare("SELECT COUNT(*) AS n FROM users").get() as { n: number }).n),
+    workspaces: Number((db.prepare("SELECT COUNT(*) AS n FROM workspaces").get() as { n: number }).n),
+    projects: Number((db.prepare("SELECT COUNT(*) AS n FROM projects").get() as { n: number }).n),
+    conversations: Number((db.prepare("SELECT COUNT(*) AS n FROM conversations").get() as { n: number }).n),
+    messages: Number((db.prepare("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n),
+    runs: Number((db.prepare("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n),
+    failedRuns: Number((db.prepare("SELECT COUNT(*) AS n FROM runs WHERE status='failed'").get() as { n: number }).n),
+    artifacts: Number((db.prepare("SELECT COUNT(*) AS n FROM artifacts").get() as { n: number }).n),
+    orders: Number((db.prepare("SELECT COUNT(*) AS n FROM orders").get() as { n: number }).n),
+    pendingOrders: Number((db.prepare("SELECT COUNT(*) AS n FROM orders WHERE status='pending'").get() as { n: number }).n),
+  };
+  const todayTokens = Number((db.prepare("SELECT COALESCE(SUM(total_tokens),0) AS n FROM run_usage WHERE created_at >= ?").get(`${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`) as { n: number }).n);
+  const payments = paymentConfig();
+  const catalogue = engineModelCatalogue();
+  const lastRuns = db.prepare("SELECT r.id, r.status, r.model, r.error_code AS errorCode, r.created_at AS createdAt, r.finished_at AS finishedAt, u.cost_micros AS costMicros FROM runs r LEFT JOIN run_usage u ON u.run_id=r.id ORDER BY r.created_at DESC LIMIT 10").all();
+  return {
+    version: process.env.APP_VERSION ?? process.env.npm_package_version ?? null,
+    generatedAt: new Date().toISOString(),
+    durationMs: Date.now() - startedAt,
+    engine: { ...health, models: catalogue.models.length, note: catalogue.note ?? null, error: catalogue.error ?? null },
+    database: { ok: databaseOk, detail: databaseDetail, tables, migrations },
+    counts,
+    money: { todayTokens, payments: { gateway: payments.gateway, xenditEnabled: payments.xenditEnabled, midtransEnabled: payments.midtransEnabled, xenditConfigured: payments.xenditConfigured, midtransConfigured: payments.midtransConfigured } },
+    mail: { configured: mailerConfigured(), from: config.SMTP_FROM, host: config.SMTP_HOST ? `${config.SMTP_HOST}:${config.SMTP_PORT}` : null, secure: config.SMTP_SECURE },
+    security: { csrfStrict: config.CSRF_STRICT, sessionCookie: "httpOnly", adminEmails: config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim()).filter(Boolean).length, metricsEnabled: Boolean(config.METRICS_TOKEN) },
+    limits: { dailyCostMicros: config.DEFAULT_DAILY_COST_LIMIT_MICROS, monthlyCostMicros: config.DEFAULT_MONTHLY_COST_LIMIT_MICROS, runsPerHour: config.DEFAULT_RUNS_PER_HOUR_LIMIT, engineTimeoutMs: config.ENGINE_TIMEOUT_MS },
+    storage: { data: await dirStats(config.DATA_DIR), engineSessions: await dirStats(config.ENGINE_ROOT_DIR) },
+    lastRuns,
+    backup: { note: "Cadangan otomatis dijalankan cron 03:17 di host (di luar container), jadi isi direktori cadangan tidak bisa dibaca dari sini.", cron: "17 3 * * *" },
+    queue: { pendingOrders: counts.pendingOrders },
+  };
+});
+
+// ------------------------------------------------------------
+// Playground
+// ------------------------------------------------------------
+/** Runs one prompt without a project, for trying a model, a persona, or a thinking level. */
+app.post<{ Body: { prompt?: string; model?: string; thinking?: string; personaId?: string; useMemory?: boolean; autonomous?: boolean } }>("/api/v1/playground/run", { preHandler: requireUser }, async (request: any, reply) => {
+  const prompt = String(request.body?.prompt ?? "").trim();
+  if (!prompt || prompt.length > 8000) return reply.code(400).send({ error: "INVALID_PROMPT", message: "Tulis pertanyaan 1-8000 karakter." });
+  const userId = request.user!.id;
+  const quotaBlock = quotaGuard(userId, "");
+  if (quotaBlock) return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
+  const settings = agentSettings(userId);
+  const thinking = isThinkingLevel(request.body?.thinking) ? String(request.body?.thinking) : settings.thinking_level;
+  const model = request.body?.model?.trim() || undefined;
+  if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
+  const blocks = request.body?.useMemory === false ? [] : systemBlocksFor(userId, request.body?.personaId ?? null, null);
+  const autonomous = Boolean(request.body?.autonomous);
+  const sessionId = randomUUID(); const started = Date.now();
+  const playgroundRunId = randomUUID();
+  // The playground is a real engine call, so it must honour the same tool allowlist as a chat run.
+  const playgroundTools = parseToolsAllow(settings.tools_allow);
+  let text = ""; let usage: unknown = null;
+  try {
+    for await (const event of engine.run({
+      runId: playgroundRunId, sessionId, prompt,
+      model: model || config.PRIME_AGENT_MODEL, provider: model ? providerForModel(model) : config.PRIME_AGENT_PROVIDER,
+      thinking, appendSystem: blocks, tools: playgroundTools ?? undefined,
+      autonomous: autonomous ? { maxTurns: settings.autonomous_max_turns, maxTokens: settings.autonomous_max_tokens } : undefined,
+    })) {
+      if (event.type === "text") text += typeof event.data === "string" ? event.data : "";
+      if (event.type === "completed") usage = (event.data as { usage?: unknown })?.usage ?? null;
+      if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
+    }
+  } catch (error) {
+    return reply.code(502).send({ error: "PLAYGROUND_FAILED", message: error instanceof Error ? error.message : "Mesin gagal menjawab." });
+  }
+  const reported = usage as { totalTokens?: number; inputTokens?: number; outputTokens?: number; model?: string } | null;
+  const tokens = Math.round(Number(reported?.totalTokens ?? 0) || Math.ceil(prompt.length / 4) + Math.ceil(text.length / 4));
+  // A playground call has no project, so run_usage cannot hold it; user_usage makes the tokens visible
+  // to quotaState() and to the usage figures. Without this row the call was free and unreported.
+  const reportedTokens = typeof reported?.totalTokens === "number" || typeof reported?.inputTokens === "number" || typeof reported?.outputTokens === "number";
+  const usageModel = typeof reported?.model === "string" ? reported.model : (model ?? config.PRIME_AGENT_MODEL ?? null);
+  const inputTokens = reportedTokens ? Math.round(reported?.inputTokens ?? 0) : Math.ceil(prompt.length / 4);
+  const outputTokens = reportedTokens ? Math.round(reported?.outputTokens ?? 0) : Math.ceil(text.length / 4);
+  const costMicros = estimateCostMicros(usageModel, { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
+  db.prepare("INSERT INTO user_usage (id,user_id,run_id,source,model,provider,input_tokens,output_tokens,total_tokens,cost_micros,estimated,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run(randomUUID(), userId, playgroundRunId, "playground", usageModel, usageModel ? providerForModel(usageModel) : config.PRIME_AGENT_PROVIDER ?? null, inputTokens, outputTokens, tokens, costMicros, reportedTokens ? 0 : 1, new Date().toISOString());
+  chargeQuota(userId, tokens);
+  return { text, usage, thinking, autonomous, model: usageModel, systemBlocks: blocks.length, tools: playgroundTools ?? null, tokens, durationMs: Date.now() - started, sessionId };
+});
+
+// ------------------------------------------------------------
+// Compaction
+// ------------------------------------------------------------
+app.post<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversationId/compact", { preHandler: requireUser }, async (request: any, reply) => {
+  const conversation = db.prepare("SELECT c.id, c.project_id AS projectId, p.workspace_id AS workspaceId, m.role AS role FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; projectId: string; workspaceId: string; role: string } | undefined;
+  if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  if (conversation.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  // Compacting an empty conversation would spend engine tokens on a meaningless summary and rotate the
+  // engine session for nothing, so it is refused before any work happens.
+  const existing = db.prepare("SELECT COUNT(*) AS n FROM messages WHERE conversation_id=?").get(conversation.id) as { n: number };
+  if (existing.n === 0) return reply.code(400).send({ error: "NO_MESSAGES_TO_COMPACT", message: "Percakapan ini belum punya pesan untuk diringkas." });
+  const result = await compactConversation(conversation.id, request.user!.id);
+  if (!result) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  recordAudit(conversation.workspaceId, request.user!.id, "conversation.compacted", { conversationId: conversation.id, messagesCovered: result.messagesCovered, charsBefore: result.charsBefore, charsAfter: result.charsAfter, source: result.source });
+  return { compacted: true, ...result };
+});
+
+app.get<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversationId/summaries", { preHandler: requireUser }, async (request: any, reply) => {
+  const allowed = db.prepare("SELECT 1 FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id);
+  if (!allowed) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  const summaries = db.prepare("SELECT id, summary, messages_covered AS messagesCovered, chars_before AS charsBefore, chars_after AS charsAfter, created_at AS createdAt FROM conversation_summaries WHERE conversation_id=? ORDER BY created_at DESC LIMIT 20").all(request.params.conversationId);
+  const conversation = db.prepare("SELECT engine_session_id AS engineSessionId, compacted_at AS compactedAt FROM conversations WHERE id=?").get(request.params.conversationId);
+  return { summaries, conversation, messages: messageCount(request.params.conversationId) };
+});
+
+// ------------------------------------------------------------
+// Agent map: conversations, engine sessions, and the run tree
+// ------------------------------------------------------------
+app.get<{ Querystring: { limit?: string } }>("/api/v1/agents/map", { preHandler: requireUser }, async (request: any) => {
+  const limit = Math.min(Math.max(Number(request.query?.limit ?? 30) || 30, 1), 100);
+  const rows = db.prepare(`SELECT c.id, c.title, c.updated_at AS updatedAt, c.engine_session_id AS engineSessionId, c.compacted_at AS compactedAt,
+      c.persona_id AS personaId, p.id AS projectId, p.name AS projectName, w.name AS workspaceName,
+      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id) AS messages,
+      (SELECT COUNT(*) FROM conversation_summaries s WHERE s.conversation_id=c.id) AS summaries
+    FROM conversations c JOIN projects p ON p.id=c.project_id JOIN workspaces w ON w.id=p.workspace_id
+    JOIN memberships m ON m.workspace_id=p.workspace_id
+    WHERE m.user_id=? ORDER BY c.updated_at DESC LIMIT ?`).all(request.user!.id, limit) as any[];
+  const sessions = [];
+  for (const row of rows) {
+    sessions.push({
+      conversationId: row.id, title: row.title, projectId: row.projectId, projectName: row.projectName, workspaceName: row.workspaceName,
+      updatedAt: row.updatedAt, messages: row.messages, summaries: row.summaries, compactedAt: row.compactedAt, personaId: row.personaId,
+      engineSessionId: row.engineSessionId ?? null,
+      engineSession: row.engineSessionId ? await dirStats(join(config.ENGINE_ROOT_DIR, row.engineSessionId)) : null,
+      runs: db.prepare(`SELECT r.id, r.status, r.model, r.thinking_level AS thinkingLevel, r.autonomous, r.parent_run_id AS parentRunId,
+          r.error_code AS errorCode, r.prompt_chars AS promptChars, r.append_system_chars AS appendSystemChars,
+          r.created_at AS createdAt, r.finished_at AS finishedAt, COALESCE(u.total_tokens,0) AS totalTokens
+        FROM runs r LEFT JOIN run_usage u ON u.run_id=r.id
+        WHERE EXISTS (SELECT 1 FROM messages m WHERE m.run_id=r.id AND m.conversation_id=?)
+        ORDER BY r.created_at DESC LIMIT 10`).all(row.id),
+    });
+  }
+  return { sessions, engine: await engine.health(), engineRoot: config.ENGINE_ROOT_DIR, rootStorage: await dirStats(config.ENGINE_ROOT_DIR), note: "Sesi mesin dipakai bergantian: percakapan yang sudah dipadatkan memakai sesi baru." };
+});
+
+// ------------------------------------------------------------
+// Artifact diff
+// ------------------------------------------------------------
+app.get<{ Params: { artifactId: string; otherId: string }; Querystring: { context?: string } }>("/api/v1/artifacts/:artifactId/diff/:otherId", { preHandler: requireUser }, async (request: any, reply) => {
+  const load = (id: string) => db.prepare(`SELECT a.id, a.name, a.mime_type AS mimeType, a.size_bytes AS sizeBytes, a.storage_path AS storagePath
+    FROM artifacts a JOIN projects p ON p.id=a.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE a.id=? AND m.user_id=?`)
+    .get(id, request.user!.id) as { id: string; name: string; mimeType: string; sizeBytes: number; storagePath: string } | undefined;
+  const left = load(request.params.artifactId); const right = load(request.params.otherId);
+  if (!left || !right) return reply.code(404).send({ error: "ARTIFACT_NOT_FOUND" });
+  if (left.id === right.id) return reply.code(400).send({ error: "SAME_ARTIFACT", message: "Pilih dua artefak yang berbeda." });
+  const READ_LIMIT = 400_000;
+  if (left.sizeBytes > READ_LIMIT || right.sizeBytes > READ_LIMIT) return reply.code(413).send({ error: "ARTIFACT_TOO_LARGE", message: "Diff dibatasi 400 KB per artefak." });
+  let leftText = ""; let rightText = "";
+  try { leftText = (await readFile(left.storagePath)).toString("utf8"); rightText = (await readFile(right.storagePath)).toString("utf8"); }
+  catch { return reply.code(404).send({ error: "ARTIFACT_FILE_MISSING" }); }
+  const context = Math.min(Math.max(Number(request.query?.context ?? 3) || 3, 0), 20);
+  return unifiedDiff(left.name, leftText, right.name, rightText, context);
+});
+
+// ------------------------------------------------------------
+// Markdown report
+// ------------------------------------------------------------
+app.get<{ Params: { projectId: string }; Querystring: { kind?: string; conversationId?: string } }>("/api/v1/projects/:projectId/report.md", { preHandler: requireUser }, async (request: any, reply) => {
+  const kind = (request.query?.kind ?? "project").toLowerCase();
+  if (!["project", "conversation"].includes(kind)) return reply.code(400).send({ error: "UNKNOWN_REPORT_KIND", message: "Jenis laporan: project atau conversation." });
+  const report = markdownReport(kind, request.params.projectId, request.user!.id, request.query?.conversationId);
+  if (!report) return reply.code(404).send({ error: "REPORT_NOT_AVAILABLE", message: kind === "conversation" ? "Proyek ini belum punya percakapan." : "Proyek tidak ditemukan." });
+  return reply
+    .header("Content-Disposition", `attachment; filename="${report.filename}"`)
+    .header("X-Content-Type-Options", "nosniff")
+    .type("text/markdown; charset=utf-8")
+    .send(report.markdown);
 });
 
 app.setErrorHandler((error: any, _request, reply) => { app.log.error(error); const status = Number(error.statusCode) >= 400 && Number(error.statusCode) < 500 ? Number(error.statusCode) : 500; return reply.code(status).send({ error: status < 500 ? "INVALID_REQUEST" : "INTERNAL_ERROR" }); });

@@ -15,8 +15,23 @@ export class PrimeRpcEngine implements AgentEngine {
   async *run(request: EngineRunRequest): AsyncIterable<EngineEvent> {
     const sessionDir = join(this.options.rootDir, request.sessionId); await mkdir(sessionDir, { recursive: true });
     const args = ["--mode", "rpc", "--session-dir", sessionDir];
-    if (this.options.model) args.push("--model", this.options.model);
-    if (this.options.provider) args.push("--provider", this.options.provider);
+    if (request.model ?? this.options.model) args.push("--model", String(request.model ?? this.options.model));
+    if (request.provider ?? this.options.provider) args.push("--provider", String(request.provider ?? this.options.provider));
+    // Reasoning effort is a real token saver: lower levels spend fewer thinking tokens.
+    if (request.thinking) args.push("--thinking", request.thinking);
+    // Persona, memory bank and conversation summary travel as extra system prompt blocks.
+    for (const block of request.appendSystem ?? []) if (String(block).trim()) args.push("--append-system-prompt", String(block));
+    // An empty allowlist means "no tools" on purpose, so the check is not falsy-based.
+    if (Array.isArray(request.tools)) {
+      if (!request.tools.length) args.push("--no-tools");
+      else args.push("--tools", request.tools.join(","));
+    }
+    if (request.autonomous) {
+      args.push("--autonomous");
+      if (request.autonomous.maxTurns) args.push("--autonomous-max-turns", String(request.autonomous.maxTurns));
+      if (request.autonomous.maxTokens) args.push("--autonomous-max-tokens", String(request.autonomous.maxTokens));
+      if (request.autonomous.maxContinuations) args.push("--autonomous-max-continuations", String(request.autonomous.maxContinuations));
+    }
     const child = spawn(this.options.binary, args, { stdio: ["pipe", "pipe", "pipe"], env: process.env });
     let ended = false; const timeout = this.options.timeoutMs ?? 30 * 60_000;
     const queue: EngineEvent[] = []; let wake: (() => void) | null = null; let streamed = false;

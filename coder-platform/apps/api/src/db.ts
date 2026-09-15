@@ -83,6 +83,16 @@ CREATE TABLE IF NOT EXISTS run_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_run_usage_project ON run_usage(project_id, created_at DESC);
 
+/* Playground and other ad-hoc engine calls have no project, so run_usage cannot hold them
+   (its project_id is NOT NULL). Their tokens are recorded per user here, and quota counts both tables. */
+CREATE TABLE IF NOT EXISTS user_usage (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, run_id TEXT,
+ source TEXT NOT NULL DEFAULT 'playground', model TEXT, provider TEXT,
+ input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER NOT NULL,
+ cost_micros INTEGER, estimated INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_usage_user ON user_usage(user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS artifacts (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, run_id TEXT REFERENCES runs(id) ON DELETE SET NULL, name TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, storage_path TEXT NOT NULL, created_at TEXT NOT NULL
 );
@@ -294,9 +304,69 @@ CREATE TABLE IF NOT EXISTS message_attachments (
 CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachments(message_id, created_at);
 `);
 
+// Wave 3: agent workspace. The memory bank, prompt templates, personas and the
+// token saver settings belong to a user; workspace_id is optional sharing.
+db.exec(`
+CREATE TABLE IF NOT EXISTS agent_memories (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL, workspace_id TEXT,
+ title TEXT NOT NULL, body TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '',
+ pinned INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, use_count INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_memories_user ON agent_memories(user_id, pinned DESC, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS prompt_templates (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL, workspace_id TEXT,
+ name TEXT NOT NULL, body TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+ slash TEXT, tags TEXT NOT NULL DEFAULT '', use_count INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_templates_user ON prompt_templates(user_id, name);
+
+CREATE TABLE IF NOT EXISTS agent_personas (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL, workspace_id TEXT,
+ name TEXT NOT NULL, system_prompt TEXT NOT NULL, tone TEXT NOT NULL DEFAULT '',
+ language TEXT NOT NULL DEFAULT 'id', model TEXT, thinking_level TEXT NOT NULL DEFAULT 'medium',
+ is_default INTEGER NOT NULL DEFAULT 0, use_count INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_personas_user ON agent_personas(user_id, is_default DESC, name);
+
+CREATE TABLE IF NOT EXISTS agent_settings (
+ user_id TEXT PRIMARY KEY,
+ thinking_level TEXT NOT NULL DEFAULT 'medium',
+ auto_compact INTEGER NOT NULL DEFAULT 1,
+ compact_after_messages INTEGER NOT NULL DEFAULT 24,
+ tools_allow TEXT NOT NULL DEFAULT '',
+ autonomous_default INTEGER NOT NULL DEFAULT 0,
+ autonomous_max_turns INTEGER NOT NULL DEFAULT 6,
+ autonomous_max_tokens INTEGER NOT NULL DEFAULT 40000,
+ updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+ id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ summary TEXT NOT NULL, messages_covered INTEGER NOT NULL DEFAULT 0,
+ chars_before INTEGER NOT NULL DEFAULT 0, chars_after INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation ON conversation_summaries(conversation_id, created_at DESC);
+`);
+/** Wave 3 columns: an engine session can rotate (compaction), and a conversation can hold a persona. */
+try { db.exec("ALTER TABLE conversations ADD COLUMN engine_session_id TEXT"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN persona_id TEXT"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN compacted_at TEXT"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN thinking_level TEXT"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN persona_id TEXT"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN autonomous INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN parent_run_id TEXT"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN prompt_chars INTEGER"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN append_system_chars INTEGER"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN default_persona_id TEXT"); } catch {}
+
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 9;
-export const SCHEMA_VERSION_NOTE = "chat attachments (message_attachments), commerce (plans, orders, coupons, credit, quota), user tier";
+const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION_NOTE = "per-user usage for calls without a project (playground), on top of the agent workspace tables";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

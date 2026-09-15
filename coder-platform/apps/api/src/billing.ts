@@ -222,11 +222,15 @@ export function creditHistory(userId: string, limit = 50) {
     .all(userId, limit);
 }
 
-/** Token counts actually consumed by one user, summed from run_usage (the source of truth). */
+/** Token counts actually consumed by one user. run_usage covers project runs (joined through the
+ *  workspace membership), while user_usage covers calls without a project, such as the playground. */
 export function tokensUsed(userId: string, since: string): number {
-  const row = db.prepare(`SELECT COALESCE(SUM(COALESCE(u.total_tokens, COALESCE(u.input_tokens,0)+COALESCE(u.output_tokens,0))),0) AS tokens
-    FROM run_usage u JOIN projects p ON p.id = u.project_id JOIN memberships m ON m.workspace_id = p.workspace_id
-    WHERE m.user_id=? AND u.created_at >= ?`).get(userId, since) as { tokens: number };
+  const row = db.prepare(`SELECT
+      COALESCE((SELECT SUM(COALESCE(u.total_tokens, COALESCE(u.input_tokens,0)+COALESCE(u.output_tokens,0)))
+        FROM run_usage u JOIN projects p ON p.id = u.project_id JOIN memberships m ON m.workspace_id = p.workspace_id
+        WHERE m.user_id=? AND u.created_at >= ?),0)
+      + COALESCE((SELECT SUM(u2.total_tokens) FROM user_usage u2 WHERE u2.user_id=? AND u2.created_at >= ?),0)
+    AS tokens`).get(userId, since, userId, since) as { tokens: number };
   return row.tokens;
 }
 

@@ -60,6 +60,12 @@ while IFS= read -r line; do
   [[ -z "\${key}" ]] && continue
   grep -q "^\${key}=" "\${PERSIST}" || printf '%s\n' "\${line}" >> "\${PERSIST}"
 done < .env.austria.example
+# The running version is reported by the app itself, so the value is refreshed on every deploy.
+if grep -q "^APP_VERSION=" "\${PERSIST}"; then
+  sed -i "s#^APP_VERSION=.*#APP_VERSION=${VERSION}#" "\${PERSIST}"
+else
+  printf 'APP_VERSION=%s\n' "${VERSION}" >> "\${PERSIST}"
+fi
 cp "\${PERSIST}" .env
 
 # Any version number in the image tag is replaced by the version being deployed.

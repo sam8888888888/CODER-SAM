@@ -7,6 +7,8 @@ const port = 3428;
 process.env.NODE_ENV = "test"; process.env.PORT = String(port); process.env.HOST = "127.0.0.1";
 process.env.DATA_DIR = `/tmp/coder-session-${Date.now()}`; process.env.MOCK_ENGINE = "true"; process.env.PUBLIC_DIR = `${process.env.DATA_DIR}/public`;
 process.env.PRIME_AGENT_MODEL = "test-model";
+// This suite asserts the estimate path, so the mock engine must stay silent about usage.
+process.env.MOCK_ENGINE_SILENT_USAGE = "1";
 
 await import("../src/server.js");
 await new Promise((resolve) => setTimeout(resolve, 1200));

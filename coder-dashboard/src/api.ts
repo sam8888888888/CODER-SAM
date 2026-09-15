@@ -46,6 +46,45 @@ export type RevenueSummary = { days: number; since: string; revenueIdr: number; 
 export type AdminUserRow = { id: string; email: string; displayName: string; tier: string; isAdmin: boolean; emailVerified: boolean; createdAt: string; workspaces: number };
 export type Branding = { appName: string; tagline: string; primaryColor: string; logoUrl: string; faviconUrl: string; supportEmail: string };
 
+
+// ============================ WAVE 3: agent workspace ============================
+export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type AgentSettings = { thinking_level: ThinkingLevel; auto_compact: number; compact_after_messages: number; tools_allow: string; autonomous_default: number; autonomous_max_turns: number; autonomous_max_tokens: number };
+export type AgentPreview = {
+  settings: AgentSettings; persona: { id: string; name: string; systemPrompt: string; tone: string; language: string; model: string | null; thinkingLevel: string } | null;
+  blocks: string[]; flags: string[]; summaryCount: number; messages: number; notes: string[];
+  conversation: { id: string; engineSessionId: string | null; compactedAt: string | null; personaId: string | null } | null;
+  session: { files: number; bytes: number; newest: string | null } | null;
+};
+export type MemoryNote = { id: string; title: string; body: string; tags: string; pinned: number; enabled: number; useCount: number; createdAt: string; updatedAt: string };
+export type PromptTemplate = { id: string; name: string; body: string; description: string; slash: string | null; tags: string; useCount: number; createdAt: string; updatedAt: string };
+export type Persona = { id: string; name: string; systemPrompt: string; tone: string; language: string; model: string | null; thinkingLevel: string; isDefault: number; useCount: number; createdAt: string; updatedAt: string };
+export type SkillRow = { key: string; name: string; available: boolean; detail: string; needs: string | null; group: string };
+export type DirStats = { files: number; bytes: number; newest: string | null };
+export type StatusHub = {
+  version: string | null; generatedAt: string; durationMs: number;
+  engine: { available: boolean; version?: string; models: number; note?: string | null; error?: string | null };
+  database: { ok: boolean; detail: string; tables: number; migrations: { version: number; note: string; appliedAt: string }[] };
+  counts: Record<string, number>;
+  money: { todayTokens: number; payments: { gateway: string; xenditEnabled: boolean; midtransEnabled: boolean; xenditConfigured: boolean; midtransConfigured: boolean } };
+  mail: { configured: boolean; from: string; host: string | null; secure: boolean };
+  security: { csrfStrict: boolean; sessionCookie: string; adminEmails: number; metricsEnabled: boolean };
+  limits: { dailyCostMicros: number; monthlyCostMicros: number; runsPerHour: number; engineTimeoutMs: number };
+  storage: { data: DirStats | null; engineSessions: DirStats | null };
+  lastRuns: { id: string; status: string; model: string | null; errorCode: string | null; createdAt: string; finishedAt: string | null; costMicros: number | null }[];
+  backup: { note: string; cron: string }; queue: Record<string, number>;
+};
+export type PlaygroundResult = { text: string; usage: unknown; thinking: string; autonomous: boolean; model: string | null; systemBlocks: number; tokens: number; durationMs: number; sessionId: string };
+export type CompactionResult = { compacted: true; summary: string; messagesCovered: number; charsBefore: number; charsAfter: number; engineSessionId: string; source: 'engine' | 'fallback'; usage: unknown };
+export type AgentMapSession = {
+  conversationId: string; title: string; projectId: string; projectName: string; workspaceName: string; updatedAt: string;
+  messages: number; summaries: number; compactedAt: string | null; personaId: string | null; engineSessionId: string | null; engineSession: DirStats | null;
+  runs: { id: string; status: string; model: string | null; thinkingLevel: string | null; autonomous: number; parentRunId: string | null; errorCode: string | null; promptChars: number | null; appendSystemChars: number | null; createdAt: string; finishedAt: string | null; totalTokens: number }[];
+};
+export type DiffLine = { type: ' ' | '-' | '+' | '@@'; text: string; left?: number; right?: number };
+export type DiffResult = { left: { name: string; lines: number }; right: { name: string; lines: number }; added: number; removed: number; changes: number; hunks: DiffLine[] };
+export type ConversationSummary = { id: string; summary: string; messagesCovered: number; charsBefore: number; charsAfter: number; createdAt: string };
+
 export const api = {
   me: () => request<{ user: User }>('/v1/auth/me'),
   login: (username: string, password: string, code?: string) => request<{ user: User; mfaEnabled?: boolean }>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: username, password, code }) }),
@@ -102,7 +141,7 @@ export const api = {
   }>(`/v1/projects/${projectId}/usage?days=${days}`),
   auditEvents: (workspaceId: string) => request<AuditEvent[]>(`/v1/workspaces/${workspaceId}/audit`),
   decideApproval: (executionId: string, decision: 'approved'|'rejected') => request(`/v1/workflow-executions/${executionId}/approval`, { method: 'POST', body: JSON.stringify({ decision }) }),
-  sendMessage: (id: string, content: string, model?: string, attachments?: { name: string; mimeType: string; contentBase64: string }[]) => request<{ message: Message; run: { id: string } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content, model, ...(attachments?.length ? { attachments } : {}) }) }),
+  sendMessage: (id: string, content: string, model?: string, attachments?: { name: string; mimeType: string; contentBase64: string }[], options?: { thinking?: ThinkingLevel; autonomous?: boolean; personaId?: string | null }) => request<{ message: Message; run: { id: string; status: string; thinkingLevel?: string; autonomous?: boolean; willCompact?: boolean; messages?: number } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content, model, ...(attachments?.length ? { attachments } : {}), ...(options?.thinking ? { thinking: options.thinking } : {}), ...(options?.autonomous ? { autonomous: true } : {}), ...(options?.personaId ? { personaId: options.personaId } : {}) }) }),
   // Lampiran chat: berkas dikirim sebagai base64 dan disimpan di server.
   attachmentUrl: (attachmentId: string) => `/api/v1/attachments/${encodeURIComponent(attachmentId)}`,
   branchSession: (id: string, body: { fromMessageId?: string; title?: string; rerun?: boolean; model?: string } = {}) =>
@@ -166,4 +205,32 @@ export const api = {
   // --- Branding --------------------------------------------------------------
   branding: () => request<Branding>('/v1/branding'),
   saveBranding: (patch: Partial<Branding>) => request<Branding>('/v1/admin/branding', { method: 'PUT', body: JSON.stringify(patch) }),
+
+  // --- Wave 3: agent workspace ----------------------------------------------
+  agentSettings: () => request<{ settings: AgentSettings; thinkingLevels: ThinkingLevel[]; toolsAllowHelp: string; autonomousHelp: string; quota: QuotaState }>('/v1/agents/settings'),
+  saveAgentSettings: (patch: { thinkingLevel?: ThinkingLevel; autoCompact?: boolean; compactAfterMessages?: number; toolsAllow?: string; autonomousDefault?: boolean; autonomousMaxTurns?: number; autonomousMaxTokens?: number }) => request<{ settings: AgentSettings }>('/v1/agents/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
+  agentPreview: (conversationId?: string, personaId?: string) => request<AgentPreview>(`/v1/agents/preview?${new URLSearchParams({ ...(conversationId ? { conversationId } : {}), ...(personaId ? { personaId } : {}) }).toString()}`),
+  agentMap: (limit = 30) => request<{ sessions: AgentMapSession[]; engine: { available: boolean; version?: string }; engineRoot: string; rootStorage: DirStats | null; note: string }>(`/v1/agents/map?limit=${limit}`),
+  memories: () => request<{ memories: MemoryNote[] }>('/v1/memories'),
+  createMemory: (input: { title: string; body: string; tags?: string; pinned?: boolean }) => request<{ memory: MemoryNote }>('/v1/memories', { method: 'POST', body: JSON.stringify(input) }),
+  updateMemory: (memoryId: string, patch: { title?: string; body?: string; tags?: string; pinned?: boolean; enabled?: boolean }) => request<{ memory: MemoryNote }>(`/v1/memories/${encodeURIComponent(memoryId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  deleteMemory: (memoryId: string) => request<{ deleted: boolean }>(`/v1/memories/${encodeURIComponent(memoryId)}`, { method: 'DELETE' }),
+  promptTemplates: () => request<{ templates: PromptTemplate[] }>('/v1/prompt-templates'),
+  createTemplate: (input: { name: string; body: string; description?: string; slash?: string; tags?: string }) => request<{ template: PromptTemplate }>('/v1/prompt-templates', { method: 'POST', body: JSON.stringify(input) }),
+  updateTemplate: (templateId: string, patch: { name?: string; body?: string; description?: string; slash?: string; tags?: string }) => request<{ template: PromptTemplate }>(`/v1/prompt-templates/${encodeURIComponent(templateId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  deleteTemplate: (templateId: string) => request<{ deleted: boolean }>(`/v1/prompt-templates/${encodeURIComponent(templateId)}`, { method: 'DELETE' }),
+  useTemplate: (templateId: string, variables?: Record<string, string>) => request<{ id: string; name: string; text: string; remainingVariables: string[] }>(`/v1/prompt-templates/${encodeURIComponent(templateId)}/use`, { method: 'POST', body: JSON.stringify({ variables: variables ?? {} }) }),
+  personas: () => request<{ personas: Persona[] }>('/v1/personas'),
+  createPersona: (input: { name: string; systemPrompt: string; tone?: string; language?: string; model?: string; thinkingLevel?: ThinkingLevel; makeDefault?: boolean }) => request<{ persona: Persona }>('/v1/personas', { method: 'POST', body: JSON.stringify(input) }),
+  updatePersona: (personaId: string, patch: { name?: string; systemPrompt?: string; tone?: string; language?: string; model?: string; thinkingLevel?: ThinkingLevel }) => request<{ persona: Persona }>(`/v1/personas/${encodeURIComponent(personaId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  deletePersona: (personaId: string) => request<{ deleted: boolean }>(`/v1/personas/${encodeURIComponent(personaId)}`, { method: 'DELETE' }),
+  setDefaultPersona: (personaId: string) => request<{ isDefault: boolean; personaId: string }>(`/v1/personas/${encodeURIComponent(personaId)}/default`, { method: 'POST' }),
+  setConversationPersona: (conversationId: string, personaId: string | null) => request<{ conversationId: string; personaId: string | null }>(`/v1/conversations/${encodeURIComponent(conversationId)}/persona`, { method: 'PATCH', body: JSON.stringify({ personaId }) }),
+  skills: () => request<{ skills: SkillRow[]; groups: string[]; engine: { available: boolean; version?: string }; storage: { data: DirStats | null; engineSessions: DirStats | null } }>('/v1/skills'),
+  statusHub: () => request<StatusHub>('/v1/status-hub'),
+  playground: (input: { prompt: string; model?: string; thinking?: ThinkingLevel; personaId?: string; useMemory?: boolean; autonomous?: boolean }) => request<PlaygroundResult>('/v1/playground/run', { method: 'POST', body: JSON.stringify(input) }),
+  compactConversation: (conversationId: string) => request<CompactionResult>(`/v1/conversations/${encodeURIComponent(conversationId)}/compact`, { method: 'POST' }),
+  conversationSummaries: (conversationId: string) => request<{ summaries: ConversationSummary[]; conversation: { engineSessionId: string | null; compactedAt: string | null }; messages: number }>(`/v1/conversations/${encodeURIComponent(conversationId)}/summaries`),
+  artifactDiff: (artifactId: string, otherId: string, context = 3) => request<DiffResult>(`/v1/artifacts/${encodeURIComponent(artifactId)}/diff/${encodeURIComponent(otherId)}?context=${context}`),
+  reportUrl: (projectId: string, kind: 'project' | 'conversation' = 'project', conversationId?: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/report.md?kind=${kind}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ''}`,
 };

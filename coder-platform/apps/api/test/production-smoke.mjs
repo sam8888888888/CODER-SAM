@@ -288,6 +288,53 @@ check("bulk delete reports ids it cannot touch", alienBulk.status === 200 && ali
 const branchUnknown = await call("POST", "/api/v1/conversations/00000000-0000-0000-0000-000000000000/branch", { rerun: false });
 check("branch refuses an unknown conversation", branchUnknown.status === 404, JSON.stringify(branchUnknown.json));
 
+// ---------------------------------------------------------------- Wave 3: agent workspace
+// Every call below reads real state from the running platform; nothing is assumed.
+const agentSettings = await call("GET", "/api/v1/agents/settings");
+check("agent settings are readable and list the real thinking levels", agentSettings.status === 200 && Boolean(agentSettings.json?.settings) && Array.isArray(agentSettings.json?.thinkingLevels) && agentSettings.json.thinkingLevels.includes("off"), JSON.stringify(agentSettings.json)?.slice(0, 200));
+const badThinking = await call("PATCH", "/api/v1/agents/settings", { thinkingLevel: "ultra" });
+check("an unknown thinking level is refused", badThinking.status === 400 && badThinking.json.error === "INVALID_THINKING_LEVEL", JSON.stringify(badThinking.json));
+const preview = await call("GET", "/api/v1/agents/preview");
+check("agent preview shows the real flags and blocks", preview.status === 200 && Array.isArray(preview.json?.flags) && Array.isArray(preview.json?.blocks) && Array.isArray(preview.json?.notes), JSON.stringify(preview.json)?.slice(0, 200));
+const memories = await call("GET", "/api/v1/memories");
+check("memory bank lists notes", memories.status === 200 && Array.isArray(memories.json?.memories), JSON.stringify(memories.json)?.slice(0, 160));
+const templates = await call("GET", "/api/v1/prompt-templates");
+check("prompt templates list", templates.status === 200 && Array.isArray(templates.json?.templates), JSON.stringify(templates.json)?.slice(0, 160));
+const personas = await call("GET", "/api/v1/personas");
+check("personas list", personas.status === 200 && Array.isArray(personas.json?.personas), JSON.stringify(personas.json)?.slice(0, 160));
+const skills = await call("GET", "/api/v1/skills");
+check("capability catalogue is grouped and marks real availability", skills.status === 200 && Array.isArray(skills.json?.skills) && skills.json.skills.length > 10 && Array.isArray(skills.json?.groups) && skills.json.skills.every((row) => typeof row.available === "boolean"), JSON.stringify(skills.json)?.slice(0, 200));
+const statusHub = await call("GET", "/api/v1/status-hub");
+check("status hub reports engine, database and storage", statusHub.status === 200 && typeof statusHub.json?.database?.ok === "boolean" && Boolean(statusHub.json?.counts) && Boolean(statusHub.json?.engine) && Boolean(statusHub.json?.storage), JSON.stringify(statusHub.json)?.slice(0, 200));
+const engineReport = statusHub.json?.engine ?? {};
+console.log(`INFO engine available=${engineReport.available} version=${engineReport.version} models=${engineReport.models}`);
+const agentMap = await call("GET", "/api/v1/agents/map?limit=3");
+check("agent map lists sessions with their runs", agentMap.status === 200 && Array.isArray(agentMap.json?.sessions) && agentMap.json.sessions.every((row) => Array.isArray(row.runs)), JSON.stringify(agentMap.json)?.slice(0, 200));
+const emptyPlayground = await call("POST", "/api/v1/playground/run", { prompt: "" });
+check("playground refuses an empty prompt before spending tokens", emptyPlayground.status === 400 && emptyPlayground.json.error === "INVALID_PROMPT", JSON.stringify(emptyPlayground.json));
+// A fresh conversation is used here because the earlier smoke conversation is deleted on purpose above.
+const summaryChat = await call("POST", `/api/v1/projects/${projectId}/conversations`, { title: "Smoke ringkasan Wave 3" });
+const summaryChatId = summaryChat.json?.conversation?.id;
+const summaries = await call("GET", `/api/v1/conversations/${summaryChatId}/summaries`);
+check("conversation summaries endpoint answers", summaries.status === 200 && Array.isArray(summaries.json?.summaries) && typeof summaries.json?.messages === "number", JSON.stringify(summaries.json)?.slice(0, 200));
+const compactEmpty = await call("POST", `/api/v1/conversations/${summaryChatId}/compact`, {});
+check("compacting a conversation without messages is refused", compactEmpty.status === 400 && compactEmpty.json.error === "NO_MESSAGES_TO_COMPACT", JSON.stringify(compactEmpty.json));
+const removeSummaryChat = await call("DELETE", `/api/v1/conversations/${summaryChatId}`);
+check("wave 3 smoke conversation cleaned up", removeSummaryChat.status === 200 && removeSummaryChat.json.deleted === true, JSON.stringify(removeSummaryChat.json));
+const badReportKind = await call("GET", `/api/v1/projects/${projectId}/report.md?kind=ngawur`);
+check("report refuses an unknown kind", badReportKind.status === 400 && badReportKind.json.error === "UNKNOWN_REPORT_KIND", JSON.stringify(badReportKind.json));
+const reportResponse = await fetch(`${BASE}/api/v1/projects/${projectId}/report.md?kind=project`, { headers: { cookie } });
+const reportText = await reportResponse.text();
+check("project Markdown report downloads with a filename", reportResponse.status === 200 && (reportResponse.headers.get("content-type") || "").includes("text/markdown") && Boolean(reportResponse.headers.get("content-disposition")) && reportText.startsWith("# Laporan proyek"), `${reportResponse.status} ${reportText.slice(0, 80)}`);
+// One tiny real AI call: proof that the playground path reaches the model, not a mock.
+const quotaBefore = Number((await call("GET", "/api/v1/agents/settings")).json?.quota?.usedToday ?? 0);
+const playground = await call("POST", "/api/v1/playground/run", { prompt: "Balas dengan satu kata: siap", thinking: "off" });
+const quotaAfter = Number((await call("GET", "/api/v1/agents/settings")).json?.quota?.usedToday ?? 0);
+check("playground tokens are recorded against the daily quota", quotaAfter > quotaBefore, `sebelum=${quotaBefore} sesudah=${quotaAfter} tokens=${playground.json?.tokens}`);
+check("playground obeys the tool allowlist of the account", playground.status === 200 && Object.prototype.hasOwnProperty.call(playground.json ?? {}, "tools"), JSON.stringify(playground.json)?.slice(0, 200));
+check("playground really answers through the engine", playground.status === 200 && typeof playground.json?.text === "string" && playground.json.text.trim().length > 0 && playground.json.tokens > 0, JSON.stringify(playground.json)?.slice(0, 240));
+console.log(`INFO playground model=${playground.json?.model} thinking=${playground.json?.thinking} tokens=${playground.json?.tokens} ms=${playground.json?.durationMs}`);
+
 const adminBlocked = await call("GET", "/api/v1/admin/overview");
 check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));
 const metricsBlocked = await call("GET", "/metrics");

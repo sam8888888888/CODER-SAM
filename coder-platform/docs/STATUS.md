@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 14 Sep 2026 (versi 0.12.0)
+Terakhir diperbarui: 15 Sep 2026 (versi 0.13.0)
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel
@@ -8,9 +8,55 @@ di `apps/api/src/db.ts`, halaman di `coder-dashboard/src/nav.ts`, dan suite di `
 Bila ragu, tulis "belum diverifikasi".
 
 Catatan snapshot: berkas ini diperiksa saat repo sedang diedit, jadi beberapa perubahan belum di-commit
-(Wave 2: `server.ts`, `db.ts`, `App.tsx`, `Tools.tsx`, `api.ts`, `styles.css`, `vite.config.ts`, `index.html`).
-Jumlah rute `server.ts` saat diperiksa: 115 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2 untuk lampiran, cabang dan hapus massal).
+(Wave 3: `server.ts`, `db.ts`, `engine-adapter.ts`, `prime-rpc-engine.ts`, `api.ts`, `nav.ts`, `App.tsx`, 9 halaman baru).
+Jumlah rute `server.ts` saat diperiksa: 140 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2 untuk lampiran, cabang dan hapus massal; 25 rute Wave 3 untuk ruang kerja agen).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
+
+## Wave 3 (v0.13.0) — ruang kerja agen
+
+- Pengaturan agen per pengguna: `GET/PATCH /api/v1/agents/settings` (schema 10, tabel `agent_settings`).
+  Isi: tingkat penalaran (`--thinking`), allowlist alat (`--tools` / `--no-tools`), pemadatan otomatis
+  (`auto_compact`, `compact_after_messages`), dan batas mode otonom. Nilai divalidasi di server.
+- Pratinjau jujur: `GET /api/v1/agents/preview` mengembalikan `flags[]` (argumen CLI yang akan dipakai),
+  `blocks[]` (teks yang dikirim sebagai `--append-system-prompt`), `notes[]`, dan ukuran sesi mesin.
+  Jadi apa yang dikirim ke mesin bisa diperiksa sebelum menjalankan run.
+- Bank memori: `/api/v1/memories` (CRUD). Catatan aktif (maksimal 12, yang disematkan didahulukan)
+  dikirim sebagai satu blok system, bukan sebagai bagian pesan pengguna.
+- Template prompt dan perintah garis miring: `/api/v1/prompt-templates` (CRUD) + `POST /:id/use`
+  yang mengisi `{{variabel}}` dan melaporkan variabel yang belum terisi.
+- Persona agen: `/api/v1/personas` (CRUD, `POST /:id/default`), plus `PATCH /api/v1/conversations/:id/persona`
+  untuk memasang persona pada satu percakapan. Persona memasok blok system pertama.
+- Penghemat token yang nyata: pemadatan meminta ringkasan ke mesin pada sesi yang sama, menyimpannya di
+  `conversation_summaries`, lalu **memutar** `conversations.engine_session_id` ke UUID baru sehingga riwayat
+  panjang tidak dikirim lagi. Bila mesin gagal, dipakai potongan transkrip dengan penanda `source: "fallback"`.
+  Rute: `POST /api/v1/conversations/:id/compact`, `GET /api/v1/conversations/:id/summaries`.
+- Playground: `POST /api/v1/playground/run` menjalankan satu prompt tanpa menyimpan percakapan,
+  memakai pengaturan akun, dan token tetap dihitung ke kuota.
+- Peta agen: `GET /api/v1/agents/map` (percakapan, sesi mesin di disk, pohon run dengan `parent_run_id`,
+  `thinking_level`, `autonomous`, `prompt_chars`, `append_system_chars`).
+- Pembanding artefak: `GET /api/v1/artifacts/:artifactId/diff/:otherId` (unified diff LCS buatan sendiri,
+  batas 400 KB per artefak; artefak yang sama ditolak `SAME_ARTIFACT`).
+- Laporan Markdown: `GET /api/v1/projects/:projectId/report.md?kind=project|conversation` dengan header
+  `Content-Disposition`, dipakai tombol "Laporan proyek" di bilah atas.
+- Katalog kapabilitas: `GET /api/v1/skills` membaca keadaan nyata (mesin, katalog model, SMTP, gateway,
+  jumlah memori/template/persona/artefak) dan menandai tiap baris `available` atau `needs`.
+  Katalog ini TIDAK mengklaim paket skill mesin, karena di container mesin memang belum ada paket terpasang.
+- Status hub: `GET /api/v1/status-hub` (mesin, `PRAGMA quick_check`, hitungan tabel, migrasi, uang,
+  surat, keamanan, batas, penyimpanan, run terakhir). Versi aplikasi dibaca dari `APP_VERSION`
+  yang ditulis otomatis oleh `deploy/deploy-austria.sh`.
+
+### Penyimpangan Wave 3 yang diketahui (bukan bug, tapi bisa mengejutkan)
+
+- `GET /api/v1/projects/:projectId/report.md?kind=conversation` tanpa `conversationId` memakai
+  percakapan PALING BARU di proyek itu, tanpa konfirmasi. Perilaku ini dipertahankan agar tautan
+  lama tidak putus, dan dicatat di sini supaya disadari.
+- Melepas persona percakapan (`PATCH /conversations/:id/persona` dengan `personaId: null`) tidak
+  mengosongkan blok persona: percakapan kembali memakai persona bawaan akun.
+- Angka token playground diambil dari `usage` mesin bila ada; kalau mesin tidak melaporkan,
+  angkanya estimasi `ceil(panjang teks / 4)` dan baris `user_usage` ditandai `estimated=1`.
+- Kolom `runs.persona_id` belum punya endpoint HTTP pembaca. Penyimpanannya dibuktikan lewat
+  `conversations.persona_id` (pratinjau), `sessions[].personaId` (peta agen), `runs.append_system_chars > 0`,
+  dan teks persona yang terlihat di opsi mesin.
 
 ## Wave 2 (v0.12.0) — komunikasi & tampilan
 
