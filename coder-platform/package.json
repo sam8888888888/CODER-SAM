@@ -9,6 +9,7 @@
     "backup": "tsx apps/api/src/backup.ts",
     "restore": "tsx apps/api/src/restore.ts",
     "start": "node dist/api/server.js",
+    "verify": "node apps/api/test/run-all.cjs",
     "test:workflow": "tsx apps/api/test/workflow-engine.e2e.ts",
     "test:migration": "tsx apps/api/test/migration-check.ts",
     "test:session": "tsx apps/api/test/session-usage.e2e.ts",

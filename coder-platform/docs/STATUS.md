@@ -77,11 +77,12 @@ Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
 
 ### Bukti uji Wave 4
 
-- `apps/api/test/wave4.e2e.ts` — 180 pemeriksaan, 0 gagal, 0 dilewati (`ALL_WAVE4_TESTS_PASSED`).
+- `apps/api/test/wave4.e2e.ts` — 181 pemeriksaan, 0 gagal, 0 dilewati (`ALL_WAVE4_TESTS_PASSED`).
   Mencakup: kunci API (termasuk batas 20 dan batas laju 429), API publik dan isolasi lintas workspace,
   antrean email, preferensi email (termasuk penggabungan email harian), ekspor data (termasuk pemeriksaan
   bahwa berkas tidak memuat bahan rahasia), laporan retensi, peran viewer, dan harga publik.
-- `apps/api/test/run-all.cjs` — 22/22 suite mock hijau (termasuk Wave 2, Wave 3, Wave 4, outbox-mail).
+- `apps/api/test/run-all.cjs` — 24/24 suite mock hijau (termasuk Wave 2, Wave 3, Wave 4, outbox-mail,
+  csrf-strict, backup-restore). Bisa juga lewat `npm run verify`.
 - `apps/api/test/outbox-mail.e2e.ts` — 14 pemeriksaan, semua lulus: dengan `NOTIFY_EMAIL_ENABLED=true`
   tetapi SMTP kosong, antrean TIDAK pernah mencoba menghubungi SMTP (`sent=0`, baris menjadi `skipped`
   dengan alasan `MAILER_NOT_CONFIGURED`), dan pesan menunggu ditolak saat dihapus (`409 EMAIL_IN_FLIGHT`).
@@ -326,16 +327,54 @@ Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
 - Deploy VPS: paket dan script ada, eksekusi di server Austria belum diverifikasi (butuh SSH, dipegang
   Aaron).
 
-## Belum dibuat
+## Belum dibuat (daftar ini diperiksa ulang 15 Sep 2026, versi 0.14.1)
 
-- Billing dan pembayaran: tidak ada kode penagihan atau integrasi penyedia pembayaran.
+Bagian ini sebelumnya memuat beberapa hal yang sekarang SUDAH ada. Versi jujurnya:
+
+Sudah ada sekarang (dulu tertulis "belum dibuat"):
+- Penagihan dan pembayaran manual: `billing.ts` (paket, pesanan, bukti transfer, kupon, kredit).
+  Integrasi penyedia otomatis tetap belum ada karena kuncinya belum diberikan.
+- Surat keluar: `mailer.ts` + antrean `outbox.ts` + preferensi email. Pengirimannya masih dimatikan
+  (`NOTIFY_EMAIL_ENABLED=false`), jadi statusnya "siap tetapi belum dinyalakan".
+- Ekspor seluruh data pribadi dan kebijakan retensi: `dataexport.ts` dan `retention.ts`
+  (kebijakan retensi masih mode uji, `RETENTION_ENABLED=false`).
+- API publik untuk klien pihak ketiga (hanya baca) dan halaman harga publik `/harga`.
+- Sandbox kode: dijalankan lewat engine per run, bukan sandbox terisolasi sendiri.
+
+Masih benar-benar belum ada:
 - OAuth/SSO (Google, GitHub, SAML).
-- Notifikasi email atau push: notifikasi hanya di dalam aplikasi.
-- Worker/queue persisten, Redis, dan penskalaan horizontal.
-- Object storage: artefak disimpan di disk lokal container.
-- Ekspor seluruh data pribadi dan kebijakan retensi data.
+- Notifikasi push (browser/HP). Notifikasi email ada, tetapi masih dimatikan.
+- Worker/queue persisten dan Redis: penjadwal workflow, worker email, dan worker retensi semuanya
+  `setInterval` di dalam proses API. Kalau container dimatikan, jadwal yang sedang berjalan hilang dan
+  tidak ada percobaan ulang lintas restart.
+- Penskalaan horizontal: satu container, satu berkas SQLite, sesi di memori proses API.
+- Object storage: artefak dan berkas ekspor disimpan di disk container.
+- Pencarian pengetahuan berbasis vektor/embedding (sekarang FTS5 `bm25`), dan unggah dari URL.
+- Versi dan kuota artefak.
+- CI: repo punya remote GitHub, tetapi belum ada `.github/workflows`. Semua suite masih dijalankan manual
+  (sekarang satu perintah: `npm run verify`).
+- Gerbang persetujuan otomatis untuk deploy (`deploy-austria.sh` dijalankan manual oleh manusia).
 - `coder-platform/apps/web` masih kosong; UI ada di `coder-dashboard`.
-- API publik untuk klien pihak ketiga, sandbox kode, dan halaman harga.
+
+## Perbaikan pasca-Wave 4 (v0.14.1)
+
+Bukan wave baru, hanya penutupan celah yang ditemukan saat Wave 4 diuji.
+
+- Aturan hapus antrean email diperbaiki: baris `pending` boleh dihapus selagi pengiriman email mati,
+  ditolak `409 EMAIL_IN_FLIGHT` saat pengiriman aktif, dan id yang tidak ada menjawab `404 EMAIL_NOT_FOUND`.
+  Sebelumnya baris `pending` tidak bisa dihapus sama sekali, sehingga surat uji bisa tersangkut permanen.
+- Suite baru `apps/api/test/csrf-strict.e2e.ts` — 13 pemeriksaan, semua lulus: menutup catatan lama
+  "CSRF level dua belum ada suite yang menguji". Membuktikan cookie `coder_csrf` tidak HttpOnly,
+  tulis tanpa token ditolak `403 CSRF_TOKEN_REQUIRED`, tulis dari situs lain tetap `403 CSRF_BLOCKED`,
+  GET tidak terpengaruh, dan setiap klien mendapat token berbeda.
+- Suite baru `apps/api/test/backup-restore.e2e.ts` — 22 pemeriksaan, semua lulus: menjalankan skrip
+  produksi `backup.ts` dan `restore.ts` sungguhan. Menutup catatan lama "backup dan restore belum punya
+  uji otomatis". Bukti penting: data yang masih berada di WAL IKUT terbawa ke berkas backup, dan versi
+  skema serta baris pengguna ikut tersalin.
+  **Temuan jujur**: `restore.ts` menyalin berkas apa pun tanpa memeriksa isinya. Berkas yang bukan
+  database diterima saat restore dan baru gagal ketika aplikasi membukanya. Restore juga menimpa
+  database tujuan tanpa bertanya, jadi jalur pemulihan harus tetap manual dan disengaja.
+- `npm run verify` menjalankan seluruh suite sekaligus (24/24 hijau per 15 Sep 2026).
 
 ## Penghambat eksternal
 
@@ -363,6 +402,7 @@ Cek tipe (tanpa keluaran berarti lulus; saya jalankan 13 Sep 2026):
 Suite end-to-end lokal tanpa jaringan:
 
 - `cd coder-platform && MOCK_ENGINE=true npx tsx apps/api/test/<suite>.e2e.ts`
+- Cara tercepat sekarang: `cd coder-platform && npm run verify` (24 suite, mencetak `ALL_SUITES_PASSED`).
 - 21 suite (20 suite lama lulus 14 Sep 2026 sebelum Wave 2 dengan `RUNNER_EXIT=0`; `wave2` lulus
   104/104 pemeriksaan): `account-recovery`, `account-security`, `admin-metrics`, `billing`, `csrf-limits`,
   `delete-flow`, `guards`, `knowledge-team`, `login-identity`, `mailer`, `model-rbac`, `project-runs`,
