@@ -40,6 +40,17 @@ const Env = z.object({
   MIDTRANS_MERCHANT_ID: z.string().optional(),
   // Notification webhook used by the platform itself (admin alert channel). Optional.
   PLATFORM_WEBHOOK_URL: z.string().optional(),
+  // Wave 4: outgoing email is queued in the database first. The worker only delivers when this flag is on,
+  // so no message leaves the server until the owner asks for it.
+  NOTIFY_EMAIL_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
+  // Public API keys (Bearer tokens). Zero disables the per-key request limit for one minute.
+  API_KEY_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().min(0).default(120),
+  // Data retention. Deletion stays off until RETENTION_ENABLED is turned on, so reports can be reviewed first.
+  RETENTION_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
+  RETENTION_AUDIT_DAYS: z.coerce.number().int().min(1).default(365),
+  RETENTION_NOTIFICATION_DAYS: z.coerce.number().int().min(1).default(90),
+  RETENTION_RUN_EVENT_DAYS: z.coerce.number().int().min(1).default(30),
+  RETENTION_EXPORT_DAYS: z.coerce.number().int().min(1).default(7),
 });
 
 export const config = Env.parse(process.env);

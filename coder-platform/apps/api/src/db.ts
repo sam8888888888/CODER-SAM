@@ -351,6 +351,44 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
  created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_summaries_conversation ON conversation_summaries(conversation_id, created_at DESC);
+
+/* Wave 4: open platform and compliance. API keys are stored as a hash only, never as plain text. */
+CREATE TABLE IF NOT EXISTS api_keys (
+ id TEXT PRIMARY KEY, workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, prefix TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE,
+ scopes TEXT NOT NULL DEFAULT 'read', created_at TEXT NOT NULL, last_used_at TEXT,
+ revoked_at TEXT, request_count INTEGER NOT NULL DEFAULT 0, last_ip TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id, created_at DESC);
+
+/* Per user switch for outgoing email. In-app notifications ignore these switches on purpose. */
+CREATE TABLE IF NOT EXISTS notification_prefs (
+ user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ email_quota INTEGER NOT NULL DEFAULT 1, email_runs INTEGER NOT NULL DEFAULT 1, email_billing INTEGER NOT NULL DEFAULT 1,
+ email_team INTEGER NOT NULL DEFAULT 1, email_security INTEGER NOT NULL DEFAULT 1,
+ updated_at TEXT NOT NULL
+);
+
+/* Outgoing email is queued first, so tests and operators can inspect it without sending anything. */
+CREATE TABLE IF NOT EXISTS email_outbox (
+ id TEXT PRIMARY KEY, user_id TEXT REFERENCES users(id) ON DELETE CASCADE, to_email TEXT NOT NULL,
+ kind TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','failed','skipped')),
+ attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, dedupe_key TEXT,
+ created_at TEXT NOT NULL, sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status, created_at ASC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_email_outbox_dedupe ON email_outbox(dedupe_key) WHERE dedupe_key IS NOT NULL;
+
+/* A personal data export is a file on disk plus this row. Rows expire, the file is deleted later. */
+CREATE TABLE IF NOT EXISTS data_exports (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ status TEXT NOT NULL DEFAULT 'ready' CHECK(status IN ('ready','expired','deleted')),
+ size_bytes INTEGER NOT NULL DEFAULT 0, storage_path TEXT NOT NULL, sections TEXT NOT NULL,
+ created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_data_exports_user ON data_exports(user_id, created_at DESC);
 `);
 /** Wave 3 columns: an engine session can rotate (compaction), and a conversation can hold a persona. */
 try { db.exec("ALTER TABLE conversations ADD COLUMN engine_session_id TEXT"); } catch {}
@@ -365,8 +403,8 @@ try { db.exec("ALTER TABLE runs ADD COLUMN append_system_chars INTEGER"); } catc
 try { db.exec("ALTER TABLE users ADD COLUMN default_persona_id TEXT"); } catch {}
 
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 11;
-export const SCHEMA_VERSION_NOTE = "per-user usage for calls without a project (playground), on top of the agent workspace tables";
+const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION_NOTE = "API keys, email outbox and notification preferences, personal data exports, on top of the agent workspace tables";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

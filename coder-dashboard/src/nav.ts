@@ -1,5 +1,5 @@
 /** Pages of the workspace shell. Shared by the sidebar, the dashboard cards and the tool panels. */
-export type PageKey = 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'billing' | 'admin' | 'settings' | 'memory' | 'templates' | 'personas' | 'playground' | 'skills' | 'status' | 'agents' | 'diff' | 'tokenSaver';
+export type PageKey = 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'billing' | 'admin' | 'settings' | 'memory' | 'templates' | 'personas' | 'playground' | 'skills' | 'status' | 'agents' | 'diff' | 'tokenSaver' | 'apiKeys' | 'privacy' | 'adminEmail';
 
 export type NavItem = { key: PageKey; label: string; icon: string; blurb: string };
 
@@ -26,6 +26,9 @@ export const NAV_ITEMS: NavItem[] = [
   { key: 'diff', label: 'Pembanding', icon: '⧎', blurb: 'Bandingkan dua artefak dan lihat bedanya baris per baris' },
   { key: 'skills', label: 'Kapabilitas', icon: '❈', blurb: 'Daftar kemampuan platform beserta status nyatanya' },
   { key: 'status', label: 'Status platform', icon: '◉', blurb: 'Kesehatan mesin, basis data, surat, penyimpanan, dan laporan' },
+  { key: 'apiKeys', label: 'Kunci API', icon: '⚿', blurb: 'Buat kunci Bearer untuk skrip dan integrasi, atur izin, cabut' },
+  { key: 'privacy', label: 'Privasi & data', icon: '⛨', blurb: 'Unduh data akun Anda, atur email notifikasi, lihat kebijakan retensi' },
+  { key: 'adminEmail', label: 'Antrean email', icon: '✉', blurb: 'Lihat pesan keluar, kirim ulang, dan jalankan pembersihan retensi' },
 ];
 
 export const TOOL_PAGES: PageKey[] = ['knowledge', 'workflow', 'team', 'artifacts', 'usage', 'audit'];

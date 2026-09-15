@@ -85,6 +85,23 @@ export type DiffLine = { type: ' ' | '-' | '+' | '@@'; text: string; left?: numb
 export type DiffResult = { left: { name: string; lines: number }; right: { name: string; lines: number }; added: number; removed: number; changes: number; hunks: DiffLine[] };
 export type ConversationSummary = { id: string; summary: string; messagesCovered: number; charsBefore: number; charsAfter: number; createdAt: string };
 
+// --- Wave 4: platform terbuka, notifikasi email dan kepatuhan data -----------
+export type ApiKeyRow = { id: string; name: string; prefix: string; scopes: string; workspaceId: string; createdAt: string; lastUsedAt: string | null; lastUsedIp?: string | null; requestCount: number; revokedAt: string | null };
+export type PublicEndpoint = { method: string; path: string; scope: string; description: string; available?: boolean };
+export type ApiKeyDocs = { prefix: string; scopes: string[]; phase: string; rateLimitPerMinute: number; endpoints: PublicEndpoint[]; plannedEndpoints?: PublicEndpoint[]; example: { curl: string; note: string } };
+export type NotificationPrefs = { userId: string; emailQuota: number; emailRuns: number; emailBilling: number; emailTeam: number; emailSecurity: number; updatedAt: string };
+export type EmailWorkerState = { enabled: boolean; mailerConfigured: boolean; from: string };
+export type OutboxEmail = { id: string; userId: string | null; toEmail: string; kind: string; subject: string; body: string; status: string; attempts: number; lastError: string | null; createdAt: string; sentAt: string | null };
+export type OutboxStats = { pending: number; sent: number; failed: number; skipped: number; total: number; lastSentAt: string | null };
+export type ExportSection = { name: string; rows: number };
+export type DataExport = { id: string; userId: string; status: string; sizeBytes: number; sections: ExportSection[]; createdAt: string; expiresAt: string };
+export type RetentionPolicy = { enabled: boolean; auditDays: number; notificationDays: number; runEventDays: number; exportDays: number };
+export type RetentionTableReport = { table: string; column: string; cutoff: string; candidates: number; removed: number };
+export type RetentionReport = { policy: RetentionPolicy; generatedAt: string; tables: RetentionTableReport[]; totalCandidates: number; enabled?: boolean; note?: string };
+export type PrivacySummary = { policy: RetentionPolicy; sectionsInExport: ExportSection[]; storedTotals: { sections: number; rows: number }; exports: DataExport[]; email: EmailWorkerState; notes: string[] };
+export type PublicPackage = { code: string; name: string; description: string; priceIdr: number; periodDays: number; tier: string; dailyTokenLimit: number; monthlyTokenLimit: number; bonusTokens: number; features: unknown };
+export type PublicPricing = { branding: any; currency: string; usdToIdrRate: number; gateways: { xendit: boolean; midtrans: boolean; manualTransfer: boolean }; plans: PublicPackage[] };
+
 export const api = {
   me: () => request<{ user: User }>('/v1/auth/me'),
   login: (username: string, password: string, code?: string) => request<{ user: User; mfaEnabled?: boolean }>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: username, password, code }) }),
@@ -233,4 +250,25 @@ export const api = {
   conversationSummaries: (conversationId: string) => request<{ summaries: ConversationSummary[]; conversation: { engineSessionId: string | null; compactedAt: string | null }; messages: number }>(`/v1/conversations/${encodeURIComponent(conversationId)}/summaries`),
   artifactDiff: (artifactId: string, otherId: string, context = 3) => request<DiffResult>(`/v1/artifacts/${encodeURIComponent(artifactId)}/diff/${encodeURIComponent(otherId)}?context=${context}`),
   reportUrl: (projectId: string, kind: 'project' | 'conversation' = 'project', conversationId?: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/report.md?kind=${kind}${conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : ''}`,
+
+  // --- Wave 4: kunci API, API publik, notifikasi email, privasi data ----------
+  apiKeys: (workspaceId?: string) => request<{ keys: ApiKeyRow[]; note: string; limits: { maxActive: number; rateLimitPerMinute: number }; scopesAvailable: string[] }>(`/v1/api-keys${workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''}`),
+  apiKeyDocs: () => request<ApiKeyDocs>('/v1/api-keys/docs'),
+  createApiKey: (input: { name: string; scopes?: string[]; workspaceId?: string }) => request<{ key: ApiKeyRow; secret: string; workspaceId: string; warning: string }>('/v1/api-keys', { method: 'POST', body: JSON.stringify(input) }),
+  updateApiKey: (keyId: string, patch: { name?: string; scopes?: string[] }) => request<{ key: ApiKeyRow }>(`/v1/api-keys/${encodeURIComponent(keyId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  revokeApiKey: (keyId: string) => request<{ revoked: boolean; keyId: string }>(`/v1/api-keys/${encodeURIComponent(keyId)}`, { method: 'DELETE' }),
+  publicPlans: () => request<PublicPricing>('/v1/public/plans'),
+  notificationPrefs: () => request<{ preferences: NotificationPrefs; email: EmailWorkerState; kinds: { key: string; label: string }[]; note: string }>('/v1/account/notification-preferences'),
+  saveNotificationPrefs: (patch: Partial<NotificationPrefs>) => request<{ preferences: NotificationPrefs; message: string }>('/v1/account/notification-preferences', { method: 'PUT', body: JSON.stringify(patch) }),
+  privacySummary: () => request<PrivacySummary>('/v1/account/privacy'),
+  createExport: () => request<{ export: DataExport; sections: ExportSection[]; downloadUrl: string; message: string }>('/v1/account/export', { method: 'POST' }),
+  listExports: () => request<{ exports: DataExport[] }>('/v1/account/exports'),
+  deleteExport: (exportId: string) => request<{ deleted: boolean; exportId: string }>(`/v1/account/exports/${encodeURIComponent(exportId)}`, { method: 'DELETE' }),
+  exportDownloadUrl: (exportId: string) => `/api/v1/account/exports/${encodeURIComponent(exportId)}/download`,
+  adminEmailOutbox: (status?: string) => request<{ worker: EmailWorkerState; stats: OutboxStats; emails: OutboxEmail[]; note: string }>(`/v1/admin/email-outbox${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  retryOutboxEmail: (emailId: string) => request<{ retried: boolean; emailId: string }>(`/v1/admin/email-outbox/${encodeURIComponent(emailId)}/retry`, { method: 'POST' }),
+  deliverOutbox: () => request<{ enabled: boolean; mailerConfigured: boolean; considered: number; sent: number; failed: number; skipped: number; pending: number; reason?: string }>('/v1/admin/email-outbox/deliver', { method: 'POST' }),
+  deleteOutboxEmail: (emailId: string) => request<{ deleted: boolean; emailId: string }>(`/v1/admin/email-outbox/${encodeURIComponent(emailId)}`, { method: 'DELETE' }),
+  retentionReport: () => request<RetentionReport>('/v1/admin/retention'),
+  runRetention: (dryRun = true) => request<RetentionReport & { dryRun: boolean; totalRemoved: number; expiredExports: { marked: number; filesRemoved: number }; message: string }>('/v1/admin/retention/run', { method: 'POST', body: JSON.stringify({ dryRun }) }),
 };

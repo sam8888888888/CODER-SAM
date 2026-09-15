@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 15 Sep 2026 (versi 0.13.0)
+Terakhir diperbarui: 15 Sep 2026 (versi 0.14.1)
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel
@@ -8,9 +8,87 @@ di `apps/api/src/db.ts`, halaman di `coder-dashboard/src/nav.ts`, dan suite di `
 Bila ragu, tulis "belum diverifikasi".
 
 Catatan snapshot: berkas ini diperiksa saat repo sedang diedit, jadi beberapa perubahan belum di-commit
-(Wave 3: `server.ts`, `db.ts`, `engine-adapter.ts`, `prime-rpc-engine.ts`, `api.ts`, `nav.ts`, `App.tsx`, 9 halaman baru).
-Jumlah rute `server.ts` saat diperiksa: 140 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2 untuk lampiran, cabang dan hapus massal; 25 rute Wave 3 untuk ruang kerja agen).
+(Wave 4: `server.ts`, `db.ts`, `config.ts`, 4 modul baru `apikeys.ts`/`outbox.ts`/`retention.ts`/`dataexport.ts`,
+`api.ts`, `nav.ts`, `App.tsx`, dan 4 halaman baru).
+Jumlah rute `server.ts` saat diperiksa: 168 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2
+untuk lampiran, cabang dan hapus massal; 25 rute Wave 3 untuk ruang kerja agen; 28 rute Wave 4 untuk kunci API,
+API publik, antrean email, ekspor data, retensi, dan harga publik).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
+
+## Wave 4 (v0.14.0) — platform terbuka & kepatuhan
+
+- Kunci API pribadi: `GET/POST /api/v1/api-keys`, `PATCH/DELETE /api/v1/api-keys/:keyId`,
+  `GET /api/v1/api-keys/docs`. Nilai kunci hanya keluar sekali saat dibuat (format `ck_` + 40 heksadesimal);
+  server menyimpan sha256-nya saja (`api_keys` di schema 12). Batas 20 kunci aktif per akun
+  dan `API_KEY_RATE_LIMIT_PER_MINUTE` (bawaan 120) permintaan per menit per kunci.
+- API publik baca-saja: `GET /api/v1/public/v1/me`, `/workspaces`, `/projects`,
+  `/projects/:projectId/conversations`, `/projects/:projectId/usage`, `/projects/:projectId/artifacts`,
+  `/conversations/:conversationId/messages`. Autentikasi `Authorization: Bearer ck_...`, hanya boleh membaca
+  workspace yang terikat pada kunci itu. Kesalahan memakai kode yang jelas: `API_KEY_REQUIRED`,
+  `API_KEY_INVALID`, `API_KEY_SCOPE_REQUIRED`, `API_KEY_RATE_LIMITED`, `PROJECT_NOT_FOUND`.
+- Antrean email: tabel `email_outbox` (schema 12). Setiap notifikasi yang pantas dikirim lewat email masuk
+  antrean dengan status `pending`, bukan langsung dikirim. Worker 60 detik (`startEmailWorker`) hanya mengirim
+  bila `NOTIFY_EMAIL_ENABLED=true`; kalau SMTP belum lengkap, barisnya ditandai `skipped` dengan alasan
+  `MAILER_NOT_CONFIGURED`; gagal kirim dicoba ulang sampai 3 kali lalu menjadi `failed`. Operator dapat melihat,
+  mengirim ulang, dan menghapus antrean di `GET/POST /api/v1/admin/email-outbox*`.
+  Aturan hapus: pesan berstatus `pending` hanya bisa dihapus selagi pengiriman email mati
+  (`NOTIFY_EMAIL_ENABLED=false`). Bila pengiriman aktif, menghapus pesan menunggu ditolak dengan
+  `409 EMAIL_IN_FLIGHT` supaya pesan tidak hilang di tengah percobaan kirim; pesan yang sudah selesai
+  (`sent`/`failed`/`skipped`) selalu bisa dihapus. Pesan yang tidak ada menjawab `404 EMAIL_NOT_FOUND`.
+- Preferensi email per akun: `GET/PUT /api/v1/account/notification-preferences` (tabel `notification_prefs`).
+  Lima saklar: kuota, kegagalan run, tagihan, tim, keamanan. Email harian bergabung untuk jenis kuota/biaya/run
+  (satu pesan per hari per akun). Notifikasi di dalam aplikasi SELALU ditulis, terlepas dari saklar email.
+- Ekspor data pribadi: `POST /api/v1/account/export`, `GET /api/v1/account/exports`,
+  `GET /api/v1/account/exports/:exportId/download`, `DELETE /api/v1/account/exports/:exportId`.
+  Berkas JSON (`coblai-coder-export/1`) berisi 23 bagian data (profil, pesan, run, pemakaian, kunci API,
+  langganan, kredit, dan seterusnya). Kata sandi (hash), rahasia MFA, dan nilai kunci API TIDAK ikut.
+  Masa berlaku bawaan `RETENTION_EXPORT_DAYS` (7 hari). Ringkasan: `GET /api/v1/account/privacy`.
+- Retensi data: `GET /api/v1/admin/retention` (laporan hitungan) dan `POST /api/v1/admin/retention/run`
+  (bawaan mode uji). Sasaran: `audit_events`, `notifications`, `run_events`, `auth_tokens`, `data_exports`.
+  Bila `RETENTION_ENABLED=false`, permintaan penghapusan ditolak dengan alasan `RETENTION_DISABLED`
+  dan tidak ada baris yang hilang. Worker 6 jam (`startRetentionWorker`).
+- Halaman harga publik: `GET /api/v1/public/plans` (merek, mata uang, kurs acuan, status gateway,
+  daftar paket aktif). Tanpa sesi, tanpa kunci rahasia. Dirender SPA di `/harga` (`PublicPricing.tsx`),
+  dijangkau lewat tombol "Harga" di bilah atas.
+- Variabel lingkungan baru (semua punya bawaan aman): `NOTIFY_EMAIL_ENABLED` (false),
+  `API_KEY_RATE_LIMIT_PER_MINUTE` (120), `RETENTION_ENABLED` (false), `RETENTION_AUDIT_DAYS` (365),
+  `RETENTION_NOTIFICATION_DAYS` (90), `RETENTION_RUN_EVENT_DAYS` (30), `RETENTION_EXPORT_DAYS` (7).
+
+### Penyimpangan Wave 4 yang diketahui (bukan bug, tapi bisa mengejutkan)
+
+- API publik baru melayani BACA. Dua rute tulis (kirim pesan, buat percakapan) tercantum di
+  `plannedEndpoints` dengan `available: false` dan belum dilayani: permintaannya menjawab 404.
+- `NOTIFY_EMAIL_ENABLED` bawaan `false`, jadi email masuk antrean tetapi tidak dikirim. Ini sengaja agar
+  operator bisa memeriksa isi antrean dulu. Mengaktifkannya berarti mulai mengirim email keluar.
+- `RETENTION_ENABLED` bawaan `false`: `POST /admin/retention/run` selalu menjadi mode uji.
+- Saklar preferensi email hanya memengaruhi salinan email, bukan notifikasi dalam aplikasi.
+- Pesan antrean yang masih `pending` tidak bisa dihapus selagi pengiriman email aktif. Ini disengaja
+  (mencegah pesan hilang saat sedang dikirim), tetapi berarti antrean hanya bisa dibersihkan setelah
+  pengiriman dimatikan atau setelah pesan selesai dikirim.
+- Nilai kunci API tidak bisa dibaca lagi setelah dibuat (hanya hash). Yang bisa dilihat: prefix 8 karakter,
+  waktu pakai terakhir, dan jumlah permintaan.
+- `PATCH /api/v1/admin/plans/:code` mengubah batas kuota untuk SEMUA pengguna paket itu. Jangan dipakai
+  di produksi untuk mencoba-coba: itu mengubah batas nyata semua akun.
+- Kredit token menaikkan plafon harian (plafon = batas paket + kredit), jadi akun ber-kredit tidak
+  akan terblokir hanya karena batas paket kecil.
+- Audit tindakan tingkat akun (`account.export.created`, `account.export.deleted`,
+  `account.notification_preferences.updated`) dicatat pada workspace pribadi pemiliknya. Kalau akun tidak
+  punya workspace (situasi yang tidak terjadi setelah pendaftaran normal), kolom `workspace_id` berisi NULL.
+
+### Bukti uji Wave 4
+
+- `apps/api/test/wave4.e2e.ts` — 180 pemeriksaan, 0 gagal, 0 dilewati (`ALL_WAVE4_TESTS_PASSED`).
+  Mencakup: kunci API (termasuk batas 20 dan batas laju 429), API publik dan isolasi lintas workspace,
+  antrean email, preferensi email (termasuk penggabungan email harian), ekspor data (termasuk pemeriksaan
+  bahwa berkas tidak memuat bahan rahasia), laporan retensi, peran viewer, dan harga publik.
+- `apps/api/test/run-all.cjs` — 22/22 suite mock hijau (termasuk Wave 2, Wave 3, Wave 4, outbox-mail).
+- `apps/api/test/outbox-mail.e2e.ts` — 14 pemeriksaan, semua lulus: dengan `NOTIFY_EMAIL_ENABLED=true`
+  tetapi SMTP kosong, antrean TIDAK pernah mencoba menghubungi SMTP (`sent=0`, baris menjadi `skipped`
+  dengan alasan `MAILER_NOT_CONFIGURED`), dan pesan menunggu ditolak saat dihapus (`409 EMAIL_IN_FLIGHT`).
+- `apps/api/test/production-smoke.mjs` — 125 pemeriksaan terhadap produksi.
+- `coder-dashboard/render-check-wave4.tsx` — merender 4 halaman baru (`npx tsx --tsconfig tsconfig.app.json
+  render-check-wave4.tsx`); membuktikan halaman tidak gagal saat dirender, bukan sekadar lolos tipe.
+- `npx tsc -p tsconfig.app.json --noEmit` dan `npx vite build` di `coder-dashboard` — bersih (bundel 479,45 kB).
 
 ## Wave 3 (v0.13.0) — ruang kerja agen
 

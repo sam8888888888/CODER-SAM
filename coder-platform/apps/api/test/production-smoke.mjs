@@ -335,6 +335,86 @@ check("playground obeys the tool allowlist of the account", playground.status ==
 check("playground really answers through the engine", playground.status === 200 && typeof playground.json?.text === "string" && playground.json.text.trim().length > 0 && playground.json.tokens > 0, JSON.stringify(playground.json)?.slice(0, 240));
 console.log(`INFO playground model=${playground.json?.model} thinking=${playground.json?.thinking} tokens=${playground.json?.tokens} ms=${playground.json?.durationMs}`);
 
+// ------------------------------------------------------------------ Wave 4: platform terbuka & kepatuhan
+// Wave 4 smoke runs against the live platform. It creates ONE temporary API key, uses it, then revokes
+// it, and creates ONE temporary data export, then deletes it, so production stays clean.
+const keyDocs = await call("GET", "/api/v1/api-keys/docs");
+check("wave4 api key docs describe the read-only phase", keyDocs.status === 200 && keyDocs.json?.phase === "baca saja", JSON.stringify(keyDocs.json)?.slice(0, 200));
+check("wave4 docs list the live public endpoints and split the planned ones", Array.isArray(keyDocs.json?.endpoints) && keyDocs.json.endpoints.length === 7 && keyDocs.json.endpoints.every((row) => row.available === true) && Array.isArray(keyDocs.json?.plannedEndpoints) && keyDocs.json.plannedEndpoints.length === 2, JSON.stringify(keyDocs.json)?.slice(0, 260));
+
+const smokeKey = await call("POST", "/api/v1/api-keys", { name: `Smoke Wave 4 ${new Date().toISOString().slice(0, 16)}`, scopes: ["read"] });
+const smokeKeyId = smokeKey.json?.key?.id;
+const smokeSecret = String(smokeKey.json?.secret ?? "");
+check("wave4 api key is created and the raw value is shown once", smokeKey.status === 201 && smokeSecret.startsWith("ck_") && smokeSecret.length === 43 && smokeSecret.slice(3, 11) === smokeKey.json?.key?.prefix, JSON.stringify(smokeKey.json)?.slice(0, 200));
+
+const keysAfterCreate = await call("GET", "/api/v1/api-keys");
+check("wave4 key list never repeats the raw secret", keysAfterCreate.status === 200 && !JSON.stringify(keysAfterCreate.json).includes(smokeSecret), `panjang=${JSON.stringify(keysAfterCreate.json)?.length}`);
+const writeScopeRefused = await call("POST", "/api/v1/api-keys", { name: "Smoke izin tulis", scopes: ["write"] });
+check("wave4 write scope is refused honestly instead of promised", writeScopeRefused.status === 400 && writeScopeRefused.json.error === "SCOPE_NOT_AVAILABLE", JSON.stringify(writeScopeRefused.json));
+
+async function publicCall(path, key) {
+  const response = await fetch(`${BASE}${path}`, { headers: key === undefined ? {} : { authorization: `Bearer ${key}` } });
+  const text = await response.text();
+  let json = null; try { json = text ? JSON.parse(text) : null; } catch { json = text; }
+  return { status: response.status, json, text, headers: response.headers };
+}
+
+const publicNoKey = await publicCall("/api/v1/public/v1/me");
+check("wave4 public API refuses a request without a key", publicNoKey.status === 401 && publicNoKey.json.error === "API_KEY_REQUIRED", JSON.stringify(publicNoKey.json));
+const publicMe = await publicCall("/api/v1/public/v1/me", smokeSecret);
+check("wave4 public API answers with a valid key", publicMe.status === 200 && publicMe.json?.user?.email === EMAIL && typeof publicMe.json?.quota?.usedToday === "number", JSON.stringify(publicMe.json)?.slice(0, 220));
+const publicProjects = await publicCall("/api/v1/public/v1/projects", smokeSecret);
+check("wave4 public API lists the projects of the bound workspace", publicProjects.status === 200 && (publicProjects.json?.projects ?? []).some((row) => row.id === projectId), JSON.stringify(publicProjects.json)?.slice(0, 220));
+const publicUsage = await publicCall(`/api/v1/public/v1/projects/${projectId}/usage`, smokeSecret);
+check("wave4 public API reports project usage from real runs", publicUsage.status === 200 && typeof publicUsage.json?.totals?.tokens === "number" && Array.isArray(publicUsage.json?.byModel), JSON.stringify(publicUsage.json)?.slice(0, 220));
+const publicCross = await publicCall("/api/v1/public/v1/projects/00000000-0000-4000-8000-000000000000/usage", smokeSecret);
+check("wave4 public API answers 404 for unknown resources", publicCross.status === 404 && publicCross.json.error === "PROJECT_NOT_FOUND", JSON.stringify(publicCross.json));
+const publicWriteResponse = await fetch(`${BASE}/api/v1/public/v1/projects/${projectId}/conversations`, { method: "POST", headers: { authorization: `Bearer ${smokeSecret}`, "content-type": "application/json" }, body: JSON.stringify({ title: "harus ditolak" }) });
+const publicWriteText = await publicWriteResponse.text();
+check("wave4 public API does not pretend to serve the planned write routes", publicWriteResponse.status === 404 && !publicWriteText.includes("harus ditolak"), `${publicWriteResponse.status} ${publicWriteText.slice(0, 120)}`);
+
+const smokeRevoke = await call("DELETE", `/api/v1/api-keys/${smokeKeyId}`);
+check("wave4 api key can be revoked", smokeRevoke.status === 200 && smokeRevoke.json.revoked === true, JSON.stringify(smokeRevoke.json));
+const publicAfterRevoke = await publicCall("/api/v1/public/v1/me", smokeSecret);
+check("wave4 revoked key stops working at once", publicAfterRevoke.status === 401 && publicAfterRevoke.json.error === "API_KEY_INVALID", JSON.stringify(publicAfterRevoke.json));
+
+const smokePrefs = await call("GET", "/api/v1/account/notification-preferences");
+check("wave4 notification preferences expose five email switches", smokePrefs.status === 200 && smokePrefs.json?.kinds?.length === 5 && smokePrefs.json?.preferences?.emailSecurity === 1, JSON.stringify(smokePrefs.json)?.slice(0, 220));
+const smokePrefsOff = await call("PUT", "/api/v1/account/notification-preferences", { emailTeam: false });
+const smokePrefsBack = await call("PUT", "/api/v1/account/notification-preferences", { emailTeam: true });
+check("wave4 notification preferences can be changed and restored", smokePrefsOff.json?.preferences?.emailTeam === 0 && smokePrefsBack.json?.preferences?.emailTeam === 1, JSON.stringify(smokePrefsBack.json));
+check("wave4 email worker reports its state instead of guessing", typeof smokePrefs.json?.email?.enabled === "boolean" && typeof smokePrefs.json?.email?.mailerConfigured === "boolean", JSON.stringify(smokePrefs.json?.email));
+check("wave4 outgoing mail is fully configured in production (SMTP ready)", smokePrefs.json?.email?.mailerConfigured === true, JSON.stringify(smokePrefs.json?.email));
+console.log(`INFO wave4 email worker: enabled=${smokePrefs.json?.email?.enabled} from=${smokePrefs.json?.email?.from} (pengiriman otomatis hanya jalan bila NOTIFY_EMAIL_ENABLED=true)`);
+
+const privacy = await call("GET", "/api/v1/account/privacy");
+check("wave4 privacy summary lists the exported data sections", privacy.status === 200 && (privacy.json?.sectionsInExport ?? []).length >= 20 && Number(privacy.json?.storedTotals?.rows) > 0, JSON.stringify(privacy.json)?.slice(0, 220));
+const smokeExport = await call("POST", "/api/v1/account/export");
+const smokeExportId = smokeExport.json?.export?.id;
+check("wave4 personal data export is created", smokeExport.status === 201 && Number(smokeExport.json?.export?.sizeBytes) > 100 && Array.isArray(smokeExport.json?.export?.sections), JSON.stringify(smokeExport.json)?.slice(0, 200));
+const exportBody = await (await fetch(`${BASE}/api/v1/account/exports/${smokeExportId}/download`, { headers: { cookie } })).text();
+check("wave4 export file holds no password or raw api key material", exportBody.includes("coblai-coder-export/1") && !exportBody.includes("password_hash") && !exportBody.includes("mfa_secret") && !exportBody.includes(smokeSecret), `${exportBody.length} byte`);
+const smokeExportDelete = await call("DELETE", `/api/v1/account/exports/${smokeExportId}`);
+const smokeExportGone = await call("GET", `/api/v1/account/exports/${smokeExportId}/download`);
+check("wave4 export can be deleted and stops downloading", smokeExportDelete.status === 200 && smokeExportDelete.json.deleted === true && smokeExportGone.status === 404, JSON.stringify(smokeExportGone.json));
+
+const outboxBlocked = await call("GET", "/api/v1/admin/email-outbox");
+const retentionBlocked = await call("GET", "/api/v1/admin/retention");
+check("wave4 email outbox and retention stay behind the admin gate", outboxBlocked.status === 403 && outboxBlocked.json.error === "ADMIN_REQUIRED" && retentionBlocked.status === 403, `${outboxBlocked.status}/${retentionBlocked.status}`);
+
+const publicPlans = await publicCall("/api/v1/public/plans");
+check("wave4 public pricing page data is open and lists real plans", publicPlans.status === 200 && (publicPlans.json?.plans ?? []).length >= 3 && publicPlans.json?.currency === "IDR", JSON.stringify(publicPlans.json)?.slice(0, 220));
+check("wave4 public pricing never leaks gateway secrets", !/serverKey|clientKey|secret|callbackToken/i.test(publicPlans.text), publicPlans.text.slice(0, 160));
+const pricingPage = await (await fetch(`${BASE}/harga`)).text();
+check("wave4 public pricing page route serves the app shell", pricingPage.includes("<div id=\"root\">") || pricingPage.includes("<!doctype html"), `${pricingPage.length} byte`);
+
+const statusHubW4 = await call("GET", "/api/v1/status-hub");
+check("wave4 status hub reports the open platform block", statusHubW4.status === 200 && Number(statusHubW4.json?.openPlatform?.publicEndpoints) >= 7 && Number(statusHubW4.json?.openPlatform?.publicEndpointsPlanned) >= 2 && typeof statusHubW4.json?.openPlatform?.emailWorker?.enabled === "boolean" && typeof statusHubW4.json?.openPlatform?.retention?.enabled === "boolean", JSON.stringify(statusHubW4.json?.openPlatform)?.slice(0, 260));
+check("wave4 status hub counts api keys, queued emails, and ready exports from the database",
+  typeof statusHubW4.json?.openPlatform?.activeKeys === "number" && typeof statusHubW4.json?.openPlatform?.emailOutbox?.pending === "number" && typeof statusHubW4.json?.openPlatform?.emailOutbox?.total === "number" && typeof statusHubW4.json?.openPlatform?.readyExports === "number",
+  JSON.stringify(statusHubW4.json?.openPlatform?.emailOutbox));
+console.log(`INFO wave4 open platform: activeKeys=${statusHubW4.json?.openPlatform?.activeKeys} outboxPending=${statusHubW4.json?.openPlatform?.emailOutbox?.pending} readyExports=${statusHubW4.json?.openPlatform?.readyExports}`);
+
 const adminBlocked = await call("GET", "/api/v1/admin/overview");
 check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));
 const metricsBlocked = await call("GET", "/metrics");

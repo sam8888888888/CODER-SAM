@@ -18,13 +18,23 @@ import { createExecution, recordAudit, runExecution, scheduleNextRun } from "./w
 import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
 import { checkRequestOrigin, constantTimeEquals, csrfCookieOptions, generateCsrfToken } from "./csrf.js";
 import { limiterFor } from "./ratelimit.js";
+import {
+  API_KEY_PREFIX, MAX_API_KEYS_PER_USER, PUBLIC_API_ENDPOINTS, authenticateApiKey, checkApiKeyRate, countActiveApiKeys,
+  createApiKey, getApiKey, hasScope, listApiKeys, parseScopes, revokeApiKey, touchApiKey, updateApiKey, type ApiScope,
+} from "./apikeys.js";
+import {
+  EMAIL_WORKER_INTERVAL_MS, deleteOutboxRow, deliverPending, emailEnabled, emailWorkerState, getOutboxRow,
+  listOutbox, notificationPrefs, outboxStats, queueEmail, renderEmail, retryEmail, saveNotificationPrefs, type EmailKind,
+} from "./outbox.js";
+import { RETENTION_JOB_INTERVAL_MS, retentionPolicy, retentionReport, runRetention } from "./retention.js";
+import { collectUserData, createExport, deleteExport, expireExports, exportFilePath, getExport, listExports } from "./dataexport.js";
 import { describeCron, nextCronRun, validateCronExpression } from "./cron.js";
 import {
   activeSubscription, attachOrderProof, branding, chargeQuota, createBankAccount, createOrder, createCoupon,
   creditHistory, deleteBankAccount, ensureCommerceSeed, getOrder, getPlan, grantCredit,
   listBankAccounts, listCoupons, listOrders, listPlans, markOrderPaid, paymentConfig, quotaGuard, quotaState,
   recordPayment, rejectOrder, resetQuota, revenueSummary, saveBranding, savePaymentConfig, setCouponActive,
-  setUsdToIdrRate, updatePlan, userTier, validateCoupon,
+  setUsdToIdrRate, updatePlan, usdToIdrRate, userTier, validateCoupon,
 } from "./billing.js";
 
 // trustProxy is on because the API only listens on 127.0.0.1 behind nginx, which sets X-Forwarded-For.
@@ -100,6 +110,12 @@ function workflowAccess(workflowId: string, userId: string) {
 }
 
 /** True when the user may inspect the whole platform (workspace list, all users, totals). */
+/** Workspace pribadi tempat tindakan tingkat akun dicatat, supaya audit tidak hilang tanpa jejak. */
+function accountAuditWorkspace(userId: string): string | null {
+  const row = db.prepare("SELECT workspace_id FROM memberships WHERE user_id=? AND role='owner' ORDER BY created_at LIMIT 1").get(userId) as { workspace_id?: string } | undefined;
+  return row?.workspace_id ?? null;
+}
+
 function isPlatformAdmin(user: { id: string; email: string }): boolean {
   const allowed = config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
   if (allowed.includes(user.email.toLowerCase())) return true;
@@ -148,6 +164,22 @@ function notify(workspaceId: string | null, userId: string | null, kind: string,
   }
   const insert = db.prepare("INSERT INTO notifications (id,workspace_id,user_id,kind,title,body,link,created_at) VALUES (?,?,?,?,?,?,?,?)");
   db.transaction(() => { for (const target of targets) insert.run(randomUUID(), workspaceId, target, kind, title, body ?? null, link ?? null, createdAt); })();
+  // Wave 4: the same event may also leave by email. It is queued, never sent here, and the person
+  // can switch each kind off. Any failure is swallowed: email must not break the request itself.
+  for (const target of targets) queueEventEmail(target, kind, title, body, link);
+}
+
+/** Kinds that repeat often are collapsed into one email per day, so the inbox stays readable. */
+const DAILY_EMAIL_KINDS = new Set(["quota", "cost", "run"]);
+
+function queueEventEmail(userId: string, kind: string, title: string, body?: string, link?: string) {
+  try {
+    const user = db.prepare("SELECT email FROM users WHERE id=?").get(userId) as { email: string } | undefined;
+    if (!user?.email) return;
+    const rendered = renderEmail(kind as EmailKind, title, body ?? "", link);
+    const dedupeKey = DAILY_EMAIL_KINDS.has(kind) ? `${kind}:${userId}:${new Date().toISOString().slice(0, 10)}` : null;
+    queueEmail({ userId, toEmail: user.email, kind: kind as EmailKind, subject: rendered.subject, body: rendered.body, dedupeKey });
+  } catch { /* the in-app notification is already stored */ }
 }
 
 /** Creates a single use token (only its hash is stored) and returns the raw value for the email link. */
@@ -2570,6 +2602,15 @@ app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) 
     mail: { configured: mailerConfigured(), from: config.SMTP_FROM, host: config.SMTP_HOST ? `${config.SMTP_HOST}:${config.SMTP_PORT}` : null, secure: config.SMTP_SECURE },
     security: { csrfStrict: config.CSRF_STRICT, sessionCookie: "httpOnly", adminEmails: config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim()).filter(Boolean).length, metricsEnabled: Boolean(config.METRICS_TOKEN) },
     limits: { dailyCostMicros: config.DEFAULT_DAILY_COST_LIMIT_MICROS, monthlyCostMicros: config.DEFAULT_MONTHLY_COST_LIMIT_MICROS, runsPerHour: config.DEFAULT_RUNS_PER_HOUR_LIMIT, engineTimeoutMs: config.ENGINE_TIMEOUT_MS },
+    openPlatform: {
+      activeKeys: Number((db.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE revoked_at IS NULL").get() as { n: number }).n),
+      publicEndpoints: PUBLIC_API_ENDPOINTS.filter((endpoint) => endpoint.available).length,
+      publicEndpointsPlanned: PUBLIC_API_ENDPOINTS.filter((endpoint) => !endpoint.available).length,
+      emailOutbox: outboxStats(),
+      emailWorker: emailWorkerState(),
+      retention: retentionPolicy(),
+      readyExports: Number((db.prepare("SELECT COUNT(*) AS n FROM data_exports WHERE status='ready'").get() as { n: number }).n),
+    },
     storage: { data: await dirStats(config.DATA_DIR), engineSessions: await dirStats(config.ENGINE_ROOT_DIR) },
     lastRuns,
     backup: { note: "Cadangan otomatis dijalankan cron 03:17 di host (di luar container), jadi isi direktori cadangan tidak bisa dibaca dari sini.", cron: "17 3 * * *" },
@@ -2719,6 +2760,345 @@ app.get<{ Params: { projectId: string }; Querystring: { kind?: string; conversat
 app.setErrorHandler((error: any, _request, reply) => { app.log.error(error); const status = Number(error.statusCode) >= 400 && Number(error.statusCode) < 500 ? Number(error.statusCode) : 500; return reply.code(status).send({ error: status < 500 ? "INVALID_REQUEST" : "INTERNAL_ERROR" }); });
 
 const contentTypes: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
+
+// ---------------------------------------------------------------- public API keys (Wave 4)
+// A key is a Bearer token for scripts and third parties. Only its hash is stored, and the public
+// surface is read-only for now, so a leaked key can never change data.
+
+const API_KEY_NAME_MIN = 2;
+const API_KEY_NAME_MAX = 60;
+
+type ApiAuth = { key: { id: string; name: string; prefix: string; scopes: string; revokedAt: string | null; lastUsedAt: string | null; createdAt: string }; userId: string; email: string; displayName: string | null; workspaceId: string; workspaceName: string; role: string };
+
+/** Rejects a request unless it carries a valid, unrevoked key with the needed scope. */
+function requireApiKey(scope: ApiScope) {
+  return async (request: any, reply: any) => {
+    const header = String(request.headers?.authorization ?? "");
+    const raw = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
+    if (!raw) return reply.code(401).send({ error: "API_KEY_REQUIRED", message: "Sertakan header Authorization: Bearer <kunci>." });
+    const auth = authenticateApiKey(raw);
+    if (!auth) return reply.code(401).send({ error: "API_KEY_INVALID", message: "Kunci API tidak dikenal, sudah dicabut, atau keanggotaan workspace-nya hilang." });
+    if (!hasScope(auth.key as any, scope)) return reply.code(403).send({ error: "API_KEY_SCOPE_REQUIRED", message: `Kunci ini tidak punya izin "${scope}".` });
+    const rate = checkApiKeyRate(auth.key.id);
+    if (!rate.allowed) return reply.code(429).send({ error: "API_KEY_RATE_LIMITED", message: `Batas ${rate.limit} permintaan per menit untuk kunci ini terlampaui.` });
+    (request as any).apiAuth = auth;
+    touchApiKey(auth.key.id, request.ip ?? null);
+  };
+}
+
+/** Every public endpoint works inside the workspace the key is bound to. */
+function apiProjectFor(auth: ApiAuth, projectId: string) {
+  return db.prepare("SELECT id, workspace_id AS workspaceId, name, created_at AS createdAt FROM projects WHERE id=? AND workspace_id=?").get(projectId, auth.workspaceId) as { id: string; workspaceId: string; name: string; createdAt: string } | undefined;
+}
+
+function apiConversationFor(auth: ApiAuth, conversationId: string) {
+  return db.prepare(`SELECT c.id, c.project_id AS projectId, c.title, c.created_at AS createdAt
+      FROM conversations c JOIN projects p ON p.id=c.project_id WHERE c.id=? AND p.workspace_id=?`).get(conversationId, auth.workspaceId) as { id: string; projectId: string; title: string; createdAt: string } | undefined;
+}
+
+app.get("/api/v1/api-keys", { preHandler: requireUser }, async (request: any) => {
+  const keys = listApiKeys(request.user!.id, request.query?.workspaceId ?? null);
+  return {
+    keys,
+    // The raw value is never returned again, only the visible prefix helps to identify a key.
+    note: "Nilai kunci hanya ditampilkan sekali saat dibuat. Yang tersimpan adalah hash-nya.",
+    limits: { maxActive: MAX_API_KEYS_PER_USER, rateLimitPerMinute: config.API_KEY_RATE_LIMIT_PER_MINUTE },
+    scopesAvailable: ["read"],
+  };
+});
+
+app.get("/api/v1/api-keys/docs", { preHandler: requireUser }, async () => ({
+  prefix: API_KEY_PREFIX,
+  scopes: ["read"],
+  phase: "baca saja",
+  rateLimitPerMinute: config.API_KEY_RATE_LIMIT_PER_MINUTE,
+  endpoints: PUBLIC_API_ENDPOINTS.filter((endpoint) => endpoint.available),
+  // Daftar rencana dipisah, supaya dokumentasi tidak menyebut rute yang belum dilayani.
+  plannedEndpoints: PUBLIC_API_ENDPOINTS.filter((endpoint) => !endpoint.available),
+  example: {
+    curl: `curl -H "Authorization: Bearer ${API_KEY_PREFIX}_..." ${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/api/v1/public/v1/me`,
+    note: "Endpoint tulis belum dibuka; fase berikutnya menambah POST pesan dan percakapan.",
+  },
+}));
+
+app.post<{ Body: { name?: string; scopes?: unknown; workspaceId?: string } }>("/api/v1/api-keys", { preHandler: requireUser }, async (request: any, reply) => {
+  const name = String(request.body?.name ?? "").trim();
+  if (name.length < API_KEY_NAME_MIN || name.length > API_KEY_NAME_MAX) {
+    return reply.code(400).send({ error: "INVALID_KEY_NAME", message: `Nama kunci ${API_KEY_NAME_MIN}-${API_KEY_NAME_MAX} karakter.` });
+  }
+  const scopes = parseScopes(request.body?.scopes ?? "read");
+  if (!scopes.length) return reply.code(400).send({ error: "INVALID_KEY_SCOPES", message: "Pilih minimal satu izin: read." });
+  const forbidden = scopes.filter((scope) => scope === "write");
+  // Write endpoints do not exist yet, so the platform refuses to hand out a promise it cannot keep.
+  if (forbidden.length) return reply.code(400).send({ error: "SCOPE_NOT_AVAILABLE", message: "Izin write belum tersedia. Gunakan read." });
+  const membership = request.body?.workspaceId
+    ? db.prepare("SELECT m.workspace_id AS workspaceId, m.role AS role FROM memberships m WHERE m.user_id=? AND m.workspace_id=?").get(request.user!.id, request.body.workspaceId) as { workspaceId: string; role: string } | undefined
+    : db.prepare("SELECT m.workspace_id AS workspaceId, m.role AS role FROM memberships m WHERE m.user_id=? ORDER BY m.created_at ASC LIMIT 1").get(request.user!.id) as { workspaceId: string; role: string } | undefined;
+  if (!membership) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND", message: "Workspace tidak ditemukan untuk akun ini." });
+  if (membership.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  if (countActiveApiKeys(request.user!.id) >= MAX_API_KEYS_PER_USER) {
+    return reply.code(409).send({ error: "TOO_MANY_API_KEYS", message: `Maksimal ${MAX_API_KEYS_PER_USER} kunci aktif. Cabut dulu salah satu.` });
+  }
+  const created = createApiKey({ userId: request.user!.id, workspaceId: membership.workspaceId, name, scopes: ["read"] });
+  recordAudit(membership.workspaceId, request.user!.id, "api_key.created", { keyId: created.key.id, prefix: created.key.prefix, scopes: created.key.scopes });
+  return reply.code(201).send({ key: created.key, secret: created.raw, workspaceId: membership.workspaceId, warning: "Salin sekarang. Nilai ini tidak bisa ditampilkan lagi." });
+});
+
+app.patch<{ Params: { keyId: string }; Body: { name?: string; scopes?: unknown } }>("/api/v1/api-keys/:keyId", { preHandler: requireUser }, async (request: any, reply) => {
+  const current = getApiKey(request.user!.id, request.params.keyId);
+  if (!current) return reply.code(404).send({ error: "API_KEY_NOT_FOUND" });
+  if (request.body?.name !== undefined) {
+    const name = String(request.body.name).trim();
+    if (name.length < API_KEY_NAME_MIN || name.length > API_KEY_NAME_MAX) return reply.code(400).send({ error: "INVALID_KEY_NAME", message: `Nama kunci ${API_KEY_NAME_MIN}-${API_KEY_NAME_MAX} karakter.` });
+  }
+  if (request.body?.scopes !== undefined) {
+    const scopes = parseScopes(request.body.scopes);
+    if (!scopes.length) return reply.code(400).send({ error: "INVALID_KEY_SCOPES", message: "Pilih minimal satu izin." });
+    if (scopes.includes("write")) return reply.code(400).send({ error: "SCOPE_NOT_AVAILABLE", message: "Izin write belum tersedia." });
+  }
+  const updated = updateApiKey(request.user!.id, request.params.keyId, { name: request.body?.name, scopes: request.body?.scopes });
+  recordAudit(current.workspaceId, request.user!.id, "api_key.updated", { keyId: current.id });
+  return { key: updated };
+});
+
+app.delete<{ Params: { keyId: string } }>("/api/v1/api-keys/:keyId", { preHandler: requireUser }, async (request: any, reply) => {
+  const current = getApiKey(request.user!.id, request.params.keyId);
+  if (!current) return reply.code(404).send({ error: "API_KEY_NOT_FOUND" });
+  // Mencabut ulang tidak boleh dilaporkan sebagai sukses: jejak pencabutan tidak berubah.
+  if (current.revokedAt) return reply.code(409).send({ error: "API_KEY_ALREADY_REVOKED", message: "Kunci ini sudah dicabut.", revokedAt: current.revokedAt });
+  revokeApiKey(request.user!.id, request.params.keyId);
+  recordAudit(current.workspaceId, request.user!.id, "api_key.revoked", { keyId: current.id, prefix: current.prefix });
+  return { revoked: true, keyId: current.id };
+});
+
+// ---------------------------------------------------------------- public read API (Bearer)
+
+app.get("/api/v1/public/v1/me", { preHandler: requireApiKey("read") }, async (request: any) => {
+  const auth = request.apiAuth as ApiAuth;
+  const quota = quotaState(auth.userId);
+  return {
+    user: { id: auth.userId, email: auth.email, displayName: auth.displayName },
+    workspace: { id: auth.workspaceId, name: auth.workspaceName, role: auth.role },
+    key: { id: auth.key.id, name: auth.key.name, prefix: auth.key.prefix, scopes: auth.key.scopes },
+    quota: { tier: quota.tier, usedToday: quota.usedToday, dailyLimit: quota.dailyLimit, usedMonth: quota.usedMonth, monthlyLimit: quota.monthlyLimit },
+  };
+});
+
+app.get("/api/v1/public/v1/workspaces", { preHandler: requireApiKey("read") }, async (request: any) => {
+  const auth = request.apiAuth as ApiAuth;
+  return { workspaces: [{ id: auth.workspaceId, name: auth.workspaceName, role: auth.role }] };
+});
+
+app.get("/api/v1/public/v1/projects", { preHandler: requireApiKey("read") }, async (request: any) => {
+  const auth = request.apiAuth as ApiAuth;
+  const projects = db.prepare("SELECT id, name, description, created_at AS createdAt FROM projects WHERE workspace_id=? ORDER BY created_at DESC").all(auth.workspaceId);
+  return { projects };
+});
+
+app.get<{ Params: { projectId: string } }>("/api/v1/public/v1/projects/:projectId/conversations", { preHandler: requireApiKey("read") }, async (request: any, reply) => {
+  const auth = request.apiAuth as ApiAuth;
+  const project = apiProjectFor(auth, request.params.projectId);
+  if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const conversations = db.prepare("SELECT id, title, pinned, created_at AS createdAt, updated_at AS updatedAt FROM conversations WHERE project_id=? ORDER BY updated_at DESC").all(project.id);
+  return { project: { id: project.id, name: project.name }, conversations };
+});
+
+app.get<{ Params: { conversationId: string } }>("/api/v1/public/v1/conversations/:conversationId/messages", { preHandler: requireApiKey("read") }, async (request: any, reply) => {
+  const auth = request.apiAuth as ApiAuth;
+  const conversation = apiConversationFor(auth, request.params.conversationId);
+  if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  const messages = db.prepare("SELECT id, role, content, run_id AS runId, created_at AS createdAt FROM messages WHERE conversation_id=? ORDER BY created_at ASC").all(conversation.id);
+  return { conversation: { id: conversation.id, title: conversation.title, projectId: conversation.projectId }, messages };
+});
+
+app.get<{ Params: { projectId: string } }>("/api/v1/public/v1/projects/:projectId/usage", { preHandler: requireApiKey("read") }, async (request: any, reply) => {
+  const auth = request.apiAuth as ApiAuth;
+  const project = apiProjectFor(auth, request.params.projectId);
+  if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  const totals = db.prepare(`SELECT COUNT(*) AS runs, COALESCE(SUM(total_tokens),0) AS tokens, COALESCE(SUM(cost_micros),0) AS costMicros
+      FROM run_usage WHERE project_id=?`).get(project.id) as { runs: number; tokens: number; costMicros: number };
+  const byModel = db.prepare(`SELECT COALESCE(model,'(tanpa model)') AS model, COUNT(*) AS runs, COALESCE(SUM(total_tokens),0) AS tokens, COALESCE(SUM(cost_micros),0) AS costMicros
+      FROM run_usage WHERE project_id=? GROUP BY model ORDER BY tokens DESC`).all(project.id);
+  return { project: { id: project.id, name: project.name }, totals, byModel };
+});
+
+app.get<{ Params: { projectId: string } }>("/api/v1/public/v1/projects/:projectId/artifacts", { preHandler: requireApiKey("read") }, async (request: any, reply) => {
+  const auth = request.apiAuth as ApiAuth;
+  const project = apiProjectFor(auth, request.params.projectId);
+  if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
+  // Metadata only: a key cannot pull file contents out of the platform.
+  const artifacts = db.prepare("SELECT id, name, mime_type AS mimeType, size_bytes AS sizeBytes, sha256, created_at AS createdAt FROM artifacts WHERE project_id=? ORDER BY created_at DESC LIMIT 200").all(project.id);
+  return { project: { id: project.id, name: project.name }, artifacts, note: "Isi berkas tidak disajikan lewat API kunci." };
+});
+
+// ---------------------------------------------------------------- public pricing (no session)
+
+app.get("/api/v1/public/plans", async () => {
+  const plans = listPlans(true);
+  const gates = paymentConfig();
+  return {
+    branding: branding(),
+    currency: "IDR",
+    usdToIdrRate: usdToIdrRate(),
+    // Only on/off flags leave this endpoint, never a key or a secret.
+    gateways: { xendit: Boolean((gates as any)?.xendit?.enabled), midtrans: Boolean((gates as any)?.midtrans?.enabled), manualTransfer: true },
+    plans: plans.map((plan) => ({
+      code: plan.code, name: plan.name, description: plan.description, priceIdr: plan.priceIdr, periodDays: plan.periodDays,
+      tier: plan.tier, dailyTokenLimit: plan.dailyTokenLimit, monthlyTokenLimit: plan.monthlyTokenLimit, bonusTokens: plan.bonusTokens,
+      features: plan.features ?? null,
+    })),
+  };
+});
+
+
+// ---------------------------------------------------------------- account privacy and data export (Wave 4)
+
+app.get("/api/v1/account/privacy", { preHandler: requireUser }, async (request: any) => {
+  const { sections } = collectUserData(request.user!.id);
+  const exports = listExports(request.user!.id);
+  return {
+    policy: retentionPolicy(),
+    sectionsInExport: sections,
+    storedTotals: { sections: sections.length, rows: sections.reduce((sum, item) => sum + item.rows, 0) },
+    exports: exports.slice(0, 10),
+    email: emailWorkerState(),
+    notes: [
+      "Kata sandi (hash), kode pemulihan MFA, dan nilai kunci API tidak pernah ikut dalam ekspor.",
+      "Berkas ekspor kedaluwarsa sendiri dan dihapus otomatis oleh pembersihan retensi.",
+      "Penghapusan akun tersedia di Pengaturan > Keamanan akun, dan menghapus data terkait.",
+    ],
+  };
+});
+
+app.post("/api/v1/account/export", { preHandler: requireUser }, async (request: any, reply) => {
+  const created = await createExport(request.user!.id);
+  recordAudit(accountAuditWorkspace(request.user!.id), request.user!.id, "account.export.created", { exportId: created.row.id, rows: created.sections.reduce((sum, item) => sum + item.rows, 0) });
+  return reply.code(201).send({
+    export: { ...created.row, sections: created.sections },
+    sections: created.sections,
+    downloadUrl: `/api/v1/account/exports/${created.row.id}/download`,
+    message: `Berkas ekspor siap (${created.row.sizeBytes} byte) dan berlaku sampai ${created.row.expiresAt}.`,
+  });
+});
+
+app.get("/api/v1/account/exports", { preHandler: requireUser }, async (request: any) => ({ exports: listExports(request.user!.id) }));
+
+app.get<{ Params: { exportId: string } }>("/api/v1/account/exports/:exportId/download", { preHandler: requireUser }, async (request: any, reply) => {
+  const found = getExport(request.user!.id, request.params.exportId);
+  if (!found) return reply.code(404).send({ error: "EXPORT_NOT_FOUND" });
+  if (found.status !== "ready" || found.expiresAt < new Date().toISOString()) return reply.code(410).send({ error: "EXPORT_EXPIRED", message: "Berkas ekspor ini sudah kedaluwarsa. Buat ekspor baru." });
+  let text: string;
+  try { text = await readFile(exportFilePath(found.id), "utf8"); }
+  catch { return reply.code(410).send({ error: "EXPORT_FILE_MISSING", message: "Berkas ekspor tidak ada di penyimpanan. Buat ekspor baru." }); }
+  reply.header("content-type", "application/json; charset=utf-8");
+  reply.header("content-disposition", `attachment; filename="coblai-data-akun-${found.createdAt.slice(0, 10)}.json"`);
+  return reply.send(text);
+});
+
+app.delete<{ Params: { exportId: string } }>("/api/v1/account/exports/:exportId", { preHandler: requireUser }, async (request: any, reply) => {
+  const removed = await deleteExport(request.user!.id, request.params.exportId);
+  if (!removed) return reply.code(404).send({ error: "EXPORT_NOT_FOUND" });
+  recordAudit(accountAuditWorkspace(request.user!.id), request.user!.id, "account.export.deleted", { exportId: request.params.exportId });
+  return { deleted: true, exportId: request.params.exportId };
+});
+
+// ---------------------------------------------------------------- email notification preferences (Wave 4)
+
+app.get("/api/v1/account/notification-preferences", { preHandler: requireUser }, async (request: any) => ({
+  preferences: notificationPrefs(request.user!.id),
+  email: emailWorkerState(),
+  kinds: [
+    { key: "emailQuota", label: "Kuota token hampir atau sudah habis" },
+    { key: "emailRuns", label: "Kegagalan menjalankan agen" },
+    { key: "emailBilling", label: "Pesanan, pembayaran, dan langganan" },
+    { key: "emailTeam", label: "Undangan dan perubahan anggota tim" },
+    { key: "emailSecurity", label: "Keamanan akun: kata sandi, MFA, email" },
+  ],
+  note: "Pemberitahuan di dalam aplikasi selalu aktif. Saklar di atas hanya mengatur salinan lewat email.",
+}));
+
+app.put("/api/v1/account/notification-preferences", { preHandler: requireUser }, async (request: any) => {
+  const body = request.body && typeof request.body === "object" ? request.body : {};
+  const preferences = saveNotificationPrefs(request.user!.id, body);
+  recordAudit(accountAuditWorkspace(request.user!.id), request.user!.id, "account.notification_preferences.updated", { preferences });
+  return { preferences, message: "Preferensi email disimpan." };
+});
+
+// ---------------------------------------------------------------- admin: email outbox and retention (Wave 4)
+
+app.get("/api/v1/admin/email-outbox", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh membuka antrean email." });
+  const status = typeof request.query?.status === "string" ? request.query.status : undefined;
+  const limit = Number(request.query?.limit ?? 50);
+  return {
+    worker: emailWorkerState(),
+    stats: outboxStats(),
+    emails: listOutbox({ status, limit }),
+    note: config.NOTIFY_EMAIL_ENABLED
+      ? "Antrean email aktif. Pesan terkirim otomatis oleh pekerja latar setiap menit."
+      : "NOTIFY_EMAIL_ENABLED=false, jadi pesan hanya masuk antrean dan belum dikirim.",
+  };
+});
+
+app.post<{ Params: { emailId: string } }>("/api/v1/admin/email-outbox/:emailId/retry", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mencoba ulang pengiriman." });
+  const retried = retryEmail(request.params.emailId);
+  if (!retried) return reply.code(404).send({ error: "EMAIL_NOT_RETRYABLE", message: "Pesan tidak ada atau statusnya masih menunggu." });
+  recordAudit(null, request.user!.id, "admin.email_outbox.retry", { emailId: request.params.emailId });
+  return { retried: true, emailId: request.params.emailId };
+});
+
+app.post("/api/v1/admin/email-outbox/deliver", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh menjalankan pengiriman email." });
+  const report = await deliverPending(20);
+  recordAudit(null, request.user!.id, "admin.email_outbox.deliver", report);
+  return report;
+});
+
+app.delete<{ Params: { emailId: string } }>("/api/v1/admin/email-outbox/:emailId", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh menghapus pesan antrean." });
+  const row = getOutboxRow(request.params.emailId);
+  if (!row) return reply.code(404).send({ error: "EMAIL_NOT_FOUND", message: "Pesan antrean itu tidak ada." });
+  // A pending row is safe to remove while the worker is off (nothing is in flight). While sending is
+  // enabled the row is kept so a message cannot disappear in the middle of a delivery attempt.
+  const workerEnabled = emailEnabled();
+  if (row.status === "pending" && workerEnabled) {
+    return reply.code(409).send({ error: "EMAIL_IN_FLIGHT", message: "Pengiriman email sedang aktif, jadi pesan yang masih menunggu tidak bisa dihapus. Kirim ulang atau matikan NOTIFY_EMAIL_ENABLED dulu." });
+  }
+  const removed = deleteOutboxRow(request.params.emailId, !workerEnabled);
+  if (!removed) return reply.code(409).send({ error: "EMAIL_IN_FLIGHT", message: "Pesan tidak bisa dihapus saat ini." });
+  recordAudit(null, request.user!.id, "admin.email_outbox.deleted", { emailId: request.params.emailId, status: row.status });
+  return { deleted: true, emailId: request.params.emailId, status: row.status };
+});
+
+app.get("/api/v1/admin/retention", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat kebijakan retensi." });
+  const report = retentionReport();
+  return {
+    ...report,
+    // The default is a report only. Nothing is deleted until an operator asks for it and the flag is on.
+    enabled: report.policy.enabled,
+    note: report.policy.enabled
+      ? "Retensi aktif. Pekerja latar menjalankan pembersihan setiap 6 jam."
+      : "RETENTION_ENABLED=false, jadi laporan ini hanya menghitung. Tidak ada data yang dihapus.",
+  };
+});
+
+app.post("/api/v1/admin/retention/run", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh menjalankan retensi." });
+  const dryRun = request.body?.dryRun !== false;
+  const result = runRetention({ dryRun });
+  const expired = await expireExports();
+  recordAudit(null, request.user!.id, "admin.retention.run", { dryRun: result.dryRun, totalRemoved: result.totalRemoved, expiredExports: expired.marked });
+  return {
+    ...result,
+    expiredExports: expired,
+    message: result.dryRun
+      ? `Mode uji: tidak ada data yang dihapus. Kirim {"dryRun": false} untuk benar-benar menghapus.`
+      : `Retensi selesai: ${result.totalRemoved} baris dihapus.`,
+  };
+});
+
 app.setNotFoundHandler(async (request, reply) => {
   // HEAD is answered like GET so uptime checks and monitors see a healthy page.
   if (!["GET", "HEAD"].includes(request.method) || request.url.startsWith("/api/")) return reply.code(404).send({ error: "NOT_FOUND" });
@@ -2733,6 +3113,31 @@ app.setNotFoundHandler(async (request, reply) => {
 
 mkdirSync(config.DATA_DIR, { recursive: true });
 startWorkflowScheduler();
+
+/** Wave 4: sends queued email every minute. It stays idle while NOTIFY_EMAIL_ENABLED is false. */
+function startEmailWorker() {
+  const timer = setInterval(() => {
+    try { if (config.NOTIFY_EMAIL_ENABLED) void deliverPending(20).catch(() => undefined); } catch { /* the worker never takes the API down */ }
+  }, EMAIL_WORKER_INTERVAL_MS);
+  timer.unref?.();
+  return timer;
+}
+
+/** Wave 4: retention pass every six hours. It reports only until RETENTION_ENABLED=true. */
+function startRetentionWorker() {
+  const timer = setInterval(() => {
+    try {
+      const result = runRetention();
+      void expireExports().catch(() => undefined);
+      if (!result.dryRun && result.totalRemoved > 0) console.log(`[retention] removed ${result.totalRemoved} rows`);
+    } catch { /* a failed pass is retried on the next tick */ }
+  }, RETENTION_JOB_INTERVAL_MS);
+  timer.unref?.();
+  return timer;
+}
+
+startEmailWorker();
+startRetentionWorker();
 ensureCommerceSeed();
 await app.listen({ host: config.HOST, port: config.PORT });
 
