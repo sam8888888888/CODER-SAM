@@ -65,7 +65,7 @@ export function createRateLimiter(rule: RateLimitRule): RateLimiter {
   };
 }
 
-export type LimiterName = "login" | "register" | "password" | "api";
+export type LimiterName = "login" | "register" | "password" | "api" | "referral";
 
 /** Reads a positive integer from the environment so one deployment can tune a limit. */
 function envMax(name: string, fallback: number): number {
@@ -80,6 +80,8 @@ const RULES: Record<LimiterName, RateLimitRule> = {
   register: { windowMs: 60 * 60 * 1000, max: envMax("RATE_LIMIT_REGISTER_PER_HOUR", 20) },
   password: { windowMs: 60 * 60 * 1000, max: envMax("RATE_LIMIT_PASSWORD_PER_HOUR", 20) },
   api: { windowMs: 60 * 1000, max: envMax("RATE_LIMIT_API_PER_MINUTE", 600) },
+  // Wave 7: issuing a new referral code is a write, so it gets its own small window.
+  referral: { windowMs: 60 * 60 * 1000, max: envMax("RATE_LIMIT_REFERRAL_PER_HOUR", 20) },
 };
 
 /** One shared limiter instance per name, so counters survive across route calls. */

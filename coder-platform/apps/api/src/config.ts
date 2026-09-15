@@ -74,6 +74,15 @@ const Env = z.object({
   // tier limit still applies, so an owner can hand out a key without thinking about numbers.
   API_KEY_DAILY_REQUESTS_DEFAULT: z.coerce.number().int().min(0).default(0),
   API_KEY_DAILY_TOKENS_DEFAULT: z.coerce.number().int().min(0).default(0),
+  // Wave 7: referral programme. The reward is token credit, granted only AFTER the invited account
+  // finishes its first run, so "register many accounts and collect at once" does not pay out.
+  REFERRAL_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
+  REFERRAL_INVITER_TOKENS: z.coerce.number().int().min(0).default(500000),
+  REFERRAL_INVITEE_TOKENS: z.coerce.number().int().min(0).default(250000),
+  // Zero means "no ceiling". A ceiling keeps a single account from farming the programme forever.
+  REFERRAL_MAX_REWARDED_PER_USER: z.coerce.number().int().min(0).default(50),
+  // Wave 7: default window (in days) for the admin growth screen when the request names no window.
+  GROWTH_WINDOW_DAYS: z.coerce.number().int().min(1).max(365).default(30),
 });
 
 export const config = Env.parse(process.env);

@@ -37,6 +37,15 @@ import {
   enqueueJob, getJob, jobStats, jobWorkerState, listJobs, reapAbandonedExecutions, reapAbandonedRuns,
   recoverExpiredLeases, registerJobHandler, retryJob, runJobCycleOnce, startJobWorker, type JobRow,
 } from "./jobs.js";
+/** Wave 7: growth measurement and the referral programme. */
+import {
+  GROWTH_EVENTS, eventCatalogue, growthOverview, isGrowthEvent, recordGrowthEvent, topEvents,
+} from "./growth.js";
+import {
+  attachReferral, codeOwner, ensureReferralCode, listReferralsAdmin, listReferralsFor, qualifyReferralForRun,
+  referralEntryFor, referralLeaderboard, referralLimits, referralProgrammeEnabled, referralStats, referralSummaryFor,
+  rotateReferralCode,
+} from "./referrals.js";
 import { collectUserData, createExport, deleteExport, expireExports, exportFilePath, getExport, listExports } from "./dataexport.js";
 import { describeCron, nextCronRun, validateCronExpression } from "./cron.js";
 import {
@@ -353,7 +362,7 @@ app.get("/api/v1/auth/me", async (request, reply) => {
   // isAdmin and tier let the shell show the right pages without extra requests.
   return { user: { ...user, isAdmin: isPlatformAdmin(user), tier: userTier(user.id) } };
 });
-app.post<{ Body: { email?: string; password?: string; displayName?: string } }>("/api/v1/auth/register", async (request, reply) => {
+app.post<{ Body: { email?: string; password?: string; displayName?: string; ref?: string } }>("/api/v1/auth/register", async (request, reply) => {
   if (!registerLimiter.allow(request.ip ?? "unknown")) return reply.code(429).send({ error: "RATE_LIMITED", message: "Terlalu banyak pendaftaran dari koneksi ini. Coba lagi nanti." });
   const email = request.body?.email?.trim().toLowerCase(); const password = request.body?.password ?? ""; const displayName = request.body?.displayName?.trim();
   if (!email || !/^\S+@\S+\.\S+$/.test(email) || password.length < 10 || !displayName) return reply.code(400).send({ error: "INVALID_REGISTRATION" });
@@ -361,14 +370,26 @@ app.post<{ Body: { email?: string; password?: string; displayName?: string } }>(
   try {
     const passwordHash = await hashPassword(password);
     const transaction = db.transaction(() => {
-      db.prepare("INSERT INTO users (id,email,display_name,password_hash,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(userId,email,displayName,passwordHash,now,now);
+      db.prepare("INSERT INTO users (id,email,display_name,password_hash,created_at,updated_at,signup_ip) VALUES (?,?,?,?,?,?,?)").run(userId,email,displayName,passwordHash,now,now,request.ip ?? null);
       db.prepare("INSERT INTO workspaces (id,name,slug,created_at,updated_at) VALUES (?,?,?,?,?)").run(workspaceId,`${displayName}'s Workspace`,slug,now,now);
       db.prepare("INSERT INTO memberships (user_id,workspace_id,role,created_at) VALUES (?,?,?,?)").run(userId,workspaceId,"owner",now);
     }); transaction();
     const token = createSession(userId); setSessionCookie(reply, token, config.NODE_ENV === "production");
     const verification = await sendVerificationEmail({ id: userId, email, displayName });
     notify(workspaceId, userId, "account", "Selamat datang di COBLAI Coder", verification.sent ? "Kami sudah mengirim tautan verifikasi email." : "Verifikasi email belum aktif karena server email belum dikonfigurasi.", "/");
-    return reply.code(201).send({ user: { id: userId, email, displayName }, workspace: { id: workspaceId, slug }, emailVerification: verification });
+    // Wave 7: count the sign-up and, when the form carried a referral code, record the invitation.
+    // Neither step may block registration: a bad code is reported in the response, not as an error.
+    recordGrowthEvent("signup", { userId, workspaceId, props: { referred: Boolean(request.body?.ref) } });
+    let referral: { accepted: boolean; error?: string } = { accepted: false };
+    if (request.body?.ref) {
+      const attached = attachReferral({ inviteeUserId: userId, inviteeEmail: email, inviteeIp: request.ip ?? null, code: request.body.ref });
+      referral = attached.ok ? { accepted: true } : { accepted: false, error: attached.error };
+      if (attached.ok) {
+        recordGrowthEvent("referral_joined", { userId, workspaceId, props: { referralId: attached.referralId } });
+        notify(null, attached.inviterUserId, "growth", "Ada yang memakai kode undangan Anda", `${displayName} mendaftar dengan kode ${request.body.ref.toUpperCase()}. Hadiah keluar setelah ia menyelesaikan run pertama.`, "/referrals");
+      }
+    }
+    return reply.code(201).send({ user: { id: userId, email, displayName }, workspace: { id: workspaceId, slug }, emailVerification: verification, referral });
   } catch (error) { if (String(error).includes("UNIQUE")) return reply.code(409).send({ error: "EMAIL_EXISTS" }); throw error; }
 });
 app.post<{ Body: { email?: string; password?: string; code?: string } }>("/api/v1/auth/login", async (request, reply) => {
@@ -462,6 +483,7 @@ app.post<{ Body: { token?: string } }>("/api/v1/auth/email/verify", async (reque
   if (!userId) return reply.code(400).send({ error: "TOKEN_INVALID_OR_EXPIRED" });
   db.prepare("UPDATE users SET email_verified=1, updated_at=? WHERE id=?").run(new Date().toISOString(), userId);
   recordAudit(null, userId, "auth.email_verified", {});
+  recordGrowthEvent("email_verified", { userId });
   return { verified: true };
 });
 
@@ -658,6 +680,7 @@ app.post<{ Params: { workspaceId: string }; Body: { name?: string; slug?: string
   const now = new Date().toISOString(); const id = randomUUID();
   try {
     db.prepare("INSERT INTO projects (id,workspace_id,name,slug,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(id,workspaceId,name,slug,body.description?.trim() ?? "",now,now);
+    recordGrowthEvent("project_created", { userId: request.user!.id, workspaceId, props: { projectId: id } });
     return reply.code(201).send({ id, workspaceId, name, slug, description: body.description?.trim() ?? "", createdAt: now, updatedAt: now });
   } catch (error) {
     if (String(error).includes("UNIQUE")) return reply.code(409).send({ error: "PROJECT_SLUG_EXISTS" });
@@ -677,6 +700,7 @@ app.post<{ Params: { projectId: string }; Body: { title?: string } }>("/api/v1/p
   if (allowed.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
   const title = request.body?.title?.trim() || "New conversation"; const id = randomUUID(); const now = new Date().toISOString();
   db.prepare("INSERT INTO conversations (id,project_id,title,created_at,updated_at) VALUES (?,?,?,?,?)").run(id,request.params.projectId,title,now,now);
+  recordGrowthEvent("conversation_created", { userId: request.user!.id, props: { conversationId: id, projectId: request.params.projectId } });
   return reply.code(201).send({ conversation: { id, projectId: request.params.projectId, title, createdAt: now, updatedAt: now } });
 });
 /** Downloads one chat attachment. Access follows the conversation, not the file id. */
@@ -868,6 +892,7 @@ type RunEngineOptions = { text?: string; thinking?: string; personaId?: string |
 async function executeRun(runId: string, projectId: string, prompt: string, conversationId?: string, knowledge?: KnowledgeContext, model?: string, userId?: string, engineOptions?: RunEngineOptions) {
   const startedAt = new Date().toISOString();
   db.prepare("UPDATE runs SET status='running', started_at=? WHERE id=?").run(startedAt, runId);
+  recordGrowthEvent("run_started", { userId: userId ?? null, props: { runId, projectId, model: model ?? null } });
   let text = "";
   try {
     if (knowledge?.hits?.length) publishRunEvent(runId, "knowledge", { hits: knowledge.hits });
@@ -904,12 +929,26 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
     publishRunEvent(runId, "completed", { result: text });
     // Wave 6: tell registered webhooks. The delivery is queued, so a slow receiver never delays the run.
     emitProjectEvent(projectId, "run.completed", { runId, conversationId: conversationId ?? null, model: model ?? null, answerChars: text.length });
+    // Wave 7: growth accounting and the referral reward. The reward is paid here and only here, so an
+    // invitation only pays out after the invited account really finished a run.
+    recordGrowthEvent("run_completed", { userId: userId ?? null, props: { runId, projectId, model: model ?? null, answerChars: text.length } });
+    if (userId) {
+      const qualified = qualifyReferralForRun(userId);
+      if (qualified.status === "rewarded") {
+        recordGrowthEvent("referral_rewarded", { userId, props: { referralId: qualified.referralId, inviterUserId: qualified.inviterUserId } });
+        notify(null, qualified.inviterUserId ?? null, "growth", "Hadiah undangan cair",
+          `Undangan Anda menyelesaikan run pertama, jadi ${qualified.inviterTokens ?? 0} token masuk ke saldo Anda.`, "/referrals");
+        notify(null, userId, "growth", "Bonus undangan cair",
+          `Anda memakai kode undangan, jadi ${qualified.inviteeTokens ?? 0} token masuk ke saldo Anda.`, "/paket");
+      }
+    }
     if (conversationId) db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(randomUUID(),conversationId,"assistant",text || "",runId,new Date().toISOString());
   } catch (error) {
     const message = error instanceof Error ? error.message : "RUN_FAILED";
     db.prepare("UPDATE runs SET status='failed', error_code=?, finished_at=? WHERE id=?").run(message, new Date().toISOString(), runId);
     publishRunEvent(runId, "failed", { message });
     emitProjectEvent(projectId, "run.failed", { runId, conversationId: conversationId ?? null, model: model ?? null, error: message.slice(0, 300) });
+    recordGrowthEvent("run_failed", { userId: userId ?? null, props: { runId, projectId, error: message.slice(0, 120) } });
     // A failed engine run is worth a notification, because it usually needs a human.
     const owner = db.prepare("SELECT workspace_id AS workspaceId FROM projects WHERE id=?").get(projectId) as { workspaceId: string } | undefined;
     notify(owner?.workspaceId ?? null, null, "run", "Run gagal", `Run ${runId.slice(0, 8)} gagal: ${message.slice(0, 200)}`, "/");
@@ -1637,6 +1676,7 @@ app.post<{ Body: { planCode?: string; months?: number; couponCode?: string; note
     return reply.code(status).send({ error: result.error, message: result.error === "PLAN_NOT_FOUND" ? "Paket tidak ditemukan." : "Kupon tidak bisa dipakai." });
   }
   recordAudit(null, request.user!.id, "billing.order_created", { orderId: result.order.id, planCode: result.order.planCode, totalIdr: result.order.totalIdr, method: result.order.method });
+  recordGrowthEvent("order_created", { userId: request.user!.id, props: { orderId: result.order.id, planCode: result.order.planCode, totalIdr: result.order.totalIdr, status: result.order.status } });
   if (result.order.status === "pending") {
     notifyAdmins("billing", "Pesanan baru menunggu pembayaran", `${request.user!.email} memesan paket ${result.order.planCode} senilai Rp${result.order.totalIdr.toLocaleString("id-ID")}.`, "/");
   }
@@ -1710,6 +1750,7 @@ app.post<{ Params: { orderId: string }; Body: { decision?: string; note?: string
     if (fresh.status === "paid" && !existing.decidedAt) {
       recordAudit(null, request.user!.id, "billing.order_paid", { orderId: fresh.id, totalIdr: fresh.totalIdr, planCode: fresh.planCode });
       notify(null, fresh.userId, "billing", "Pembayaran diterima", `Paket ${fresh.planCode} sudah aktif. Terima kasih.`, "/");
+      recordGrowthEvent("order_paid", { userId: fresh.userId, props: { orderId: fresh.id, planCode: fresh.planCode, totalIdr: fresh.totalIdr } });
     }
     return { order: fresh };
   }
@@ -2609,6 +2650,175 @@ app.get("/api/v1/skills", { preHandler: requireUser }, async (request: any) => {
   return { skills, groups, engine: health, storage: { data: await dirStats(config.DATA_DIR), engineSessions: await dirStats(config.ENGINE_ROOT_DIR) } };
 });
 
+/* ---------------------------------------------------------------------------
+ * Wave 7: growth. Onboarding, the referral programme, honest quota warnings,
+ * the admin growth view, and the public files search engines look for.
+ * ------------------------------------------------------------------------- */
+
+const referralLimiter = limiterFor("referral");
+
+/** One row per first-time step, so the Home card can point at the next useful action. */
+function onboardingStepsFor(userId: string) {
+  const one = (sql: string, ...args: unknown[]) => Number((db.prepare(sql).get(...args) as { n: number }).n);
+  const emailVerified = Number((db.prepare("SELECT email_verified AS v FROM users WHERE id=?").get(userId) as { v: number } | undefined)?.v ?? 0) === 1;
+  const projects = one("SELECT COUNT(*) AS n FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=?", userId);
+  const conversations = one("SELECT COUNT(*) AS n FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=?", userId);
+  const runsDone = one("SELECT COUNT(*) AS n FROM runs r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=? AND r.status='completed'", userId);
+  const keys = one("SELECT COUNT(*) AS n FROM api_keys WHERE user_id=? AND revoked_at IS NULL", userId);
+  const teammates = one("SELECT COUNT(*) AS n FROM memberships m WHERE m.workspace_id IN (SELECT workspace_id FROM memberships WHERE user_id=?) AND m.user_id<>?", userId, userId);
+  const steps = [
+    { key: "verify_email", label: "Verifikasi email", done: emailVerified, hint: "Buka tautan verifikasi di kotak masuk Anda.", link: "/" },
+    { key: "first_project", label: "Buat proyek pertama", done: projects > 0, hint: "Proyek adalah tempat percakapan dan berkas berkumpul.", link: "/projects" },
+    { key: "first_conversation", label: "Mulai percakapan", done: conversations > 0, hint: "Tulis permintaan pertama Anda, sekecil apa pun.", link: "/projects" },
+    { key: "first_run", label: "Selesaikan satu run AI", done: runsDone > 0, hint: "Run pertama biasanya selesai di bawah satu menit.", link: "/projects" },
+    { key: "connect_team_or_key", label: "Undang tim atau buat kunci API", done: teammates > 0 || keys > 0, hint: "Bagikan akses lewat Tim, atau pakai kunci API untuk otomatisasi.", link: "/team" },
+  ];
+  const done = steps.filter((step) => step.done).length;
+  const dismissed = Boolean(db.prepare("SELECT dismissed_at AS d FROM onboarding_state WHERE user_id=?").get(userId));
+  return {
+    steps, done, total: steps.length,
+    percent: Math.round((done / steps.length) * 100),
+    nextStep: steps.find((step) => !step.done)?.key ?? null,
+    complete: done === steps.length,
+    dismissed,
+    counts: { projects, conversations, runsDone, keys, teammates, emailVerified },
+  };
+}
+
+/** The referral panel of the signed-in account. The code is created on first view. */
+app.get("/api/v1/referrals/me", { preHandler: requireUser }, async (request: any) => {
+  const userId = request.user!.id;
+  return { ...referralSummaryFor(userId), invitedBy: referralEntryFor(userId), site: config.PUBLIC_BASE_URL };
+});
+
+app.get<{ Querystring: { limit?: string } }>("/api/v1/referrals", { preHandler: requireUser }, async (request: any) => {
+  const userId = request.user!.id;
+  const limit = Number(request.query?.limit ?? 100);
+  return {
+    code: ensureReferralCode(userId),
+    referrals: listReferralsFor(userId, Number.isFinite(limit) ? limit : 100),
+    invitedBy: referralEntryFor(userId),
+    limits: referralLimits(),
+  };
+});
+
+/** A fresh code invalidates older links. Limited so it cannot be used as a free random generator. */
+app.post("/api/v1/referrals/code", { preHandler: requireUser }, async (request: any, reply) => {
+  const userId = request.user!.id;
+  if (!referralLimiter.allow(`ref:${userId}`)) {
+    return reply.code(429).send({ error: "RATE_LIMITED", message: `Terlalu sering. Coba lagi dalam ${referralLimiter.retryAfterSeconds(`ref:${userId}`)} detik.` });
+  }
+  const code = rotateReferralCode(userId);
+  recordAudit(null, userId, "referral.code_rotated", { code });
+  return { code, link: `${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/?ref=${code}` };
+});
+
+/** The invitation the signed-in account arrived with, including a pending reward. */
+app.get("/api/v1/onboarding", { preHandler: requireUser }, async (request: any) => onboardingStepsFor(request.user!.id));
+
+app.post("/api/v1/onboarding/dismiss", { preHandler: requireUser }, async (request: any) => {
+  const userId = request.user!.id;
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO onboarding_state (user_id, dismissed_at, updated_at) VALUES (?,?,?)
+    ON CONFLICT(user_id) DO UPDATE SET dismissed_at=excluded.dismissed_at, updated_at=excluded.updated_at`).run(userId, now, now);
+  const state = onboardingStepsFor(userId);
+  if (state.complete) recordGrowthEvent("onboarding_completed", { userId });
+  return { dismissed: true, onboarding: state };
+});
+
+/** An honest quota warning: real numbers, no invented scarcity. It drives the small shell banner. */
+app.get("/api/v1/billing/quota-alert", { preHandler: requireUser }, async (request: any) => {
+  const userId = request.user!.id;
+  const quota = quotaState(userId);
+  const share = (used: number, limit: number) => (limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0);
+  const dayPercent = share(quota.usedToday, quota.dailyLimit);
+  const monthPercent = share(quota.usedMonth, quota.monthlyLimit);
+  const percent = Math.max(dayPercent, monthPercent);
+  const level = quota.blocked ? "exceeded" : percent >= 95 ? "critical" : percent >= 80 ? "warning" : "ok";
+  const messages: Record<string, string> = {
+    ok: "Pemakaian token masih longgar.",
+    warning: `Pemakaian token sudah ${percent}% dari batas paket ${quota.tier}.`,
+    critical: `Pemakaian token sudah ${percent}% dari batas paket ${quota.tier}. Sisa sedikit.`,
+    exceeded: `Batas paket ${quota.tier} sudah terpakai penuh. Run berikutnya akan ditolak sampai batas direset atau paket dinaikkan.`,
+  };
+  return {
+    level, percent, dayPercent, monthPercent,
+    usedToday: quota.usedToday, dailyLimit: quota.dailyLimit, usedMonth: quota.usedMonth, monthlyLimit: quota.monthlyLimit,
+    remainingToday: quota.remainingToday, remainingMonth: quota.remainingMonth,
+    creditTokens: quota.creditTokens, tier: quota.tier, blocked: quota.blocked, reason: quota.reason,
+    message: messages[level], packagePath: "/paket", refreshSeconds: 300,
+  };
+});
+
+/** Platform-wide growth numbers. Administrators only: the funnel is business information. */
+app.get<{ Querystring: { days?: string } }>("/api/v1/admin/growth", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat angka pertumbuhan." });
+  const asked = Number(request.query?.days ?? config.GROWTH_WINDOW_DAYS);
+  const days = Number.isFinite(asked) && asked > 0 ? Math.min(365, Math.round(asked)) : config.GROWTH_WINDOW_DAYS;
+  const overview = growthOverview(days);
+  return {
+    ...overview,
+    windowDays: days,
+    referrals: referralStats(),
+    leaderboard: referralLeaderboard(10),
+    referralLimits: referralLimits(),
+  };
+});
+
+app.get<{ Querystring: { limit?: string } }>("/api/v1/admin/referrals", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat daftar undangan." });
+  const asked = Number(request.query?.limit ?? 100);
+  const limit = Number.isFinite(asked) && asked > 0 ? Math.min(500, Math.round(asked)) : 100;
+  return { stats: referralStats(), leaderboard: referralLeaderboard(10), referrals: listReferralsAdmin(limit) };
+});
+
+/** Public catalogue of the write and read API. No session and no secret: it is documentation. */
+app.get("/api/v1/public/docs", async () => ({
+  product: "COBLAI Coder",
+  baseUrl: `${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/api/v1/public/v1`,
+  version: process.env.APP_VERSION ?? null,
+  auth: {
+    scheme: "ApiKey",
+    header: "Authorization",
+    example: "Authorization: ApiKey ck_...",
+    scopes: ["read", "write"],
+    note: "Kunci dibuat di halaman Kunci API. Nilai kunci hanya tampil sekali saat dibuat.",
+  },
+  endpoints: PUBLIC_API_ENDPOINTS,
+  limits: PUBLIC_API_LIMITS(),
+  webhook: {
+    enabled: true,
+    events: webhookCatalogue().map((item) => item.event),
+    signatureHeader: "x-coblai-signature",
+    signatureFormat: "sha256=<hmac sha256 dari '<timestamp>.<body json>'>",
+    headers: ["x-coblai-event", "x-coblai-delivery", "x-coblai-timestamp", "x-coblai-signature"],
+    retries: { attempts: config.WEBHOOK_MAX_ATTEMPTS, timeoutMs: config.WEBHOOK_DELIVERY_TIMEOUT_MS, backoffSeconds: "5 x percobaan" },
+  },
+  errors: [
+    { code: "API_KEY_REQUIRED", meaning: "Header Authorization tidak memuat kunci yang dikenal." },
+    { code: "API_KEY_SCOPE_REQUIRED", meaning: "Kunci tidak punya izin yang dibutuhkan rute ini." },
+    { code: "API_KEY_RATE_LIMITED", meaning: "Terlalu banyak permintaan per menit untuk kunci ini." },
+    { code: "API_KEY_DAILY_REQUEST_LIMIT", meaning: "Batas jumlah permintaan harian kunci sudah tercapai." },
+    { code: "API_KEY_DAILY_TOKEN_LIMIT", meaning: "Batas token harian kunci sudah tercapai." },
+  ],
+  page: `${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/docs`,
+}));
+
+/** Search engines: the public pages only. The application shell is private. */
+app.get("/robots.txt", async (_request, reply) => reply.type("text/plain; charset=utf-8").send(
+  [`User-agent: *`, `Allow: /$`, `Allow: /harga`, `Allow: /docs`, `Disallow: /api/`, `Sitemap: ${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/sitemap.xml`, ""].join("\n"),
+));
+
+app.get("/sitemap.xml", async (_request, reply) => {
+  const base = config.PUBLIC_BASE_URL.replace(/\/+$/, "");
+  const today = new Date().toISOString().slice(0, 10);
+  const urls = ["/", "/harga", "/docs"];
+  const body = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`
+    + urls.map((path) => `  <url><loc>${base}${path}</loc><lastmod>${today}</lastmod><changefreq>weekly</changefreq></url>`).join("\n")
+    + `\n</urlset>\n`;
+  return reply.type("application/xml; charset=utf-8").send(body);
+});
+
 /** One screen with the platform health an operator needs, all values read from the running system. */
 app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) => {
   const userId = request.user!.id;
@@ -2662,6 +2872,11 @@ app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) 
       webhooks: webhookStats(),
       keyLimits: PUBLIC_API_LIMITS(),
       webhookAllowLocal: config.WEBHOOK_ALLOW_LOCAL,
+      /** Wave 7: the referral programme and the event log that feeds the growth screen. */
+      referrals: referralStats(),
+      referralLimits: referralLimits(),
+      growthEvents: Number((db.prepare("SELECT COUNT(*) AS n FROM growth_events").get() as { n: number }).n),
+      growthWindowDays: config.GROWTH_WINDOW_DAYS,
     },
     /** Wave 5: the durable queue. These numbers say whether background work is keeping up. */
     backgroundWork: {
@@ -2922,6 +3137,7 @@ app.post<{ Body: { name?: string; scopes?: unknown; workspaceId?: string; dailyR
     keyId: created.key.id, prefix: created.key.prefix, scopes: created.key.scopes,
     dailyRequestLimit: created.key.dailyRequestLimit, dailyTokenLimit: created.key.dailyTokenLimit,
   });
+  recordGrowthEvent("api_key_created", { userId: request.user!.id, workspaceId: membership.workspaceId, props: { scopes: created.key.scopes } });
   return reply.code(201).send({ key: created.key, secret: created.raw, workspaceId: membership.workspaceId, warning: "Salin sekarang. Nilai ini tidak bisa ditampilkan lagi." });
 });
 
@@ -3033,6 +3249,7 @@ app.post<{ Params: { projectId: string }; Body: { title?: string } }>("/api/v1/p
   const id = randomUUID(); const now = new Date().toISOString();
   db.prepare("INSERT INTO conversations (id,project_id,title,created_at,updated_at) VALUES (?,?,?,?,?)").run(id, project.id, title, now, now);
   recordAudit(auth.workspaceId, auth.userId, "public.conversation.created", { conversationId: id, projectId: project.id, keyId: auth.key.id });
+  recordGrowthEvent("conversation_created", { userId: auth.userId, workspaceId: auth.workspaceId, props: { conversationId: id, projectId: project.id, via: "public-api" } });
   return reply.code(201).send({ conversation: { id, projectId: project.id, title, createdAt: now, updatedAt: now } });
 });
 
@@ -3122,6 +3339,7 @@ app.post<{ Body: { url?: string; events?: unknown; description?: string; workspa
     events: parseEvents(request.body?.events), description: request.body?.description ?? null,
   });
   recordAudit(workspace.workspaceId, request.user!.id, "webhook.created", { webhookId: created.webhook.id, url: created.webhook.url, events: created.webhook.events });
+  recordGrowthEvent("webhook_created", { userId: request.user!.id, workspaceId: workspace.workspaceId, props: { webhookId: created.webhook.id } });
   return reply.code(201).send({
     webhook: created.webhook, secret: created.secret,
     warning: "Salin rahasia ini sekarang. Dipakai untuk memeriksa header x-coblai-signature.",

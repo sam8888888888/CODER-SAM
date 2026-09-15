@@ -117,7 +117,7 @@ check("pendaftaran pengguna non-admin berhasil", registerOutsider.status === 200
 /* ---------------------------------- 1) bentuk tabel dan skema ---------------------------------- */
 
 const schemaRow = db.prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1").get() as any;
-check("skema basis data sudah 14 (tabel jobs dan webhook ikut terpasang)", Number(schemaRow?.version) === 14, short(schemaRow));
+check("skema basis data minimal 14 (tabel jobs dan webhook ikut terpasang)", Number(schemaRow?.version) >= 14, short(schemaRow));
 const jobColumns = (db.prepare("PRAGMA table_info(jobs)").all() as any[]).map((row) => String(row.name));
 const expectedColumns = ["id", "kind", "status", "payload", "result", "attempts", "max_attempts", "run_after", "lock_owner", "lock_expires_at", "last_error", "dedupe_key", "created_at", "updated_at", "finished_at"];
 check("kolom tabel jobs lengkap", expectedColumns.every((name) => jobColumns.includes(name)), short(jobColumns));

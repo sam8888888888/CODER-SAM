@@ -157,7 +157,7 @@ const guestUser = db.prepare("SELECT id FROM users WHERE email=?").get(guestEmai
 /* ---------------------------------- 1) bentuk skema 14 ---------------------------------- */
 
 const schemaRow = db.prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1").get() as any;
-check("skema basis data sudah 14", Number(schemaRow?.version) === 14, short(schemaRow));
+check("skema basis data minimal 14", Number(schemaRow?.version) >= 14, short(schemaRow));
 const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((row) => String(row.name));
 check("tabel webhooks dan webhook_deliveries terpasang", tables.includes("webhooks") && tables.includes("webhook_deliveries"), short(tables.length));
 const keyColumns = (db.prepare("PRAGMA table_info(api_keys)").all() as any[]).map((row) => String(row.name));

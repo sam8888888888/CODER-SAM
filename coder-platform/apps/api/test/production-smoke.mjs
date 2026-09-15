@@ -462,5 +462,49 @@ check("wave6 status hub counts 9 served public routes and no planned ones",
   JSON.stringify(hubAfterKeys.json?.openPlatform)?.slice(0, 200));
 console.log(`INFO wave6 webhooks: hooks=${hubAfterKeys.json?.openPlatform?.webhooks?.hooks} active=${hubAfterKeys.json?.openPlatform?.webhooks?.active} delivered=${hubAfterKeys.json?.openPlatform?.webhooks?.delivered} failed=${hubAfterKeys.json?.openPlatform?.webhooks?.failed} allowLocal=${hubAfterKeys.json?.openPlatform?.webhookAllowLocal}`);
 
+/* ------------------------------- Wave 7: pertumbuhan (hanya baca) ------------------------------- */
+// Uji produksi hanya MELIHAT. Tidak ada undangan yang dibuat, tidak ada kode yang diganti, dan tidak ada
+// pendaftaran uji, supaya data produksi tidak bertambah hanya karena uji ini.
+const robots = await call("GET", "/robots.txt");
+check("wave7 robots.txt is served and points at the sitemap",
+  robots.status === 200 && String(robots.json).includes("Sitemap:") && String(robots.json).includes("Disallow: /api/"),
+  String(robots.json)?.slice(0, 160));
+const sitemap = await call("GET", "/sitemap.xml");
+check("wave7 sitemap.xml lists the public pages",
+  sitemap.status === 200 && String(sitemap.json).includes("<urlset") && String(sitemap.json).includes("/harga") && String(sitemap.json).includes("/docs"),
+  String(sitemap.json)?.slice(0, 160));
+const docs = await call("GET", "/api/v1/public/docs");
+check("wave7 public docs need no session and describe the served API",
+  docs.status === 200 && typeof docs.json?.product === "string" && Array.isArray(docs.json?.endpoints) && docs.json.endpoints.length >= 9,
+  JSON.stringify(docs.json)?.slice(0, 200));
+check("wave7 public docs list the webhook events and the error codes",
+  Array.isArray(docs.json?.webhook?.events) && docs.json.webhook.events.length === 2 && String(docs.json?.webhook?.signatureHeader).length > 0 && Array.isArray(docs.json?.errors) && docs.json.errors.length >= 5,
+  JSON.stringify(docs.json?.webhook)?.slice(0, 200));
+check("wave7 public docs never carry a webhook secret", !JSON.stringify(docs.json).includes("whsec_"), `panjang=${JSON.stringify(docs.json)?.length}`);
+const refMe = await call("GET", "/api/v1/referrals/me");
+check("wave7 the signed in account gets its own referral code and link",
+  refMe.status === 200 && typeof refMe.json?.code === "string" && refMe.json.code.length === 8 && String(refMe.json?.link).includes(`?ref=${refMe.json?.code}`),
+  JSON.stringify(refMe.json)?.slice(0, 160));
+check("wave7 referral counters and limits are reported as numbers",
+  typeof refMe.json?.counters?.invited === "number" && typeof refMe.json?.counters?.rewarded === "number" && typeof refMe.json?.limits?.inviterTokens === "number",
+  JSON.stringify(refMe.json?.counters));
+const onboard = await call("GET", "/api/v1/onboarding");
+check("wave7 onboarding answers with five steps and a next step",
+  onboard.status === 200 && Array.isArray(onboard.json?.steps) && onboard.json.steps.length === 5 && Number(onboard.json?.total) === 5 && Number(onboard.json?.percent) >= 0 && Number(onboard.json?.percent) <= 100,
+  JSON.stringify(onboard.json)?.slice(0, 200));
+const quota = await call("GET", "/api/v1/billing/quota-alert");
+check("wave7 the quota warning uses real server numbers and a readable sentence",
+  quota.status === 200 && ["ok", "warning", "critical", "exceeded"].includes(String(quota.json?.level)) && String(quota.json?.message).length > 10 && String(quota.json?.packagePath) === "/paket",
+  JSON.stringify(quota.json)?.slice(0, 240));
+const growthBlocked = await call("GET", "/api/v1/admin/growth");
+check("wave7 the growth screen refuses a normal user", growthBlocked.status === 403 && growthBlocked.json?.error === "ADMIN_REQUIRED", JSON.stringify(growthBlocked.json));
+const refBlocked = await call("GET", "/api/v1/admin/referrals");
+check("wave7 the referral list refuses a normal user", refBlocked.status === 403 && refBlocked.json?.error === "ADMIN_REQUIRED", JSON.stringify(refBlocked.json));
+const hubW7 = await call("GET", "/api/v1/status-hub");
+check("wave7 status hub reports the referral programme and the event count",
+  typeof hubW7.json?.openPlatform?.referrals?.total === "number" && typeof hubW7.json?.openPlatform?.referralLimits?.inviterTokens === "number" && Number.isFinite(Number(hubW7.json?.openPlatform?.growthEvents)) && Number(hubW7.json?.openPlatform?.growthWindowDays) >= 1,
+  JSON.stringify(hubW7.json?.openPlatform?.referrals)?.slice(0, 200));
+console.log(`INFO wave7 growth: codes=${hubW7.json?.openPlatform?.referrals?.codes} total=${hubW7.json?.openPlatform?.referrals?.total} rewarded=${hubW7.json?.openPlatform?.referrals?.rewarded} events=${hubW7.json?.openPlatform?.growthEvents} quota=${quota.json?.level}(${quota.json?.percent}%)`);
+
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

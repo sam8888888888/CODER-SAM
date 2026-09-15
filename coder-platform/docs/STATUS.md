@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 15 Sep 2026 (versi 0.16.0)
+Terakhir diperbarui: 15 Sep 2026 (versi 0.17.0)
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel
@@ -8,13 +8,65 @@ di `apps/api/src/db.ts`, halaman di `coder-dashboard/src/nav.ts`, dan suite di `
 Bila ragu, tulis "belum diverifikasi".
 
 Catatan snapshot: berkas ini diperiksa saat repo sedang diedit, jadi beberapa perubahan belum di-commit
-(Wave 6: `server.ts`, `db.ts`, `config.ts`, `jobs.ts`, `apikeys.ts`, `webhooks.ts` baru, `api.ts`, `nav.ts`,
-`App.tsx`, `ApiKeys.tsx`, `ApiWebhooks.tsx` baru).
-Jumlah rute `server.ts` saat diperiksa: 179 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2
+(Wave 7: `server.ts`, `db.ts`, `config.ts`, `ratelimit.ts`, `referrals.ts` baru, `growth.ts` baru,
+`api.ts`, `nav.ts`, `App.tsx`, `index.html`, `Referrals.tsx`/`Growth.tsx`/`Onboarding.tsx`/`PublicDocs.tsx` baru,
+serta suite `wave7.e2e.ts` baru).
+Jumlah rute `server.ts` saat diperiksa: 190 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2
 untuk lampiran, cabang dan hapus massal; 25 rute Wave 3 untuk ruang kerja agen; 28 rute Wave 4 untuk kunci API,
 API publik, antrean email, ekspor data, retensi, dan harga publik; 3 rute Wave 5 untuk melihat antrean pekerjaan,
-mengulang pekerjaan, dan memaksa satu putaran; 8 rute Wave 6 untuk dua rute tulis publik dan enam rute webhook).
+mengulang pekerjaan, dan memaksa satu putaran; 8 rute Wave 6 untuk dua rute tulis publik dan enam rute webhook;
+11 rute Wave 7 untuk undangan, langkah awal, peringatan kuota, laporan pertumbuhan, panel undangan admin,
+dokumentasi publik, robot, dan sitemap).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
+
+## Wave 7 (v0.17.0) — Pertumbuhan: undangan, angka pertumbuhan, langkah awal, kuota, permukaan publik
+
+Tema: pemakaian yang tumbuh bisa diukur dan dihadiahi, tanpa menambah risiko pada data lama.
+Schema basis data naik 14 -> 15. Empat tabel baru: `referral_codes`, `referrals`, `growth_events`,
+`onboarding_state`; satu kolom baru: `users.signup_ip`. Modul baru: `apps/api/src/referrals.ts` dan
+`apps/api/src/growth.ts`.
+
+- Program undangan (`apps/api/src/referrals.ts`):
+  - Kode dibuat otomatis saat panel undangan pertama dibuka: 8 karakter dari abjad `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`
+    (tanpa huruf/angka yang mudah tertukar seperti `I`, `O`, `0`, `1`). Kode lama langsung tidak dikenali setelah
+    `POST /api/v1/referrals/code` (rotasi dicatat sebagai audit `referral.code_rotated`).
+  - Pendaftaran menerima `ref` opsional. Kode salah TIDAK menggagalkan pendaftaran; jawabannya berisi
+    `referral: { accepted: false, error: "REFERRAL_CODE_NOT_FOUND" }`.
+  - Hadiah cair HANYA setelah akun yang diundang menyelesaikan run pertamanya yang berhasil
+    (`qualifyReferralForRun` dipanggil di jalur selesai `executeRun`). Nilai bawaan: pengundang 500.000 token,
+    yang diundang 250.000 token, lewat `grantCredit` sehingga tercatat di `credit_ledger`.
+  - Penolakan yang terbaca: `REFERRAL_CODE_REQUIRED`, `REFERRAL_CODE_NOT_FOUND`, `REFERRAL_SELF`,
+    `REFERRAL_ALREADY_RECORDED`, `REFERRAL_DISABLED`. Undangan yang dicurigai tipuan disimpan dengan
+    status `blocked` dan alasan `SAME_EMAIL` atau `SAME_IP`, lalu `CEILING` bila batas hadiah per pengundang
+    (`REFERRAL_MAX_REWARDED_PER_USER`, bawaan 50) sudah tercapai.
+  - BATAS YANG DIAKUI: penjagaan anti-tipuan ini lemah. Verifikasi email belum diwajibkan, jadi akun palsu dari
+    IP berbeda tetap bisa lolos. Angka hadiah di atas juga masih usulan, bukan keputusan pemilik produk.
+- Angka pertumbuhan (`apps/api/src/growth.ts`, `GET /api/v1/admin/growth?days=`):
+  - Corong empat langkah (daftar, proyek, run, bayar) dihitung dari tabel ASLI (`users`, `projects`, `runs`,
+    `orders`) sehingga berlaku surut untuk akun dan run yang sudah ada sebelum Wave 7.
+  - Aktivitas harian, retensi (`dau`/`wau`/`mau`), peristiwa teratas, dan katalog 16 nama peristiwa dibaca dari
+    `growth_events`. BATAS YANG DIAKUI: tabel itu mulai kosong pada Wave 7 (tanpa isi ulang data lama), jadi
+    grafik retensi dan aktivitas baru terisi sejak versi ini. `retention.note` menyebutkan hal ini di API.
+  - Peristiwa yang dicatat saat tindakan terjadi: `signup`, `email_verified`, `project_created`,
+    `conversation_created`, `run_started`, `run_completed`, `run_failed`, `api_key_created`, `webhook_created`,
+    `order_created`, `order_paid`, `referral_joined`, `referral_rewarded`, `onboarding_completed`,
+    `quota_warning_shown`, `upgrade_viewed`. Pencatatan bersifat best-effort: kegagalan tidak pernah
+    membatalkan tindakan utama.
+- Langkah awal (`GET /api/v1/onboarding`, `POST /api/v1/onboarding/dismiss`): lima langkah tetap
+  (`verify_email`, `first_project`, `first_conversation`, `first_run`, `connect_team_or_key`) dengan keadaan
+  selesai yang dihitung dari basis data, plus `percent`, `nextStep`, dan `counts`. Tombol sembunyikan menyimpan
+  `dismissed_at` di `onboarding_state`, jadi kartunya tidak muncul lagi setelah halaman dimuat ulang.
+- Peringatan kuota (`GET /api/v1/billing/quota-alert`): tingkat `ok` < 70%, `warning` >= 70%, `critical` >= 90%,
+  `exceeded` saat jatah harian habis (`blocked: true`, `reason: DAILY_TOKEN_QUOTA_EXCEEDED`). Angka yang
+  dilaporkan (`percent`, `dayPercent`, `monthPercent`, `remainingToday`, `remainingMonth`, `creditTokens`)
+  berasal dari `quotaState` yang sama dengan penjaga run, jadi tidak ada dua hitungan yang berbeda.
+- Permukaan publik (tanpa sesi):
+  - `GET /robots.txt` (menunjuk sitemap, menutup `/api/`) dan `GET /sitemap.xml` (`/`, `/harga`, `/docs`).
+  - `GET /api/v1/public/docs`: sembilan rute aktif, izin `read`/`write`, batas laju dan jumlah kunci, bentuk
+    webhook (`run.completed`, `run.failed`, tanda tangan, percobaan ulang), dan daftar kode galat. Tidak ada
+    rahasia (`whsec_`) di dalamnya.
+  - Halaman `/docs` disajikan shell SPA tanpa sesi, sama polanya dengan `/harga`.
+  - `index.html` memuat meta Open Graph/Twitter, `canonical`, dan `robots` untuk dibagikan.
 
 ## Wave 6 (v0.16.0) — API publik fase 2: tulis, webhook, kuota per kunci
 
@@ -517,7 +569,13 @@ Cek tipe (tanpa keluaran berarti lulus; saya jalankan 13 Sep 2026):
 Suite end-to-end lokal tanpa jaringan:
 
 - `cd coder-platform && MOCK_ENGINE=true npx tsx apps/api/test/<suite>.e2e.ts`
-- Cara tercepat sekarang: `cd coder-platform && npm run verify` (26 suite, mencetak `ALL_SUITES_PASSED`).
+- Cara tercepat sekarang: `cd coder-platform && npm run verify` (27 suite, mencetak `ALL_SUITES_PASSED`).
+- Suite yang ditambahkan setelah snapshot 21 suite itu, semuanya hijau 15 Sep 2026:
+  `wave3.e2e.ts` (260 lulus, 1 SKIP), `wave4.e2e.ts` (181), `outbox-mail.e2e.ts` (14),
+  `csrf-strict.e2e.ts` (13), `backup-restore.e2e.ts` (22), `jobs.e2e.ts` (51), `wave6.e2e.ts` (91),
+  `wave7.e2e.ts` (95, menjalankan alur undangan sampai hadiah lewat MOCK_ENGINE).
+- Catatan jujur: `apps/api/tsconfig.json` hanya menyertakan `src/**/*.ts`, jadi berkas uji di `apps/api/test`
+  TIDAK diperiksa tipe oleh `tsc --noEmit` (di-type-strip oleh tsx). Yang diperiksa tipe hanya kode server.
 - 21 suite (20 suite lama lulus 14 Sep 2026 sebelum Wave 2 dengan `RUNNER_EXIT=0`; `wave2` lulus
   104/104 pemeriksaan): `account-recovery`, `account-security`, `admin-metrics`, `billing`, `csrf-limits`,
   `delete-flow`, `guards`, `knowledge-team`, `login-identity`, `mailer`, `model-rbac`, `project-runs`,

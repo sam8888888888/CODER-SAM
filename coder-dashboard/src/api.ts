@@ -98,6 +98,49 @@ export type WebhookLimits = { maxPerWorkspace: number; maxAttempts: number; time
 export type WebhooksResponse = { webhooks: Webhook[]; stats: WebhookStats; events: WebhookEventInfo[]; limits: WebhookLimits; note: string; canManage: boolean };
 export type WebhookTestReport = { status: string; responseStatus: number | null; error: string | null; durationMs: number };
 
+// --- Wave 7: pertumbuhan, undangan, dan langkah awal -------------------------
+export type ReferralStatus = 'pending' | 'qualified' | 'rewarded' | 'blocked';
+export type ReferralRow = { id: string; code: string; inviterUserId: string; inviteeUserId: string; inviteeEmail: string | null;
+  status: ReferralStatus; blockedReason: string | null; inviterTokens: number; inviteeTokens: number;
+  createdAt: string; qualifiedAt: string | null; rewardedAt: string | null };
+export type ReferralLimits = { enabled: boolean; inviterTokens: number; inviteeTokens: number; maxRewardedPerUser: number };
+export type ReferralCounters = { invited: number; pending: number; qualified: number; rewarded: number; blocked: number };
+export type ReferralSummary = { enabled: boolean; code: string; link: string; limits: ReferralLimits; counters: ReferralCounters;
+  tokensEarned: number; recent: ReferralRow[]; invitedBy: ReferralRow | null; site: string };
+export type ReferralStats = { codes: number; total: number; pending: number; qualified: number; rewarded: number; blocked: number;
+  tokensGranted: number; blockedByReason: { reason: string; count: number }[] };
+export type ReferralLeader = { userId: string; email: string; rewarded: number; tokens: number; invited: number };
+export type OnboardingStep = { key: string; label: string; done: boolean; hint: string; link: string };
+export type OnboardingState = { steps: OnboardingStep[]; done: number; total: number; percent: number;
+  nextStep: string | null; complete: boolean; dismissed: boolean;
+  counts: { projects: number; conversations: number; runsDone: number; keys: number; teammates: number; emailVerified: boolean } };
+export type QuotaAlertLevel = 'ok' | 'warning' | 'critical' | 'exceeded';
+export type QuotaAlert = { level: QuotaAlertLevel; percent: number; dayPercent: number; monthPercent: number;
+  usedToday: number; dailyLimit: number; usedMonth: number; monthlyLimit: number;
+  remainingToday: number | null; remainingMonth: number | null; creditTokens: number; tier: string;
+  blocked: boolean; reason: string | null; message: string; packagePath: string; refreshSeconds: number };
+export type GrowthFunnelStep = { key: string; label: string; users: number; allTime: number };
+export type GrowthActivityRow = { day: string; signups: number; runsCompleted: number; events: number; activeUsers: number };
+export type GrowthRetention = { dau: number; wau: number; mau: number; newUsers7d: number; newUsers30d: number; payingUsers: number; note: string };
+export type GrowthReport = {
+  funnel: { days: number; since: string; steps: GrowthFunnelStep[]; note: string };
+  activity: GrowthActivityRow[];
+  retention: GrowthRetention;
+  events: { name: string; count: number; users: number }[];
+  totals: { users: number; workspaces: number; projects: number; conversations: number; runsCompleted: number; eventsRecorded: number };
+  catalogue: string[];
+  windowDays: number;
+  referrals: ReferralStats;
+  leaderboard: ReferralLeader[];
+  referralLimits: ReferralLimits;
+};
+export type PublicApiDocs = { product: string; baseUrl: string; version: string | null;
+  auth: { scheme: string; header: string; example: string; scopes: string[]; note: string };
+  endpoints: PublicEndpoint[]; limits: Record<string, unknown>;
+  webhook: { enabled: boolean; events: string[]; signatureHeader: string; signatureFormat: string; headers: string[];
+    retries: { attempts: number; timeoutMs: number; backoffSeconds: string } };
+  errors: { code: string; meaning: string }[]; page: string };
+
 // --- Wave 4: platform terbuka, notifikasi email dan kepatuhan data -----------
 export type ApiKeyRow = { id: string; name: string; prefix: string; scopes: string; workspaceId: string; createdAt: string; lastUsedAt: string | null; lastUsedIp?: string | null; requestCount: number; revokedAt: string | null;
   /** Wave 6: batas harian per kunci dan pemakaian hari ini. 0 berarti tanpa batas khusus. */
@@ -125,8 +168,8 @@ export type AdminJobsResponse = { worker: JobWorkerInfo; stats: JobStats; jobs: 
 
 export const api = {
   me: () => request<{ user: User }>('/v1/auth/me'),
-  login: (username: string, password: string, code?: string) => request<{ user: User; mfaEnabled?: boolean }>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: username, password, code }) }),
-  register: (username: string, password: string, name: string) => request<{ user: User; workspace: Workspace }>('/v1/auth/register', { method: 'POST', body: JSON.stringify({ email: username, password, displayName: name }) }),
+  login: (username: string, password: string, code?: string) => request<{ user: User; mfaEnabled?: boolean; referral?: { accepted: boolean; error?: string } }>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: username, password, code }) }),
+  register: (username: string, password: string, name: string, ref?: string) => request<{ user: User; workspace: Workspace; referral?: { accepted: boolean; error?: string } }>('/v1/auth/register', { method: 'POST', body: JSON.stringify({ email: username, password, displayName: name, ref }) }),
   logout: () => request('/v1/auth/logout', { method: 'POST' }),
   workspaces: () => request<Workspace[]>('/v1/workspaces'),
   projects: (workspaceId: string) => request<Project[]>(`/v1/workspaces/${workspaceId}/projects`),
@@ -308,4 +351,18 @@ export const api = {
     request<{ report: WebhookTestReport; delivery: WebhookDelivery | null }>(`/v1/webhooks/${encodeURIComponent(webhookId)}/test`, { method: 'POST' }),
   retentionReport: () => request<RetentionReport>('/v1/admin/retention'),
   runRetention: (dryRun = true) => request<RetentionReport & { dryRun: boolean; totalRemoved: number; expiredExports: { marked: number; filesRemoved: number }; message: string }>('/v1/admin/retention/run', { method: 'POST', body: JSON.stringify({ dryRun }) }),
+  /** Wave 7: program undangan. Kode dibuat otomatis saat panel dibuka pertama kali. */
+  referralMe: () => request<ReferralSummary>('/v1/referrals/me'),
+  referrals: (limit = 100) => request<{ code: string; referrals: ReferralRow[]; invitedBy: ReferralRow | null; limits: ReferralLimits }>(`/v1/referrals?limit=${encodeURIComponent(String(limit))}`),
+  rotateReferralCode: () => request<{ code: string; link: string }>('/v1/referrals/code', { method: 'POST' }),
+  /** Wave 7: langkah awal untuk pengguna baru. */
+  onboarding: () => request<OnboardingState>('/v1/onboarding'),
+  dismissOnboarding: () => request<{ dismissed: boolean; onboarding: OnboardingState }>('/v1/onboarding/dismiss', { method: 'POST' }),
+  /** Wave 7: peringatan kuota yang jujur. */
+  quotaAlert: () => request<QuotaAlert>('/v1/billing/quota-alert'),
+  /** Wave 7: angka pertumbuhan, khusus admin platform. */
+  adminGrowth: (days = 30) => request<GrowthReport>(`/v1/admin/growth?days=${encodeURIComponent(String(days))}`),
+  adminReferrals: (limit = 100) => request<{ stats: ReferralStats; leaderboard: ReferralLeader[]; referrals: (ReferralRow & { inviterEmail: string; inviteeEmailConfirmed: string })[] }>(`/v1/admin/referrals?limit=${encodeURIComponent(String(limit))}`),
+  /** Wave 7: dokumentasi API publik tanpa sesi. */
+  publicDocs: () => request<PublicApiDocs>('/v1/public/docs'),
 };

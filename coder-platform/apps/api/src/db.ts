@@ -439,9 +439,42 @@ try { db.exec("ALTER TABLE api_keys ADD COLUMN daily_token_limit INTEGER NOT NUL
 try { db.exec("ALTER TABLE api_keys ADD COLUMN requests_today INTEGER NOT NULL DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE api_keys ADD COLUMN usage_day TEXT"); } catch {}
 
+/* Wave 7: growth. Referral codes, referral rows, and a small event log so the funnel can be measured.
+   Nothing here changes existing tables; every row is additive. */
+db.exec(`
+CREATE TABLE IF NOT EXISTS referral_codes (
+ code TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ created_at TEXT NOT NULL, uses INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_codes_user ON referral_codes(user_id);
+CREATE TABLE IF NOT EXISTS referrals (
+ id TEXT PRIMARY KEY, code TEXT NOT NULL, inviter_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ invitee_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ invitee_email TEXT, invitee_ip TEXT, inviter_ip TEXT,
+ status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','qualified','rewarded','blocked')), blocked_reason TEXT,
+ inviter_tokens INTEGER NOT NULL DEFAULT 0, invitee_tokens INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, qualified_at TEXT, rewarded_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_referrals_invitee ON referrals(invitee_user_id);
+CREATE INDEX IF NOT EXISTS idx_referrals_inviter ON referrals(inviter_user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS growth_events (
+ id TEXT PRIMARY KEY, name TEXT NOT NULL, user_id TEXT, workspace_id TEXT,
+ props TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_growth_events_name ON growth_events(name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_growth_events_user ON growth_events(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS onboarding_state (
+ user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ dismissed_at TEXT, updated_at TEXT NOT NULL
+);
+`);
+
+/** Wave 7 columns: the registration IP is kept so a referral can spot a self-made account. */
+try { db.exec("ALTER TABLE users ADD COLUMN signup_ip TEXT"); } catch {}
+
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 14;
-export const SCHEMA_VERSION_NOTE = "Public write API, outgoing webhooks and per-key daily ceilings, on top of the durable job queue";
+const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION_NOTE = "Referral programme, growth events and onboarding state, on top of the public write API, webhooks and per-key ceilings";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.
