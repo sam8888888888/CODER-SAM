@@ -50,6 +50,8 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
 
   // Artifact state
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  // Bulk delete selection (Wave 2).
+  const [pilihArtifact, setPilihArtifact] = useState<string[]>([]);
 
   // Usage state
   const [usage, setUsage] = useState<UsageTotals | null>(null);
@@ -91,6 +93,21 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
   }
 
   /** Removes one artifact after the user confirms. */
+  /** Deletes every selected artifact in one request and reports what happened. */
+  async function removeSelectedArtifacts() {
+    if (!pilihArtifact.length) return;
+    if (!window.confirm(`Hapus ${pilihArtifact.length} artefak yang dipilih?`)) return;
+    await guard(async () => {
+      const hasil = await api.bulkDeleteArtifacts(pilihArtifact);
+      setPilihArtifact([]);
+      if (previewId && !hasil.deleted) { setPreviewId(null); setPreviewText(''); }
+      await loadArtifacts();
+      setMessage(hasil.skipped.length
+        ? `${hasil.deleted} artefak dihapus, ${hasil.skipped.length} dilewati karena bukan milik Anda.`
+        : `${hasil.deleted} artefak sudah dihapus.`);
+    });
+  }
+
   async function removeArtifact(artifact: Artifact) {
     if (!window.confirm(`Hapus artifact "${artifact.name}"?`)) return;
     await guard(async () => {
@@ -411,10 +428,20 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
         <label className="file-picker">Unggah artifact
           <input type="file" disabled={uploading} onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadArtifactFile(file); event.target.value = ''; }} />
         </label>
+        <button type="button" className="link-button" disabled={!artifacts.length} onClick={() => setPilihArtifact(pilihArtifact.length === artifacts.length ? [] : artifacts.map((item) => item.id))}>
+          {pilihArtifact.length === artifacts.length && artifacts.length > 0 ? 'Batal pilih semua' : 'Pilih semua'}
+        </button>
+        <button type="button" className="link-button danger" disabled={!pilihArtifact.length} onClick={() => void removeSelectedArtifacts()}>
+          Hapus terpilih ({pilihArtifact.length})
+        </button>
       </div>
       <div className="tool-list">
         {artifacts.map((artifact) => (
           <div key={artifact.id}>
+            <label className="artifact-pick" title="Pilih artefak ini">
+              <input type="checkbox" checked={pilihArtifact.includes(artifact.id)} onChange={(event) => setPilihArtifact(daftar => event.target.checked ? [...daftar, artifact.id] : daftar.filter((id) => id !== artifact.id))} />
+              <span className="sr-only">Pilih {artifact.name}</span>
+            </label>
             <b>{artifact.name}</b>
             <small>{artifact.mimeType} · {(artifact.sizeBytes / 1024).toFixed(1)} KB · {artifact.sha256.slice(0, 10)}…</small>
             <a className="download" href={`/api/v1/artifacts/${artifact.id}/download`} target="_blank" rel="noreferrer">Unduh</a>

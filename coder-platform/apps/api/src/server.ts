@@ -2,9 +2,9 @@ import Fastify from "fastify";
 import cookie from "@fastify/cookie";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
-import { mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
 import { estimateCostMicros } from "./model-prices.js";
 import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
@@ -637,11 +637,113 @@ app.post<{ Params: { projectId: string }; Body: { title?: string } }>("/api/v1/p
   db.prepare("INSERT INTO conversations (id,project_id,title,created_at,updated_at) VALUES (?,?,?,?,?)").run(id,request.params.projectId,title,now,now);
   return reply.code(201).send({ conversation: { id, projectId: request.params.projectId, title, createdAt: now, updatedAt: now } });
 });
+/** Downloads one chat attachment. Access follows the conversation, not the file id. */
+app.get<{ Params: { attachmentId: string } }>("/api/v1/attachments/:attachmentId", { preHandler: requireUser }, async (request: any, reply) => {
+  const row = db.prepare(`SELECT a.name, a.mime_type AS mimeType, a.storage_path AS storagePath FROM message_attachments a
+    JOIN messages ms ON ms.id=a.message_id JOIN conversations c ON c.id=ms.conversation_id
+    JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id
+    WHERE a.id=? AND m.user_id=?`).get(request.params.attachmentId, request.user!.id) as { name: string; mimeType: string; storagePath: string } | undefined;
+  if (!row) return reply.code(404).send({ error: "ATTACHMENT_NOT_FOUND" });
+  try {
+    const data = await readFile(row.storagePath);
+    return reply.header("content-type", row.mimeType || "application/octet-stream")
+      .header("content-disposition", `inline; filename="${row.name.replace(/[^\w.\- ]+/g, "_")}"`).send(data);
+  } catch {
+    return reply.code(404).send({ error: "ATTACHMENT_NOT_FOUND", message: "Berkas lampiran sudah tidak ada di server." });
+  }
+});
+
+/**
+ * Branches a conversation: copies every message up to one point into a new conversation in the same
+ * project, together with the attachment files, and can start a fresh answer from that point.
+ */
+app.post<{ Params: { conversationId: string }; Body: { fromMessageId?: string; title?: string; rerun?: boolean; model?: string } }>("/api/v1/conversations/:conversationId/branch", { preHandler: requireUser }, async (request: any, reply) => {
+  const source = db.prepare(`SELECT c.id, c.project_id AS projectId, c.title, p.workspace_id AS workspaceId,
+      (SELECT m.role FROM memberships m WHERE m.workspace_id=p.workspace_id AND m.user_id=?) AS role
+    FROM conversations c JOIN projects p ON p.id=c.project_id WHERE c.id=?`).get(request.user!.id, request.params.conversationId) as { id: string; projectId: string; title: string; workspaceId: string; role: string | null } | undefined;
+  if (!source?.role) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
+  if (source.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  const rows = db.prepare("SELECT id, role, content, run_id AS runId, created_at AS createdAt FROM messages WHERE conversation_id=? ORDER BY created_at ASC").all(source.id) as { id: string; role: string; content: string; runId: string | null; createdAt: string }[];
+  const cut = request.body?.fromMessageId?.trim();
+  if (cut && !rows.some((row) => row.id === cut)) return reply.code(400).send({ error: "MESSAGE_NOT_FOUND" });
+  const copied = cut ? rows.slice(0, rows.findIndex((row) => row.id === cut) + 1) : rows;
+  if (!copied.length) return reply.code(400).send({ error: "EMPTY_BRANCH", message: "Percakapan ini belum punya pesan untuk dicabangkan." });
+  const model = request.body?.model?.trim() || undefined;
+  if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
+
+  const newId = randomUUID(); const now = new Date().toISOString();
+  const title = String(request.body?.title ?? "").trim().slice(0, 120) || `${source.title} (cabang)`;
+  const attachments = attachmentsForConversation(source.id);
+  const copiedFiles: { path: string; name: string; mimeType: string; sizeBytes: number }[] = [];
+  try {
+    for (const message of copied) {
+      for (const item of attachments.get(message.id) ?? []) {
+        const row = db.prepare("SELECT storage_path AS storagePath FROM message_attachments WHERE id=?").get(item.id) as { storagePath: string } | undefined;
+        if (!row) continue;
+        const target = join(ATTACHMENT_DIR, `${randomUUID()}${extname(item.name).toLowerCase()}`);
+        await copyFile(row.storagePath, target);
+        copiedFiles.push({ path: target, name: item.name, mimeType: item.mimeType, sizeBytes: item.sizeBytes });
+      }
+    }
+  } catch {
+    return reply.code(500).send({ error: "BRANCH_FAILED", message: "Cabang percakapan gagal dibuat. Coba lagi." });
+  }
+  db.transaction(() => {
+    db.prepare("INSERT INTO conversations (id,project_id,title,created_at,updated_at) VALUES (?,?,?,?,?)").run(newId, source.projectId, title, now, now);
+    let fileIndex = 0;
+    for (const message of copied) {
+      const messageId = randomUUID();
+      db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(messageId, newId, message.role, message.content, null, message.createdAt);
+      for (const item of attachments.get(message.id) ?? []) {
+        const file = copiedFiles[fileIndex++];
+        if (!file) continue;
+        db.prepare("INSERT INTO message_attachments (id,message_id,name,mime_type,size_bytes,storage_path,extracted_chars,created_at) VALUES (?,?,?,?,?,?,?,?)")
+          .run(randomUUID(), messageId, file.name, file.mimeType, file.sizeBytes, file.path, 0, now);
+      }
+    }
+  })();
+  recordAudit(source.workspaceId, request.user!.id, "conversation.branched", { conversationId: newId, from: source.id, messages: copied.length });
+
+  // Optional: answer the last copied user message again in the branch.
+  const lastUser = [...copied].reverse().find((row) => row.role === "user");
+  let runId: string | null = null;
+  if (request.body?.rerun && lastUser) {
+    const quotaBlock = quotaGuard(request.user!.id, "");
+    if (quotaBlock) return reply.code(201).send({ conversation: { id: newId, projectId: source.projectId, title, createdAt: now }, run: null, warning: quotaBlock.error });
+    runId = randomUUID();
+    db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(runId, source.projectId, "queued", lastUser.content, model ?? config.PRIME_AGENT_MODEL, now);
+    void executeRun(runId, source.projectId, lastUser.content, newId, undefined, model, request.user!.id);
+  }
+  return reply.code(201).send({ conversation: { id: newId, projectId: source.projectId, title, createdAt: now }, run: runId ? { id: runId, status: "queued" } : null });
+});
+
+/** Deletes many artifacts in one call; ids the caller may not touch are reported, not removed. */
+app.post<{ Body: { ids?: string[] } }>("/api/v1/artifacts/bulk-delete", { preHandler: requireUser }, async (request: any, reply) => {
+  const rawIds: unknown[] = Array.isArray(request.body?.ids) ? request.body.ids : [];
+  const ids = [...new Set(rawIds.map((value: unknown) => String(value ?? "").trim()).filter((value: string) => Boolean(value)))].slice(0, 200) as string[];
+  if (!ids.length) return reply.code(400).send({ error: "IDS_REQUIRED", message: "Pilih minimal satu artefak yang mau dihapus." });
+  let deleted = 0; const skipped: string[] = [];
+  for (const id of ids) {
+    const artifact = db.prepare(`SELECT a.id, a.name, a.storage_path AS storagePath, p.workspace_id AS workspaceId FROM artifacts a
+      JOIN projects p ON p.id=a.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE a.id=? AND m.user_id=?`)
+      .get(id, request.user!.id) as { id: string; name: string; storagePath: string; workspaceId: string } | undefined;
+    if (!artifact) { skipped.push(id); continue; }
+    const role = membershipRole(artifact.workspaceId, request.user!.id);
+    if (!canManageWorkspace(artifact.workspaceId, request.user!.id) && role !== "member") { skipped.push(id); continue; }
+    recordAudit(artifact.workspaceId, request.user!.id, "artifact.deleted", { artifactId: artifact.id, name: artifact.name, bulk: true });
+    db.prepare("DELETE FROM artifacts WHERE id=?").run(artifact.id);
+    await unlink(artifact.storagePath).catch(() => undefined);
+    deleted += 1;
+  }
+  return { deleted, skipped };
+});
+
 app.get<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversationId/messages", { preHandler: requireUser }, async (request: any, reply) => {
   const allowed = db.prepare("SELECT 1 FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id);
   if (!allowed) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
-  const messages = db.prepare("SELECT id, conversation_id AS conversationId, role, content, run_id AS runId, created_at AS createdAt FROM messages WHERE conversation_id=? ORDER BY created_at ASC").all(request.params.conversationId);
-  return { messages };
+  const messages = db.prepare("SELECT id, conversation_id AS conversationId, role, content, run_id AS runId, created_at AS createdAt FROM messages WHERE conversation_id=? ORDER BY created_at ASC").all(request.params.conversationId) as { id: string }[];
+  const attachments = attachmentsForConversation(request.params.conversationId);
+  return { messages: messages.map((message) => ({ ...message, attachments: attachments.get(message.id) ?? [] })) };
 });
 
 type KnowledgeContext = { text: string; hits: { documentId: string; title: string; chunkIndex: number }[] };
@@ -716,11 +818,71 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
   }
 }
 
-app.post<{ Params: { conversationId: string }; Body: { content?: string; model?: string } }>("/api/v1/conversations/:conversationId/messages", { preHandler: requireUser }, async (request: any, reply) => {
-  const content = request.body?.content?.trim();
+/** Chat attachments: bytes on disk, metadata next to the message, text of readable files in the prompt. */
+const ATTACHMENT_DIR = resolve(config.DATA_DIR, "attachments");
+const ATTACHMENT_MAX_FILES = 5;
+const ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
+const ATTACHMENT_MAX_ENCODED = 7_000_000;
+const ATTACHMENT_PROMPT_CHARS = 20_000;
+const ATTACHMENT_EXT: Record<string, string> = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+  ".pdf": "application/pdf", ".txt": "text/plain", ".md": "text/markdown", ".csv": "text/csv",
+  ".json": "application/json", ".log": "text/plain", ".sql": "text/plain", ".yml": "text/yaml", ".yaml": "text/yaml",
+};
+const ATTACHMENT_TEXT_EXT = new Set([".txt", ".md", ".markdown", ".csv", ".json", ".log", ".sql", ".yml", ".yaml", ".ts", ".tsx", ".js", ".jsx", ".py", ".sh", ".html", ".htm", ".css", ".xml", ".env", ".ini", ".toml"]);
+
+/** Guesses the content type from the file name; the browser value wins when it is present. */
+function attachmentMime(name: string, given?: unknown): string {
+  const fromClient = typeof given === "string" ? given.trim() : "";
+  return fromClient || ATTACHMENT_EXT[extname(name).toLowerCase()] || "application/octet-stream";
+}
+
+/** Only readable text is pasted into the prompt; images and PDFs stay as downloads. */
+function attachmentIsText(name: string, mime: string): boolean {
+  return mime.startsWith("text/") || ATTACHMENT_TEXT_EXT.has(extname(name).toLowerCase());
+}
+
+/** One attachment as the API returns it. */
+type AttachmentRow = { id: string; messageId: string; name: string; mimeType: string; sizeBytes: number };
+
+/** Loads the attachments of every message in one conversation, keyed by message id. */
+function attachmentsForConversation(conversationId: string): Map<string, AttachmentRow[]> {
+  const rows = db.prepare(`SELECT id, message_id AS messageId, name, mime_type AS mimeType, size_bytes AS sizeBytes
+    FROM message_attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?) ORDER BY created_at ASC`)
+    .all(conversationId) as AttachmentRow[];
+  const grouped = new Map<string, AttachmentRow[]>();
+  for (const row of rows) grouped.set(row.messageId, [...(grouped.get(row.messageId) ?? []), row]);
+  return grouped;
+}
+
+app.post<{ Params: { conversationId: string }; Body: { content?: string; model?: string; attachments?: { name?: string; mimeType?: string; contentBase64?: string }[] } }>("/api/v1/conversations/:conversationId/messages", { preHandler: requireUser, bodyLimit: 40 * 1024 * 1024 }, async (request: any, reply) => {
   const model = request.body?.model?.trim() || undefined;
-  if (!content || content.length > 100_000) return reply.code(400).send({ error: "INVALID_MESSAGE" });
   if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
+
+  // Attachments arrive as base64. They are validated and written to disk before the transaction,
+  // because the prompt needs the text of the readable ones straight away.
+  const incoming = Array.isArray(request.body?.attachments) ? request.body.attachments : [];
+  if (incoming.length > ATTACHMENT_MAX_FILES) return reply.code(400).send({ error: "TOO_MANY_ATTACHMENTS", message: `Maksimal ${ATTACHMENT_MAX_FILES} lampiran untuk satu pesan.` });
+  const prepared: { id: string; name: string; mimeType: string; buffer: Buffer; text: string }[] = [];
+  for (const item of incoming) {
+    const name = String(item?.name ?? "").trim().slice(0, 200);
+    const encoded = typeof item?.contentBase64 === "string" ? item.contentBase64.replace(/^data:[^;]+;base64,/, "") : "";
+    if (!name || !encoded) return reply.code(400).send({ error: "ATTACHMENT_INVALID", message: "Lampiran harus punya nama berkas dan isi." });
+    if (encoded.length > ATTACHMENT_MAX_ENCODED) return reply.code(400).send({ error: "ATTACHMENT_TOO_LARGE", message: "Satu lampiran maksimal 5 MB." });
+    const buffer = Buffer.from(encoded, "base64");
+    if (!buffer.length) return reply.code(400).send({ error: "ATTACHMENT_INVALID", message: "Isi lampiran tidak bisa dibaca." });
+    if (buffer.length > ATTACHMENT_MAX_BYTES) return reply.code(400).send({ error: "ATTACHMENT_TOO_LARGE", message: "Satu lampiran maksimal 5 MB." });
+    const mimeType = attachmentMime(name, item?.mimeType);
+    // Reading a file can fail (binary content, damaged pdf): the attachment is still accepted.
+    let text = "";
+    if (attachmentIsText(name, mimeType)) {
+      try { text = String((await extractText(buffer, name)).text ?? "").trim().slice(0, ATTACHMENT_PROMPT_CHARS); } catch { text = ""; }
+    }
+    prepared.push({ id: randomUUID(), name, mimeType, buffer, text });
+  }
+
+  const content = String(request.body?.content ?? "").trim() || (prepared.length ? "(lihat lampiran)" : "");
+  if (!content || content.length > 100_000) return reply.code(400).send({ error: "INVALID_MESSAGE" });
   const conversation = db.prepare("SELECT c.id, c.project_id AS projectId, m.role AS role FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; projectId: string; role: string } | undefined;
   if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
   if (conversation.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
@@ -730,16 +892,38 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
     notify(null, request.user!.id, "quota", quotaBlock.error === "DAILY_TOKEN_QUOTA_EXCEEDED" ? "Kuota harian habis" : "Kuota bulanan habis", String((quotaBlock.detail as any)?.message ?? "Kuota token paket Anda habis."), "/");
     return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
   }
+
   const runId = randomUUID(); const messageId = randomUUID(); const now = new Date().toISOString();
+  const storedPaths: string[] = [];
+  try {
+    if (prepared.length) await mkdir(ATTACHMENT_DIR, { recursive: true });
+    for (const file of prepared) {
+      const path = join(ATTACHMENT_DIR, `${file.id}${extname(file.name).toLowerCase()}`);
+      await writeFile(path, file.buffer);
+      storedPaths.push(path);
+    }
+  } catch {
+    await Promise.all(storedPaths.map((path) => unlink(path).catch(() => undefined)));
+    return reply.code(500).send({ error: "ATTACHMENT_SAVE_FAILED", message: "Lampiran gagal disimpan. Coba lagi." });
+  }
+
+  // The engine only sees text: readable attachments are appended as a labelled block.
+  const attachmentBlock = prepared.filter((file) => file.text).map((file) => `Lampiran ${file.name}:
+${file.text}`).join("\n\n");
+  const prompt = attachmentBlock ? `${content}\n\n---\n${attachmentBlock}` : content;
   const retrieved = buildKnowledgeContext(conversation.projectId, content);
   const knowledge: KnowledgeContext | undefined = retrieved.hits.length ? { text: retrieved.text, hits: retrieved.hits.map((hit) => ({ documentId: hit.documentId, title: hit.title, chunkIndex: hit.chunkIndex })) } : undefined;
   const transaction = db.transaction(() => {
-    db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(runId, conversation.projectId, "queued", content, model ?? config.PRIME_AGENT_MODEL, now);
+    db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(runId, conversation.projectId, "queued", prompt, model ?? config.PRIME_AGENT_MODEL, now);
     db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(messageId, conversation.id, "user", content, runId, now);
+    for (const file of prepared) {
+      db.prepare("INSERT INTO message_attachments (id,message_id,name,mime_type,size_bytes,storage_path,extracted_chars,created_at) VALUES (?,?,?,?,?,?,?,?)")
+        .run(file.id, messageId, file.name, file.mimeType, file.buffer.length, join(ATTACHMENT_DIR, `${file.id}${extname(file.name).toLowerCase()}`), file.text.length, now);
+    }
     db.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversation.id);
   }); transaction();
-  void executeRun(runId, conversation.projectId, content, conversation.id, knowledge, model, request.user!.id);
-  return reply.code(202).send({ message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now }, run: { id: runId, status: "queued" } });
+  void executeRun(runId, conversation.projectId, prompt, conversation.id, knowledge, model, request.user!.id);
+  return reply.code(202).send({ message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now, attachments: prepared.map((file) => ({ id: file.id, messageId, name: file.name, mimeType: file.mimeType, sizeBytes: file.buffer.length })) }, run: { id: runId, status: "queued" } });
 });
 
 /** Run history for one project, newest first. Optional ?conversationId= filter. */
@@ -1153,10 +1337,14 @@ app.delete<{ Params: { conversationId: string } }>("/api/v1/conversations/:conve
   const conversation = db.prepare("SELECT c.id, p.workspace_id AS workspaceId, m.role AS role FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; workspaceId: string; role: string } | undefined;
   if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
   if (conversation.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  // Attachment files live on disk, so their paths are read before the rows disappear.
+  const berkasLampiran = db.prepare(`SELECT a.storage_path AS storagePath FROM message_attachments a
+    JOIN messages ms ON ms.id=a.message_id WHERE ms.conversation_id=?`).all(conversation.id) as { storagePath: string }[];
   db.transaction(() => {
     db.prepare("DELETE FROM messages WHERE conversation_id=?").run(conversation.id);
     db.prepare("DELETE FROM conversations WHERE id=?").run(conversation.id);
   })();
+  for (const berkas of berkasLampiran) await unlink(berkas.storagePath).catch(() => undefined);
   recordAudit(conversation.workspaceId, request.user!.id, "conversation.deleted", { conversationId: conversation.id });
   return { deleted: true, id: conversation.id };
 });

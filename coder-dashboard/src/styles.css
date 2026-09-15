@@ -149,3 +149,37 @@
 .artifact-preview-box { flex-basis: 100%; margin-top: 8px; }
 .artifact-preview { max-width: 100%; max-height: 420px; border-radius: 10px; border: 1px solid rgba(148, 163, 184, .25); }
 .artifact-preview-text { max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: rgba(15, 23, 42, .55); border: 1px solid rgba(148, 163, 184, .2); border-radius: 10px; padding: 10px; font-size: 12px; }
+
+/* ---- Wave 2: tema terang, lampiran, dan tombol aksi pesan ---- */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.message-tools{display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap}
+.message-tools .link-button{font-size:12px}
+.bubble-files{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.file-chip{display:inline-flex;align-items:center;gap:6px;border:1px solid #252b42;background:#090b1699;border-radius:10px;padding:4px 9px;font-size:12px;color:#cbd5f5;text-decoration:none}
+.file-chip:hover{border-color:#8b5cf6aa;color:#fff}
+.file-chip button{border:0;background:transparent;color:inherit;cursor:pointer;font-size:11px;line-height:1}
+.composer-files{display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px 0}
+.artifact-pick{display:inline-flex;align-items:center;margin-right:8px}
+.artifact-pick input{width:16px;height:16px;accent-color:#8b5cf6}
+.theme-button{border:1px solid #252b42;background:#111525;color:#f8fafc;border-radius:12px;padding:0 12px;height:40px;cursor:pointer;font-size:13px}
+/* Tema terang: hanya menimpa permukaan utama, aksen ungu tetap sama. */
+[data-theme="terang"]{color:#0f172a;background:#f5f7fc}
+[data-theme="terang"] .app-shell{background:radial-gradient(circle at 15% 0,#c7d2fe66,transparent 38%),radial-gradient(circle at 100% 15%,#bae6fd66,transparent 36%),#f5f7fc;color:#0f172a}
+[data-theme="terang"] .topbar{background:#ffffffee;border-bottom-color:#dbe2f0;color:#0f172a}
+[data-theme="terang"] .brand-sub,[data-theme="terang"] .connection{color:#475569}
+[data-theme="terang"] .sidebar{background:#ffffffcc;border-right-color:#dbe2f0}
+[data-theme="terang"] .page-link,[data-theme="terang"] .session{color:#334155}
+[data-theme="terang"] .page-link:hover,[data-theme="terang"] .session:hover{background:#e8edfa}
+[data-theme="terang"] .page-link.active,[data-theme="terang"] .session.active{background:#e0e7ff;color:#111827}
+[data-theme="terang"] .profile-button,[data-theme="terang"] .icon-button,[data-theme="terang"] .theme-button{background:#fff;border-color:#dbe2f0;color:#0f172a}
+[data-theme="terang"] .search{background:#fff;border-color:#dbe2f0;color:#64748b}
+[data-theme="terang"] .search input{color:#0f172a}
+[data-theme="terang"] .bubble{background:#fff;border-color:#dbe2f0;color:#111827;box-shadow:0 8px 26px #0f172a12}
+[data-theme="terang"] .message.user .bubble{background:#eef2ff;border-color:#c7d2fe;color:#1e1b4b}
+[data-theme="terang"] .composer{background:#fff;border-color:#dbe2f0;box-shadow:0 12px 32px #0f172a14}
+[data-theme="terang"] .composer textarea,[data-theme="terang"] .composer select{color:#0f172a}
+[data-theme="terang"] .tool-list>div,[data-theme="terang"] .settings-card,[data-theme="terang"] .panel,[data-theme="terang"] .card{background:#fff;border-color:#dbe2f0;color:#0f172a}
+[data-theme="terang"] .file-chip{background:#fff;border-color:#dbe2f0;color:#334155}
+[data-theme="terang"] .file-chip:hover{color:#111827;border-color:#8b5cf6aa}
+[data-theme="terang"] .empty-side,[data-theme="terang"] .settings-hint,[data-theme="terang"] small{color:#475569}
+[data-theme="terang"] input,[data-theme="terang"] select,[data-theme="terang"] textarea{color:#0f172a}

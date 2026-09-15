@@ -250,6 +250,44 @@ check("user list refuses a normal user", userListBlocked.status === 403 && userL
 const revenueBlocked = await call("GET", "/api/v1/admin/revenue?days=30");
 check("revenue refuses a normal user", revenueBlocked.status === 403 && revenueBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(revenueBlocked.json));
 
+// Wave 2 surface added in v0.12.0: PWA assets, attachments, branch and bulk delete.
+async function callRaw(path) {
+  const response = await fetch(`${BASE}${path}`, { redirect: "follow" });
+  return { status: response.status, type: response.headers.get("content-type") ?? "", size: (await response.arrayBuffer()).byteLength };
+}
+const manifest = await callRaw("/manifest.webmanifest");
+const manifestBody = await (await fetch(`${BASE}/manifest.webmanifest`)).json().catch(() => null);
+const iconSizes = Array.isArray(manifestBody?.icons) ? manifestBody.icons.map((icon) => icon.sizes) : [];
+const hasMaskable = Array.isArray(manifestBody?.icons) && manifestBody.icons.some((icon) => String(icon.purpose ?? "").includes("maskable"));
+check("PWA manifest is served with icons", manifest.status === 200 && iconSizes.includes("192x192") && iconSizes.includes("512x512") && hasMaskable, `${JSON.stringify(iconSizes)} maskable=${hasMaskable}`);
+const icon192 = await callRaw("/icon-192.png");
+const icon512 = await callRaw("/icon-512.png");
+const appleTouch = await callRaw("/apple-touch-icon.png");
+const favicon = await callRaw("/favicon.png");
+check("PWA icon 192 is a real PNG", icon192.status === 200 && icon192.type.includes("image/png") && icon192.size > 1000, JSON.stringify(icon192));
+check("PWA icon 512 is a real PNG", icon512.status === 200 && icon512.type.includes("image/png") && icon512.size > 1000, JSON.stringify(icon512));
+check("apple touch icon is a real PNG", appleTouch.status === 200 && appleTouch.type.includes("image/png") && appleTouch.size > 500, JSON.stringify(appleTouch));
+check("favicon is a real PNG", favicon.status === 200 && favicon.type.includes("image/png") && favicon.size > 500, JSON.stringify(favicon));
+const serviceWorker = await callRaw("/sw.js");
+check("service worker is served", serviceWorker.status === 200, JSON.stringify(serviceWorker));
+const attachmentAnon = await callRaw("/api/v1/attachments/00000000-0000-0000-0000-000000000000");
+check("attachment download refuses anonymous callers", attachmentAnon.status === 401, JSON.stringify(attachmentAnon));
+const attachmentMissing = await call("GET", "/api/v1/attachments/00000000-0000-0000-0000-000000000000");
+check("unknown attachment is refused for a signed-in user", attachmentMissing.status === 404 && attachmentMissing.json.error === "ATTACHMENT_NOT_FOUND", JSON.stringify(attachmentMissing.json));
+// Six attachments must be refused before any run is created, so this costs no AI tokens.
+// The attachment check runs before the conversation lookup, so a throwaway id is enough here.
+const tooMany = await call("POST", "/api/v1/conversations/00000000-0000-0000-0000-000000000000/messages", {
+  content: "uji batas lampiran",
+  attachments: Array.from({ length: 6 }, (_, index) => ({ name: `uji-${index}.txt`, mimeType: "text/plain", contentBase64: "aGFsbyBkdW5pYQ==" })),
+});
+check("six attachments are refused with an Indonesian message", tooMany.status === 400 && tooMany.json.error === "TOO_MANY_ATTACHMENTS" && typeof tooMany.json.message === "string", JSON.stringify(tooMany.json));
+const emptyBulk = await call("POST", "/api/v1/artifacts/bulk-delete", { ids: [] });
+check("bulk delete asks for at least one artifact", emptyBulk.status === 400 && emptyBulk.json.error === "IDS_REQUIRED", JSON.stringify(emptyBulk.json));
+const alienBulk = await call("POST", "/api/v1/artifacts/bulk-delete", { ids: ["00000000-0000-0000-0000-000000000000"] });
+check("bulk delete reports ids it cannot touch", alienBulk.status === 200 && alienBulk.json.deleted === 0 && Array.isArray(alienBulk.json.skipped) && alienBulk.json.skipped.length === 1, JSON.stringify(alienBulk.json));
+const branchUnknown = await call("POST", "/api/v1/conversations/00000000-0000-0000-0000-000000000000/branch", { rerun: false });
+check("branch refuses an unknown conversation", branchUnknown.status === 404, JSON.stringify(branchUnknown.json));
+
 const adminBlocked = await call("GET", "/api/v1/admin/overview");
 check("admin area refuses a normal user", adminBlocked.status === 403 && adminBlocked.json.error === "ADMIN_REQUIRED", JSON.stringify(adminBlocked.json));
 const metricsBlocked = await call("GET", "/metrics");

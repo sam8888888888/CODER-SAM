@@ -284,9 +284,19 @@ try { db.exec("ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'");
 // time stamp resets the quota counter without deleting usage history.
 try { db.exec("ALTER TABLE token_quotas ADD COLUMN reset_at TEXT"); } catch {}
 
+// Files a user attached to a chat message. The bytes live on disk under DATA_DIR/attachments.
+db.exec(`
+CREATE TABLE IF NOT EXISTS message_attachments (
+ id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, mime_type TEXT NOT NULL DEFAULT '', size_bytes INTEGER NOT NULL DEFAULT 0,
+ storage_path TEXT NOT NULL, extracted_chars INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachments(message_id, created_at);
+`);
+
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 8;
-export const SCHEMA_VERSION_NOTE = "commerce (plans, orders, coupons, credit, quota), user tier";
+const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION_NOTE = "chat attachments (message_attachments), commerce (plans, orders, coupons, credit, quota), user tier";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

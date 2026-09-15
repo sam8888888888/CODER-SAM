@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 14 Sep 2026 (versi 0.11.0)
+Terakhir diperbarui: 14 Sep 2026 (versi 0.12.0)
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel
@@ -8,9 +8,31 @@ di `apps/api/src/db.ts`, halaman di `coder-dashboard/src/nav.ts`, dan suite di `
 Bila ragu, tulis "belum diverifikasi".
 
 Catatan snapshot: berkas ini diperiksa saat repo sedang diedit, jadi beberapa perubahan belum di-commit
-(`server.ts`, `csrf.ts`, `ratelimit.ts`, `cron.ts`, `ProfilePanel.tsx`, `WorkspaceAdmin.tsx`).
-Jumlah rute `server.ts` saat diperiksa: 113 (30 rute baru v0.11.0 untuk komersial, admin dan webhook).
+(Wave 2: `server.ts`, `db.ts`, `App.tsx`, `Tools.tsx`, `api.ts`, `styles.css`, `vite.config.ts`, `index.html`).
+Jumlah rute `server.ts` saat diperiksa: 115 (30 rute baru v0.11.0 untuk komersial, admin dan webhook; 3 rute Wave 2 untuk lampiran, cabang dan hapus massal).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
+
+## Wave 2 (v0.12.0) — komunikasi & tampilan
+
+- Lampiran chat: satu pesan bisa membawa sampai 5 berkas (maksimal 5 MB per berkas) lewat
+  `POST /api/v1/conversations/:conversationId/messages` dengan `attachments: [{ name, mimeType, contentBase64 }]`.
+  Berkas disimpan di `DATA_DIR/attachments/<uuid><ext>`, metadata di tabel `message_attachments`
+  (schema 9). Isi berkas berjenis teks ikut disisipkan ke prompt run (maksimal 20.000 karakter).
+  Bukti: `apps/api/src/server.ts`, `apps/api/src/text-extract.ts`, `coder-dashboard/src/App.tsx`.
+- Unduh lampiran: `GET /api/v1/attachments/:attachmentId` (cek keanggotaan lewat percakapan; 404 bila bukan milik Anda).
+- Cabang percakapan: `POST /api/v1/conversations/:conversationId/branch` menyalin pesan sampai satu titik,
+  menyalin berkas lampiran (path baru, bukan berbagi berkas), dan bisa langsung menjalankan jawaban baru
+  (`rerun: true`). Tombol "Cabang dari sini" ada di setiap pesan pengguna.
+- Hapus artefak massal: `POST /api/v1/artifacts/bulk-delete` (maksimal 200 id) mengembalikan `{ deleted, skipped }`.
+  Dipakai halaman Artefak dengan kotak centang dan tombol "Hapus terpilih".
+- PWA: manifest lengkap (`coder-dashboard/vite.config.ts`), ikon 192/512/maskable/apple-touch,
+  `favicon.png`, dan pintasan manifest. Sebelumnya PWA sudah terpasang tetapi tanpa ikon.
+- Tampilan: palet perintah (Ctrl+K, `CommandPalette.tsx`), tombol tema terang/gelap (`ThemeToggle.tsx`,
+  aturan `[data-theme="terang"]` di `styles.css`), dan menu bagikan jawaban
+  (salin teks, unduh Markdown, cetak/PDF via `ShareMenu.tsx`).
+- Bukti uji: `apps/api/test/wave2.e2e.ts` (104 pemeriksaan, semua lulus): lampiran, cabang, hapus massal,
+  serta isolasi antar-pengguna dan peran viewer. Tampilan hanya diuji lewat cek tipe dan render server
+  (`react-dom/server`), belum di peramban nyata karena Playwright tidak tersedia.
 
 ## Sudah jalan
 
@@ -209,10 +231,11 @@ Cek tipe (tanpa keluaran berarti lulus; saya jalankan 13 Sep 2026):
 Suite end-to-end lokal tanpa jaringan:
 
 - `cd coder-platform && MOCK_ENGINE=true npx tsx apps/api/test/<suite>.e2e.ts`
-- 20 suite (semuanya lulus 14 Sep 2026, `RUNNER_EXIT=0`): `account-recovery`, `account-security`,
-  `admin-metrics`, `billing`, `csrf-limits`, `delete-flow`, `guards`, `knowledge-team`, `login-identity`,
-  `mailer`, `model-rbac`, `project-runs`, `rpc-adapter`, `session-usage`, `totp`, `usage-cost`,
-  `viewer-rbac`, `workflow-engine`, `real-ai`, `real-usage`.
+- 21 suite (20 suite lama lulus 14 Sep 2026 sebelum Wave 2 dengan `RUNNER_EXIT=0`; `wave2` lulus
+  104/104 pemeriksaan): `account-recovery`, `account-security`, `admin-metrics`, `billing`, `csrf-limits`,
+  `delete-flow`, `guards`, `knowledge-team`, `login-identity`, `mailer`, `model-rbac`, `project-runs`,
+  `rpc-adapter`, `session-usage`, `totp`, `usage-cost`, `viewer-rbac`, `wave2`, `workflow-engine`,
+  `real-ai`, `real-usage`.
 - `usage-cost.e2e.ts` dijalankan tanpa `MOCK_ENGINE=true`, memakai
   `PRIME_AGENT_BIN=apps/api/test/fixtures/fake-prime-agent.mjs` (tetap tanpa jaringan).
 - Tanpa server sama sekali: `npx tsx apps/api/test/rpc-adapter.e2e.ts` dan

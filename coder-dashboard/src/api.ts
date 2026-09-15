@@ -102,7 +102,12 @@ export const api = {
   }>(`/v1/projects/${projectId}/usage?days=${days}`),
   auditEvents: (workspaceId: string) => request<AuditEvent[]>(`/v1/workspaces/${workspaceId}/audit`),
   decideApproval: (executionId: string, decision: 'approved'|'rejected') => request(`/v1/workflow-executions/${executionId}/approval`, { method: 'POST', body: JSON.stringify({ decision }) }),
-  sendMessage: (id: string, content: string, model?: string) => request<{ message: Message; run: { id: string } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content, model }) }),
+  sendMessage: (id: string, content: string, model?: string, attachments?: { name: string; mimeType: string; contentBase64: string }[]) => request<{ message: Message; run: { id: string } }>(`/v1/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ content, model, ...(attachments?.length ? { attachments } : {}) }) }),
+  // Lampiran chat: berkas dikirim sebagai base64 dan disimpan di server.
+  attachmentUrl: (attachmentId: string) => `/api/v1/attachments/${encodeURIComponent(attachmentId)}`,
+  branchSession: (id: string, body: { fromMessageId?: string; title?: string; rerun?: boolean; model?: string } = {}) =>
+    request<{ conversation: { id: string; projectId: string; title: string; createdAt: string }; run: { id: string; status: string } | null; warning?: string }>(`/v1/conversations/${encodeURIComponent(id)}/branch`, { method: 'POST', body: JSON.stringify(body) }),
+  bulkDeleteArtifacts: (ids: string[]) => request<{ deleted: number; skipped: string[] }>('/v1/artifacts/bulk-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   sessions: () => request<{ id: string; createdAt: string; lastSeenAt: string | null; expiresAt: string; userAgent: string | null; current: boolean }[]>('/v1/auth/sessions'),
   revokeSession: (id: string) => request<{ revoked: boolean }>(`/v1/auth/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   changePassword: (currentPassword: string, newPassword: string) => request<{ changed: boolean }>('/v1/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) }),
