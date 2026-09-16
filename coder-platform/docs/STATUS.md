@@ -1,6 +1,19 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 15 Sep 2026 (versi 0.17.0)
+Terakhir diperbarui: 16 Sep 2026 (versi 0.17.0, konfigurasi produksi diperbarui)
+
+Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
+- `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
+  masuk ke kotak surat (subjek "Verifikasi email COBLAI Coder"), lalu akun uji dihapus.
+- `RETENTION_ENABLED=true` — kebijakan: audit 365 hari, notifikasi 365 hari, `run_events` 365 hari,
+  ekspor data kedaluwarsa, token kedaluwarsa 1 hari. Sasaran hanya tabel itu (tidak menghapus
+  pengguna, ruang kerja, proyek, percakapan, atau artefak). Pekerja retensi berjalan tiap 6 jam.
+- `MIDTRANS_MERCHANT_ID` / `MIDTRANS_CLIENT_KEY` / `MIDTRANS_SERVER_KEY` terisi (kunci produksi).
+  Divalidasi langsung ke API Midtrans: Snap produksi menjawab 400 (galat validasi = kunci sah),
+  sandbox menolak 401. Gateway masih `manual` karena penagihan otomatis belum dibangun.
+- DNS `coblai.com` belum dipasang (MX/SPF/DKIM); rinciannya di `docs/DNS_COBLAI_COM.md`.
+- Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
+- Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel

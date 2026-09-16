@@ -9,6 +9,21 @@ Legenda status: [BAPAK] butuh keputusan/izin Bapak · [TEKNIS] pekerjaan teknis 
 
 ---
 
+## 0. STATUS KEPUTUSAN BAPAK (jawaban bertahap, 16 Sep 2026)
+
+Keputusan yang sudah diterima (butir 1-5) dan hasilnya di produksi:
+
+| Butir | Keputusan Bapak | Status | Bukti |
+|-------|-----------------|--------|-------|
+| 1 | Nyalakan email notifikasi | SELESAI | `NOTIFY_EMAIL_ENABLED=true` di `.env` produksi; restart; surat uji ke `noreply@coblai.com` MASUK ke kotak (subjek "Verifikasi email COBLAI Coder"); smoke 156 lulus |
+| 2 | Retensi 12 bulan + akun bisa dihapus sendiri | SELESAI | `RETENTION_ENABLED=true`, audit 365 h, notifikasi 365 h, run_events 365 h, ekspor 30 h, token kedaluwarsa 1 h; hapus akun sendiri SUDAH ADA (Profil -> Hapus akun) dan diuji nyata di produksi (`{"ok":true,"deletedWorkspaces":1}`) |
+| 3 | Bapak memasang DNS sendiri | TINDAK LANJUT BAPAK | Rincian dikirim: `docs/DNS_COBLAI_COM.md` (MX, SPF, DKIM) |
+| 4 | Pakai Midtrans saja | SEBAGIAN | Kunci produksi tersimpan di `.env` produksi dan tervalidasi ke API Midtrans (Snap menjawab 400 validasi = kunci sah; sandbox menolak 401). Penagihan otomatis (pembuatan transaksi Snap + verifikasi tanda tangan webhook) BELUM ada -> pekerjaan berikutnya; gateway masih `manual` |
+| 5 | Matikan tombol Google | SELESAI | Tidak ada tombol "Masuk dengan Google" di UI (hanya nama aplikasi authenticator) |
+
+Butir 1, 2, 5 tidak lagi masuk daftar tunggu. Butir 6 (kebijakan hapus akun) dijawab: pengguna
+boleh menghapus sendiri - sudah jalan. Butir 7, 8 masih menunggu keputusan.
+
 ## 1. MENUNGGU KEPUTUSAN BAPAK
 
 1. [BAPAK] Aktifkan pengiriman email (`NOTIFY_EMAIL_ENABLED=false`). SMTP sudah terpasang dan
