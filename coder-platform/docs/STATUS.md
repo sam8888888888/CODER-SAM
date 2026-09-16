@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 16 Sep 2026 (versi 0.19.0, Wave 9: deploy tanpa henti, antrean di proses sendiri, gerbang migrasi, harga jual AI)
+Terakhir diperbarui: 16 Sep 2026 (versi 0.19.0 LIVE — deploy tanpa henti, antrean di proses sendiri, gerbang migrasi, harga jual AI; smoke produksi 176 PASS / 0 FAIL)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -99,7 +99,40 @@ mengulang pekerjaan, dan memaksa satu putaran; 8 rute Wave 6 untuk dua rute tuli
 dokumentasi publik, robot, dan sitemap).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
 
-## Deploy & operasi produksi v0.18.0 (16 Sep 2026)
+## Deploy & operasi produksi v0.19.0 (16 Sep 2026)
+
+- **Versi LIVE: `0.19.0`** (`coder-platform-app:0.19.0` sehat + `coder-platform-worker` pada citra
+  yang sama). Deploy lewat `bash deploy/deploy-austria.sh 0.19.0` → `DEPLOY_OK`, `DEPLOY_SCRIPT_EXIT=0`.
+- **Cadangan sebelum deploy**: `/app/backups/coder-2026-09-16T14-56-49.572Z.db` (dibuat dengan
+  aplikasi sendiri: `docker exec coder-platform-app node dist/api/backup.js`).
+- **Tiga gerbang deploy lulus**: `MIGRATION_REHEARSAL_OK` (`SCHEMA_VERSION_AFTER_MIGRATION 17
+  EXPECTED 17`, `ROW_COUNTS_PRESERVED true`), `READY 3403 setelah 1s` → `NGINX_POINTED 3403` →
+  biru dibuat ulang → `READY 3402` → `NGINX_POINTED 3402` → `ZERO_DOWNTIME_DONE`, lalu wadah
+  antrean dibuat ulang (`[worker] proses antrean siap: pid=1 interval=15000ms lease=1800000ms batch=10`).
+- **Smoke produksi terakhir: 176 PASS / 0 FAIL / 0 SKIP → `PRODUCTION_SMOKE_PASSED`**
+  (`/tmp/w9_smoke_prod2.txt`), termasuk blok Wave 9
+  (`markup=1 cost30=3497 billed30=3497 margin30=0 overrides=0 catalog=845 workerInWeb=false handlers=6`).
+- **Harga jual AI (butir 19) di produksi**: `GET /api/v1/admin/pricing` sebagai admin → 845 model
+  katalog, markup 1, 23 run berharga. `PUT /api/v1/admin/pricing/settings {markup:1}` →
+  `rowsUpdated=23`. `PUT .../pricing/models/<model>` → 200 `source=override`, lalu `DELETE`
+  mengembalikan `source=none` (bagian ini diuji dengan model uji, bukan model asli).
+- **Pelengkapan harga jual baris lama**: rilis pertama v0.19.0 melaporkan `cost30=3429` tetapi
+  `billed30=53` (margin negatif) karena baris pemakaian lama tidak punya `sell_cost_micros`.
+  `backfillSellCosts()` yang dipanggil saat aplikasi menyala melengkapi **32 baris**; bukti log wadah
+  hijau: `[pricing] harga jual baris lama dilengkapi: 32 baris`. Hasil akhir di produksi:
+  `run_usage` 23 baris, 0 kosong, `SUM(cost_micros)=SUM(sell_cost_micros)=3497`;
+  `user_usage` 12 baris, 8101 = 8101.
+- **Antrean pindah ke wadah pekerja**: status-hub produksi `backgroundWork.worker` =
+  `{running:false, cyclesRun:0, handlers:[email.deliver, retention.run, run.execute, run.reap,
+  webhook.deliver, workflow.reap]}` — proses web tidak lagi mengambil pekerjaan, tetapi daftar
+  penangan tetap lengkap.
+- **Nginx produksi**: `proxy_pass http://127.0.0.1:3402;` (baris 28),
+  `https://coder.sam.university/health` = 200.
+- Catatan jujur: halaman dokumentasi ini di-commit SESUDAH deploy terakhir, jadi paket rilis yang
+  terpasang (`deploy/coder-sam-university-v0.19.0.tar.gz`, sha256 `c7a6300f…3c10`) memuat kode
+  `e940db1` beserta dokumentasi satu commit lebih lama. Tidak ada perbedaan kode.
+
+## (versi sebelumnya) Deploy & operasi produksi v0.18.0 (16 Sep 2026)
 
 - **Versi LIVE: `0.18.0`** (`coder-platform-app:0.18.0`, sehat, engine `rpc-stdio` tersedia).
   Deploy lewat `bash deploy/deploy-austria.sh 0.18.0` (`DEPLOY_OK`), cadangan basis data dibuat
