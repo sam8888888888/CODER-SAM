@@ -123,7 +123,8 @@ function receiver() {
   };
 }
 async function waitForHealth(): Promise<void> {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+  // 40 detik: cukup longgar saat mesin sedang sibuk menjalankan suite lain berurutan.
+  for (let attempt = 0; attempt < 160; attempt += 1) {
     try { const response = await fetch(`${base}/health`); if (response.ok) { await response.arrayBuffer(); return; } } catch { /* belum siap */ }
     await sleep(250);
   }

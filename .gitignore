@@ -47,3 +47,7 @@ build/
 __pycache__/
 *.pyc
 .smoke-env.local
+
+# Paket deploy TIDAK di-commit (butir 13: hindari berkas besar & rahasia)
+deploy/*.tar.gz
+deploy/*.tar.gz.sha256

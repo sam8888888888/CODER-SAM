@@ -25,9 +25,19 @@ function nameErrorMessage(code: string): string {
 
 function deleteErrorMessage(code: string): string {
   if (code.includes('INVALID_PASSWORD')) return 'Kata sandi salah.';
-  if (code.includes('LAST_ADMIN')) return 'Akun admin platform terakhir tidak boleh dihapus.';
+  if (code.includes('LAST_ADMIN')) return 'Akun admin platform terakhir tidak boleh ditutup.';
   if (code.includes('CONFIRM_REQUIRED')) return 'Ketik HAPUS AKUN untuk konfirmasi.';
-  return 'Gagal menghapus akun. Coba lagi.';
+  if (code.includes('EXPORT_REQUIRED')) return 'Unduh dulu salinan data Anda. Buat ekspor di bagian "Data & Privasi", lalu kembali ke sini.';
+  if (code.includes('EXPORT_TOO_OLD')) return 'Salinan data terakhir sudah lebih dari 24 jam. Buat ekspor baru dulu, lalu tutup akun.';
+  if (code.includes('ACCOUNT_ALREADY_CLOSED')) return 'Akun ini sudah ditutup sebelumnya. Hubungi admin untuk memulihkannya.';
+  return 'Gagal menutup akun. Coba lagi.';
+}
+
+/** Tanggal singkat bahasa Indonesia untuk tanggal pemulihan. */
+function dateText(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString('id-ID', { day: '2-digit', month: 'long', year: 'numeric' });
 }
 
 export function ProfilePanel({ email, displayName, onChanged, onDeleted }: Props) {
@@ -40,6 +50,10 @@ export function ProfilePanel({ email, displayName, onChanged, onDeleted }: Props
   const [confirm, setConfirm] = useState<string>('');
   const [deleteError, setDeleteError] = useState<string>('');
   const [deleting, setDeleting] = useState<boolean>(false);
+  // Wave 8: penutupan akun wajib didahului ekspor data. Panel ini membuat ekspornya sendiri.
+  const [exportId, setExportId] = useState<string>('');
+  const [exportReady, setExportReady] = useState<string>('');
+  const [preparing, setPreparing] = useState<boolean>(false);
 
   // Kalau nama dari induk berubah (mis. setelah muat ulang profil), ikuti nilainya.
   useEffect(() => { setName(displayName); }, [displayName]);
@@ -65,7 +79,36 @@ export function ProfilePanel({ email, displayName, onChanged, onDeleted }: Props
     }
   }
 
-  // Hapus akun: butuh kata sandi saat ini + frasa konfirmasi persis.
+  /**
+   * Siapkan salinan data lewat API ekspor. Tautan unduhnya langsung dibuka, lalu id ekspor
+   * disimpan supaya bisa dipakai saat menutup akun.
+   */
+  async function prepareExport(): Promise<void> {
+    setDeleteError('');
+    setExportReady('');
+    setPreparing(true);
+    try {
+      const result = await api.createExport();
+      const id = String(result?.export?.id ?? '');
+      setExportId(id);
+      setExportReady(
+        'Salinan data siap' +
+          (result?.export?.expiresAt ? ` (kedaluwarsa ${dateText(String(result.export.expiresAt))})` : '') +
+          '. Simpan berkasnya, lalu tutup akun.',
+      );
+      if (id) window.open(api.exportDownloadUrl(id), '_blank');
+    } catch (error) {
+      setDeleteError(
+        errorCode(error).includes('EXPORT_ALREADY_RUNNING')
+          ? 'Ekspor sebelumnya masih diproses. Tunggu sebentar, lalu coba lagi.'
+          : 'Gagal membuat salinan data. Coba lagi sebentar lagi.',
+      );
+    } finally {
+      setPreparing(false);
+    }
+  }
+
+  // Tutup akun: butuh kata sandi saat ini + frasa konfirmasi persis.
   async function removeAccount(): Promise<void> {
     setDeleteError('');
     if (confirm !== CONFIRM_PHRASE) {
@@ -78,7 +121,7 @@ export function ProfilePanel({ email, displayName, onChanged, onDeleted }: Props
     }
     setDeleting(true);
     try {
-      await api.deleteAccount(password);
+      await api.deleteAccount(password, exportId || undefined);
       onDeleted?.();
     } catch (error) {
       setDeleteError(deleteErrorMessage(errorCode(error)));
@@ -117,8 +160,16 @@ export function ProfilePanel({ email, displayName, onChanged, onDeleted }: Props
       </section>
 
       <section className="settings-card danger-zone">
-        <h2 className="settings-heading">Hapus akun</h2>
-        <p className="settings-hint">Akun, sesi login, dan workspace yang hanya berisi Anda akan dihapus permanen. Tindakan ini tidak bisa dibatalkan.</p>
+        <h2 className="settings-heading">Tutup akun</h2>
+        <p className="settings-hint">
+          Langkah 1: unduh salinan data Anda. Langkah 2: tutup akun. Akun langsung tidak bisa dipakai, lalu
+          datanya dihapus permanen setelah 90 hari. Selama masa itu admin masih bisa memulihkan akun Anda.
+        </p>
+        <button type="button" className="primary" disabled={preparing || deleting} onClick={() => { void prepareExport(); }}>
+          {preparing ? 'Menyiapkan salinan…' : exportReady ? 'Buat salinan data baru' : 'Langkah 1: unduh salinan data'}
+        </button>
+        {exportReady ? <p className="settings-ok">{exportReady}</p> : null}
+        <p className="settings-hint">Langkah 2: isi kata sandi dan frasa konfirmasi, lalu tutup akun.</p>
         <label>
           Kata sandi saat ini
           <input
@@ -146,7 +197,7 @@ export function ProfilePanel({ email, displayName, onChanged, onDeleted }: Props
           />
         </label>
         <button type="button" className="btn-danger" disabled={!confirmOk || deleting} onClick={() => { void removeAccount(); }}>
-          {deleting ? 'Menghapus…' : 'Hapus akun saya'}
+          {deleting ? 'Menutup…' : 'Tutup akun saya'}
         </button>
         {deleteError ? <p className="error">{deleteError}</p> : null}
       </section>

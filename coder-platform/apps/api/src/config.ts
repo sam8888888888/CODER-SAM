@@ -43,6 +43,11 @@ const Env = z.object({
   // Wave 4: outgoing email is queued in the database first. The worker only delivers when this flag is on,
   // so no message leaves the server until the owner asks for it.
   NOTIFY_EMAIL_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
+  /**
+   * Wave 8: the email verification gate in front of AI work. "auto" follows the email server, so a
+   * platform that cannot send mail never locks its own users out, while production demands proof.
+   */
+  VERIFY_EMAIL_REQUIRED: z.enum(["auto", "on", "off"]).default("auto"),
   // Public API keys (Bearer tokens). Zero disables the per-key request limit for one minute.
   API_KEY_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().min(0).default(120),
   // Data retention. Deletion stays off until RETENTION_ENABLED is turned on, so reports can be reviewed first.

@@ -17,7 +17,7 @@ import { engine } from "./engine.js";
 import { createExecution, recordAudit, runExecution, scheduleNextRun } from "./workflow-engine.js";
 import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
 import { checkRequestOrigin, constantTimeEquals, csrfCookieOptions, generateCsrfToken } from "./csrf.js";
-import { limiterFor } from "./ratelimit.js";
+import { limiterFor, rateLimitStorage } from "./ratelimit.js";
 import {
   API_KEY_PREFIX, MAX_API_KEYS_PER_USER, PUBLIC_API_ENDPOINTS, PUBLIC_API_LIMITS, apiKeyTokensToday, authenticateApiKey,
   checkApiKeyDailyQuota, checkApiKeyRate, countActiveApiKeys, countApiKeyRequest,
@@ -32,7 +32,7 @@ import {
   deleteOutboxRow, deliverPending, emailEnabled, emailWorkerState, getOutboxRow,
   listOutbox, notificationPrefs, outboxStats, queueEmail, renderEmail, retryEmail, saveNotificationPrefs, type EmailKind,
 } from "./outbox.js";
-import { retentionPolicy, retentionReport, runRetention } from "./retention.js";
+import { ACCOUNT_RECOVERY_DAYS, closedAccounts, retentionPolicy, retentionReport, runRetention } from "./retention.js";
 import {
   enqueueJob, getJob, jobStats, jobWorkerState, listJobs, reapAbandonedExecutions, reapAbandonedRuns,
   recoverExpiredLeases, registerJobHandler, retryJob, runJobCycleOnce, startJobWorker, type JobRow,
@@ -359,8 +359,10 @@ app.get("/ready", async (_request, reply) => {
 app.get("/api/v1/auth/me", async (request, reply) => {
   const user = getSessionUser(request);
   if (!user) return reply.code(401).send({ error: "AUTH_REQUIRED" });
-  // isAdmin and tier let the shell show the right pages without extra requests.
-  return { user: { ...user, isAdmin: isPlatformAdmin(user), tier: userTier(user.id) } };
+  // isAdmin, tier and the mail state let the shell show the right pages without extra requests.
+  // Wave 8: the shell needs emailVerified, because an unverified account cannot start AI work.
+  const row = db.prepare("SELECT email_verified AS emailVerified, deleted_at AS deletedAt FROM users WHERE id=?").get(user.id) as { emailVerified: number; deletedAt: string | null } | undefined;
+  return { user: { ...user, isAdmin: isPlatformAdmin(user), tier: userTier(user.id), emailVerified: Boolean(row?.emailVerified), accountClosed: Boolean(row?.deletedAt) } };
 });
 app.post<{ Body: { email?: string; password?: string; displayName?: string; ref?: string } }>("/api/v1/auth/register", async (request, reply) => {
   if (!registerLimiter.allow(request.ip ?? "unknown")) return reply.code(429).send({ error: "RATE_LIMITED", message: "Terlalu banyak pendaftaran dari koneksi ini. Coba lagi nanti." });
@@ -396,8 +398,8 @@ app.post<{ Body: { email?: string; password?: string; code?: string } }>("/api/v
   const email = request.body?.email?.trim().toLowerCase(); const password = request.body?.password ?? ""; const code = request.body?.code?.trim();
   const key = `${request.ip}:${email ?? "unknown"}`; if (!allowLoginAttempt(key)) return reply.code(429).send({ error: "LOGIN_RATE_LIMITED" });
   // The form accepts either a full email address or the username before the @.
-  type LoginRow = { id:string; email:string; displayName:string; passwordHash:string|null; mfaEnabled:number; mfaSecret:string|null; recoveryCodes:string|null };
-  const fields = "id,email,display_name AS displayName,password_hash AS passwordHash, mfa_enabled AS mfaEnabled, mfa_secret AS mfaSecret, mfa_recovery_codes AS recoveryCodes";
+  type LoginRow = { id:string; email:string; displayName:string; passwordHash:string|null; mfaEnabled:number; mfaSecret:string|null; recoveryCodes:string|null; deletedAt:string|null; purgeAfter:string|null };
+  const fields = "id,email,display_name AS displayName,password_hash AS passwordHash, mfa_enabled AS mfaEnabled, mfa_secret AS mfaSecret, mfa_recovery_codes AS recoveryCodes, deleted_at AS deletedAt, purge_after AS purgeAfter";
   let row = email ? db.prepare(`SELECT ${fields} FROM users WHERE email=?`).get(email) as LoginRow|undefined : undefined;
   if (!row && email && !email.includes("@")) {
     // A username is only accepted when exactly one account uses that local part.
@@ -405,6 +407,7 @@ app.post<{ Body: { email?: string; password?: string; code?: string } }>("/api/v
     if (matches.length === 1) row = matches[0];
   }
   if (!row?.passwordHash || !(await verifyPassword(password,row.passwordHash))) return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
+  if (row.deletedAt) return reply.code(403).send({ error: "ACCOUNT_DELETED", message: `Akun ini sudah ditutup atas permintaan pemiliknya. Admin platform masih bisa memulihkannya${row.purgeAfter ? ` sampai ${row.purgeAfter.slice(0, 10)}` : ""}.` });
   if (row.mfaEnabled) {
     if (!code) return reply.code(401).send({ error: "MFA_REQUIRED" });
     if (!consumeSecondFactor(row, code)) return reply.code(401).send({ error: "MFA_INVALID_CODE" });
@@ -571,6 +574,7 @@ app.get("/api/v1/admin/overview", { preHandler: requireUser }, async (request: a
 app.get("/api/v1/admin/users", { preHandler: requireUser }, async (request: any, reply) => {
   if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED" });
   return db.prepare(`SELECT u.id, u.email, u.display_name AS displayName, u.created_at AS createdAt, u.mfa_enabled AS mfaEnabled, u.email_verified AS emailVerified, u.is_admin AS isAdmin,
+    u.deleted_at AS deletedAt, u.purge_after AS purgeAfter,
     (SELECT COUNT(*) FROM memberships m WHERE m.user_id=u.id) AS workspaces, (SELECT COUNT(*) FROM auth_sessions s WHERE s.user_id=u.id) AS sessions
     FROM users u ORDER BY u.created_at DESC`).all();
 });
@@ -1113,6 +1117,25 @@ app.patch<{ Params: { projectId: string }; Body: { name?: string; description?: 
   return { project };
 });
 
+/**
+ * Wave 8: a verified email is required before AI work starts, and a closed account cannot start
+ * anything at all. The message is written as a full Indonesian sentence, because the dashboard
+ * shows it to the user unchanged.
+ */
+function verificationRequired(): boolean {
+  if (config.VERIFY_EMAIL_REQUIRED === "on") return true;
+  if (config.VERIFY_EMAIL_REQUIRED === "off") return false;
+  return emailEnabled(); // "auto": only demand proof when verification mail can actually be sent
+}
+
+function accountGate(userId: string): { status: number; error: string; message: string } | null {
+  const row = db.prepare("SELECT email_verified AS emailVerified, deleted_at AS deletedAt, purge_after AS purgeAfter FROM users WHERE id=?").get(userId) as { emailVerified: number; deletedAt: string | null; purgeAfter: string | null } | undefined;
+  if (!row) return { status: 403, error: "ACCOUNT_NOT_FOUND", message: "Akun ini tidak ditemukan. Silakan masuk ulang." };
+  if (row.deletedAt) return { status: 403, error: "ACCOUNT_DELETED", message: `Akun ini sudah ditutup atas permintaan pemiliknya${row.purgeAfter ? ` dan datanya dihapus permanen setelah ${row.purgeAfter.slice(0, 10)}` : ""}. Hubungi admin platform bila ingin dipulihkan.` };
+  if (verificationRequired() && Number(row.emailVerified) !== 1) return { status: 403, error: "EMAIL_NOT_VERIFIED", message: "Verifikasi email dulu sebelum memakai AI. Kami sudah mengirim tautan verifikasi ke email Anda; buka tautan itu, lalu coba lagi." };
+  return null;
+}
+
 app.post<{ Params: { projectId: string }; Body: { prompt?: string; model?: string } }>("/api/v1/projects/:projectId/runs", { preHandler: requireUser }, async (request: any, reply) => {
   const prompt = request.body?.prompt?.trim();
   const model = request.body?.model?.trim() || undefined;
@@ -1121,6 +1144,8 @@ app.post<{ Params: { projectId: string }; Body: { prompt?: string; model?: strin
   const project = db.prepare("SELECT p.id, p.workspace_id AS workspaceId, m.role AS role FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id) as { id: string; workspaceId: string; role: string } | undefined;
   if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
   if (project.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  const gate = accountGate(request.user!.id);
+  if (gate) return reply.code(gate.status).send({ error: gate.error, message: gate.message });
   // Cost and speed guards: a workspace can cap how much engine work it starts.
   const guard = guardWorkspaceUsage(project.workspaceId);
   if (guard) {
@@ -1332,6 +1357,8 @@ app.post<{ Params: { workflowId: string }; Body: { input?: string } }>("/api/v1/
   if (!access) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
   if (access.role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
   if (access.status !== "published") return reply.code(409).send({ error: "WORKFLOW_NOT_PUBLISHED" });
+  const gate = accountGate(request.user!.id);
+  if (gate) return reply.code(gate.status).send({ error: gate.error, message: gate.message });
   // Workflow prompt steps also cost money, so the same guard applies.
   const workspace = db.prepare("SELECT workspace_id AS workspaceId FROM projects WHERE id=?").get(access.projectId) as { workspaceId: string } | undefined;
   const guard = workspace ? guardWorkspaceUsage(workspace.workspaceId) : null;
@@ -1888,6 +1915,7 @@ app.get("/api/v1/admin/user-list", { preHandler: requireUser }, async (request: 
   if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat daftar pengguna." });
   const rows = db.prepare(`SELECT u.id, u.email, u.display_name AS displayName, COALESCE(u.tier,'free') AS tier,
     u.is_admin AS isAdmin, u.email_verified AS emailVerified, u.created_at AS createdAt,
+    u.deleted_at AS deletedAt, u.purge_after AS purgeAfter,
     (SELECT COUNT(*) FROM memberships m WHERE m.user_id = u.id) AS workspaces
     FROM users u ORDER BY u.created_at DESC`).all() as any[];
   return { users: rows.map((row) => ({ ...row, isAdmin: row.isAdmin === 1, emailVerified: row.emailVerified === 1 })) };
@@ -1924,7 +1952,7 @@ app.post<{ Body: { email?: string; displayName?: string; password?: string; tier
   return { user: { ...row, isAdmin: false, emailVerified: false } };
 });
 
-app.patch<{ Params: { userId: string }; Body: { displayName?: string; tier?: string; isAdmin?: boolean; emailVerified?: boolean } }>("/api/v1/admin/users/:userId", { preHandler: requireUser }, async (request: any, reply) => {
+app.patch<{ Params: { userId: string }; Body: { displayName?: string; tier?: string; isAdmin?: boolean; emailVerified?: boolean; email?: string } }>("/api/v1/admin/users/:userId", { preHandler: requireUser }, async (request: any, reply) => {
   if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah pengguna." });
   const target = db.prepare("SELECT id, email, display_name AS displayName, is_admin AS isAdmin FROM users WHERE id=?").get(request.params.userId) as { id: string; email: string; displayName: string; isAdmin: number } | undefined;
   if (!target) return reply.code(404).send({ error: "USER_NOT_FOUND", message: "Pengguna tidak ditemukan." });
@@ -1947,6 +1975,16 @@ app.patch<{ Params: { userId: string }; Body: { displayName?: string; tier?: str
     if (!getPlan(body.tier)) return reply.code(400).send({ error: "PLAN_NOT_FOUND", message: "Paket tidak ditemukan." });
     sets.push("tier=?"); values.push(body.tier);
   }
+  // Wave 8: an admin can move an account to a new address. The new address counts as unverified
+  // until its owner proves it, so the check is reset instead of carried over.
+  if (typeof body.email === "string") {
+    const email = body.email.trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return reply.code(400).send({ error: "INVALID_EMAIL", message: "Alamat email tidak sah." });
+    const taken = db.prepare("SELECT id FROM users WHERE lower(email)=? AND id<>?").get(email, target.id) as { id: string } | undefined;
+    if (taken) return reply.code(409).send({ error: "EMAIL_EXISTS", message: "Alamat email itu sudah dipakai akun lain." });
+    sets.push("email=?"); values.push(email);
+    sets.push("email_verified=?"); values.push(0);
+  }
   if (typeof body.isAdmin === "boolean") { sets.push("is_admin=?"); values.push(body.isAdmin ? 1 : 0); }
   if (typeof body.emailVerified === "boolean") { sets.push("email_verified=?"); values.push(body.emailVerified ? 1 : 0); }
   if (!sets.length) return reply.code(400).send({ error: "NOTHING_TO_UPDATE", message: "Tidak ada perubahan yang dikirim." });
@@ -1957,6 +1995,54 @@ app.patch<{ Params: { userId: string }; Body: { displayName?: string; tier?: str
   const row = db.prepare(`SELECT u.id, u.email, u.display_name AS displayName, COALESCE(u.tier,'free') AS tier, u.is_admin AS isAdmin, u.email_verified AS emailVerified, u.created_at AS createdAt,
     (SELECT COUNT(*) FROM memberships m WHERE m.user_id = u.id) AS workspaces FROM users u WHERE u.id=?`).get(target.id) as any;
   return { user: { ...row, isAdmin: row.isAdmin === 1, emailVerified: row.emailVerified === 1 } };
+});
+
+/**
+ * Builds a short password that is easy to read out loud, because an admin may have to dictate it:
+ * three common words, a dash, and four digits. It is long enough for the scrypt hasher.
+ */
+function readablePassword(): string {
+  const words = ["aman", "cerah", "cepat", "damai", "hijau", "jernih", "kuat", "maju", "nyaman", "pintar", "rapi", "tenang"];
+  const pick = () => words[Math.floor(Math.random() * words.length)];
+  const digits = String(Math.floor(1000 + Math.random() * 9000));
+  return `${pick()}${pick()}-${digits}`;
+}
+
+/**
+ * Wave 8: an admin sets a password for any account, which is what Bapak asked for. When the
+ * request has no password, a short readable one is generated and returned exactly once, so it can
+ * be dictated over the phone. Every existing session is dropped at the same time.
+ */
+app.post<{ Params: { userId: string }; Body: { password?: string } }>("/api/v1/admin/users/:userId/password", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah kata sandi." });
+  const target = db.prepare("SELECT id, email FROM users WHERE id=?").get(request.params.userId) as { id: string; email: string } | undefined;
+  if (!target) return reply.code(404).send({ error: "USER_NOT_FOUND", message: "Pengguna tidak ditemukan." });
+  const asked = typeof request.body?.password === "string" ? request.body.password.trim() : "";
+  if (asked && asked.length < 8) return reply.code(400).send({ error: "WEAK_PASSWORD", message: "Kata sandi minimal 8 karakter." });
+  const password = asked || readablePassword();
+  const now = new Date().toISOString();
+  const passwordHash = await hashPassword(password); // hashed before the transaction: the hasher is async
+  db.transaction(() => {
+    db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?").run(passwordHash, now, target.id);
+    db.prepare("DELETE FROM auth_sessions WHERE user_id=?").run(target.id);
+    db.prepare("DELETE FROM auth_tokens WHERE user_id=?").run(target.id);
+  })();
+  recordAudit(null, request.user!.id, "admin.user_password_set", { userId: target.id, generated: !asked });
+  notify(null, target.id, "security", "Kata sandi diubah admin", "Admin platform menetapkan kata sandi baru untuk akun Anda. Semua sesi lama sudah diputus.", "/settings");
+  return { ok: true, userId: target.id, email: target.email, password, generated: !asked };
+});
+
+/** Wave 8: brings back an account that was closed inside its recovery window. */
+app.post<{ Params: { userId: string } }>("/api/v1/admin/users/:userId/restore", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh memulihkan akun." });
+  const target = db.prepare("SELECT id, email, deleted_at AS deletedAt, purge_after AS purgeAfter FROM users WHERE id=?").get(request.params.userId) as { id: string; email: string; deletedAt: string | null; purgeAfter: string | null } | undefined;
+  if (!target) return reply.code(404).send({ error: "USER_NOT_FOUND", message: "Pengguna tidak ditemukan." });
+  if (!target.deletedAt) return reply.code(409).send({ error: "ACCOUNT_NOT_CLOSED", message: "Akun ini tidak sedang ditutup." });
+  const now = new Date();
+  if (target.purgeAfter && target.purgeAfter <= now.toISOString()) return reply.code(409).send({ error: "RECOVERY_WINDOW_PASSED", message: "Masa pemulihan 90 hari sudah lewat, data akun ini sudah dihapus permanen." });
+  db.prepare("UPDATE users SET deleted_at=NULL, purge_after=NULL, updated_at=? WHERE id=?").run(now.toISOString(), target.id);
+  recordAudit(null, request.user!.id, "admin.user_restored", { userId: target.id });
+  return { ok: true, userId: target.id, email: target.email };
 });
 
 app.post<{ Params: { userId: string } }>("/api/v1/admin/users/:userId/reset-quota", { preHandler: requireUser }, async (request: any, reply) => {
@@ -2033,26 +2119,36 @@ app.patch<{ Body: { displayName?: string } }>("/api/v1/auth/me", { preHandler: r
  * required, and the last platform admin cannot be removed, so nobody locks the
  * platform out of its own administration.
  */
-app.delete<{ Body: { password?: string; confirm?: string } }>("/api/v1/auth/account", { preHandler: requireUser }, async (request: any, reply) => {
-  if (String(request.body?.confirm ?? "").trim().toUpperCase() !== "HAPUS AKUN") return reply.code(400).send({ error: "CONFIRM_REQUIRED" });
-  const row = db.prepare("SELECT password_hash AS passwordHash FROM users WHERE id=?").get(request.user!.id) as { passwordHash: string | null } | undefined;
+app.delete<{ Body: { password?: string; confirm?: string; exportId?: string } }>("/api/v1/auth/account", { preHandler: requireUser }, async (request: any, reply) => {
+  if (String(request.body?.confirm ?? "").trim().toUpperCase() !== "HAPUS AKUN") return reply.code(400).send({ error: "CONFIRM_REQUIRED", message: 'Tulis "HAPUS AKUN" untuk mengonfirmasi.' });
+  const row = db.prepare("SELECT password_hash AS passwordHash, deleted_at AS deletedAt FROM users WHERE id=?").get(request.user!.id) as { passwordHash: string | null; deletedAt: string | null } | undefined;
   const password = String(request.body?.password ?? "");
-  if (!row?.passwordHash || !password || !(await verifyPassword(password, row.passwordHash))) return reply.code(403).send({ error: "INVALID_PASSWORD" });
-  if (isPlatformAdmin(request.user!) && platformAdminCount() <= 1) return reply.code(409).send({ error: "LAST_ADMIN" });
+  if (!row?.passwordHash || !password || !(await verifyPassword(password, row.passwordHash))) return reply.code(403).send({ error: "INVALID_PASSWORD", message: "Kata sandi tidak cocok." });
+  if (row.deletedAt) return reply.code(409).send({ error: "ACCOUNT_ALREADY_CLOSED", message: "Akun ini sudah ditutup sebelumnya." });
+  if (isPlatformAdmin(request.user!) && platformAdminCount() <= 1) return reply.code(409).send({ error: "LAST_ADMIN", message: "Admin platform terakhir tidak boleh menutup akunnya sendiri." });
   const userId = request.user!.id;
-  const soloWorkspaces = (db.prepare(`SELECT m.workspace_id AS workspaceId FROM memberships m WHERE m.user_id=?
-    AND (SELECT COUNT(*) FROM memberships other WHERE other.workspace_id=m.workspace_id)=1`).all(userId) as { workspaceId: string }[]).map((row) => row.workspaceId);
-  for (const workspaceId of soloWorkspaces) await deleteWorkspaceFully(workspaceId);
+  // Wave 8: the user takes a copy of their own data first. The dashboard makes the export, and the
+  // newest ready export must be less than a day old, so nobody loses work by accident.
+  const usable = listExports(userId).filter((item) => item.status === "ready" && item.expiresAt > new Date().toISOString());
+  const wanted = request.body?.exportId;
+  const chosen = wanted ? usable.find((item) => item.id === wanted) : usable[0];
+  if (!chosen) return reply.code(409).send({ error: "EXPORT_REQUIRED", message: "Unduh dulu salinan data Anda (Pengaturan, bagian Akun). Setelah ekspor dibuat, akun bisa ditutup." });
+  if (new Date(chosen.createdAt).getTime() < Date.now() - 24 * 60 * 60 * 1000) {
+    return reply.code(409).send({ error: "EXPORT_TOO_OLD", message: "Salinan data terakhir sudah lebih dari 24 jam. Buat ekspor baru dulu, lalu tutup akun." });
+  }
+  const now = new Date();
+  const purgeAfter = new Date(now.getTime() + ACCOUNT_RECOVERY_DAYS * 86_400_000).toISOString();
+  // The account is only marked as closed. The rows stay for the recovery window, and the retention
+  // pass removes them for good once purge_after has passed.
   db.transaction(() => {
+    db.prepare("UPDATE users SET deleted_at=?, purge_after=?, updated_at=? WHERE id=?").run(now.toISOString(), purgeAfter, now.toISOString(), userId);
     db.prepare("DELETE FROM auth_sessions WHERE user_id=?").run(userId);
     db.prepare("DELETE FROM auth_tokens WHERE user_id=?").run(userId);
-    db.prepare("DELETE FROM notifications WHERE user_id=?").run(userId);
-    db.prepare("DELETE FROM memberships WHERE user_id=?").run(userId);
-    db.prepare("DELETE FROM users WHERE id=?").run(userId);
+    db.prepare("UPDATE api_keys SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL").run(now.toISOString(), userId);
   })();
-  recordAudit(null, null, "user.account_deleted", { userId, soloWorkspaces });
+  recordAudit(null, null, "user.account_closed", { userId, exportId: chosen.id, purgeAfter, recoveryDays: ACCOUNT_RECOVERY_DAYS });
   clearSessionCookie(reply as any, config.NODE_ENV === "production");
-  return { ok: true, deletedWorkspaces: soloWorkspaces.length };
+  return { ok: true, deletedAt: now.toISOString(), purgeAfter, recoveryDays: ACCOUNT_RECOVERY_DAYS, exportId: chosen.id };
 });
 
 // ---------------------------------------------------------------- hapus data
@@ -2857,7 +2953,9 @@ app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) 
     counts,
     money: { todayTokens, payments: { gateway: payments.gateway, xenditEnabled: payments.xenditEnabled, midtransEnabled: payments.midtransEnabled, xenditConfigured: payments.xenditConfigured, midtransConfigured: payments.midtransConfigured } },
     mail: { configured: mailerConfigured(), from: config.SMTP_FROM, host: config.SMTP_HOST ? `${config.SMTP_HOST}:${config.SMTP_PORT}` : null, secure: config.SMTP_SECURE },
-    security: { csrfStrict: config.CSRF_STRICT, sessionCookie: "httpOnly", adminEmails: config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim()).filter(Boolean).length, metricsEnabled: Boolean(config.METRICS_TOKEN) },
+    security: { csrfStrict: config.CSRF_STRICT, sessionCookie: "httpOnly", adminEmails: config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim()).filter(Boolean).length, metricsEnabled: Boolean(config.METRICS_TOKEN),
+      /** Wave 8: whether an unverified email blocks AI work, and why. */
+      verifyEmailRequired: verificationRequired(), verifyEmailMode: config.VERIFY_EMAIL_REQUIRED },
     limits: { dailyCostMicros: config.DEFAULT_DAILY_COST_LIMIT_MICROS, monthlyCostMicros: config.DEFAULT_MONTHLY_COST_LIMIT_MICROS, runsPerHour: config.DEFAULT_RUNS_PER_HOUR_LIMIT, engineTimeoutMs: config.ENGINE_TIMEOUT_MS },
     openPlatform: {
       activeKeys: Number((db.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE revoked_at IS NULL").get() as { n: number }).n),
@@ -2866,6 +2964,9 @@ app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) 
       emailOutbox: outboxStats(),
       emailWorker: emailWorkerState(),
       retention: retentionPolicy(),
+      /** Wave 8: where the rate limit counters live and how the closed account window works. */
+      rateLimits: rateLimitStorage(),
+      closedAccounts: (() => { const rows = closedAccounts(); return { waiting: rows.waiting.length, due: rows.due.length, recoveryDays: ACCOUNT_RECOVERY_DAYS }; })(),
       readyExports: Number((db.prepare("SELECT COUNT(*) AS n FROM data_exports WHERE status='ready'").get() as { n: number }).n),
       emailEnabled: emailEnabled(),
       /** Wave 6: outgoing webhooks and the per-key ceilings of the public API. */
@@ -3113,6 +3214,9 @@ app.get("/api/v1/api-keys/docs", { preHandler: requireUser }, async () => ({
 }));
 
 app.post<{ Body: { name?: string; scopes?: unknown; workspaceId?: string; dailyRequestLimit?: unknown; dailyTokenLimit?: unknown } }>("/api/v1/api-keys", { preHandler: requireUser }, async (request: any, reply) => {
+  // Wave 8: a key can start AI work, so the same email verification rule applies here.
+  const keyGate = accountGate(request.user!.id);
+  if (keyGate) return reply.code(keyGate.status).send({ error: keyGate.error, message: keyGate.message });
   const name = String(request.body?.name ?? "").trim();
   if (name.length < API_KEY_NAME_MIN || name.length > API_KEY_NAME_MAX) {
     return reply.code(400).send({ error: "INVALID_KEY_NAME", message: `Nama kunci ${API_KEY_NAME_MIN}-${API_KEY_NAME_MAX} karakter.` });
@@ -3657,11 +3761,35 @@ function registerBackgroundHandlers() {
     return { enabled: report.enabled, sent: report.sent, failed: report.failed, skipped: report.skipped, pending: report.pending };
   });
 
+  /**
+   * Wave 8: lists the files that belong to accounts whose recovery window has passed. The rows of
+   * a workspace with no members left are removed by the retention pass, so the file list is built
+   * before that pass runs.
+   */
+  function filesForClosedAccounts(now = new Date()): { projectIds: string[]; attachmentPaths: string[] } {
+    const due = "SELECT id FROM users WHERE deleted_at IS NOT NULL AND purge_after IS NOT NULL AND purge_after <= ?";
+    const projects = db.prepare(`SELECT p.id AS id FROM projects p WHERE p.workspace_id IN (
+      SELECT m.workspace_id FROM memberships m WHERE m.user_id IN (${due}) AND m.role='owner'
+      AND (SELECT COUNT(*) FROM memberships other WHERE other.workspace_id=m.workspace_id)=1)`).all(now.toISOString()) as { id: string }[];
+    if (projects.length === 0) return { projectIds: [], attachmentPaths: [] };
+    const marks = projects.map(() => "?").join(",");
+    const attachments = db.prepare(`SELECT a.storage_path AS storagePath FROM message_attachments a
+      JOIN messages ms ON ms.id=a.message_id JOIN conversations c ON c.id=ms.conversation_id
+      WHERE c.project_id IN (${marks})`).all(...projects.map((project) => project.id)) as { storagePath: string }[];
+    return { projectIds: projects.map((project) => project.id), attachmentPaths: attachments.map((row) => row.storagePath) };
+  }
+
   registerJobHandler("retention.run", async () => {
+    // Wave 8: the files of a workspace that is about to disappear are collected first, because
+    // after the delete pass the rows that point at them are gone.
+    const files = filesForClosedAccounts();
     const result = runRetention();
+    for (const projectId of files.projectIds) await rm(join(config.DATA_DIR, "artifacts", projectId), { recursive: true, force: true }).catch(() => undefined);
+    for (const path of files.attachmentPaths) await rm(path, { force: true }).catch(() => undefined);
     await expireExports().catch(() => undefined);
     if (!result.dryRun && result.totalRemoved > 0) console.log(`[retention] removed ${result.totalRemoved} rows`);
-    return { dryRun: result.dryRun, totalRemoved: result.totalRemoved, reason: result.reason ?? null };
+    return { dryRun: result.dryRun, totalRemoved: result.totalRemoved, accountsPurged: result.purgedAccounts ?? 0,
+      workspacesRemoved: (result.removedWorkspaces ?? []).length, filesRemoved: files.projectIds.length + files.attachmentPaths.length, reason: result.reason ?? null };
   });
 
   // Repairs abandoned runs. Nothing is touched while it is still inside the lease window.

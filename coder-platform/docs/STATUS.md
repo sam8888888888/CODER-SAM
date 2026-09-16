@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 16 Sep 2026 (versi 0.17.0, konfigurasi produksi diperbarui)
+Terakhir diperbarui: 16 Sep 2026 (versi 0.18.0, Wave 8: akun, keamanan masuk, dan batas laju)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -14,6 +14,31 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - DNS `coblai.com` belum dipasang (MX/SPF/DKIM); rinciannya di `docs/DNS_COBLAI_COM.md`.
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
+
+Wave 8 (v0.18.0, 16 Sep 2026) — jawaban butir 6–15, semuanya di kode dan diuji:
+- **Akun bisa ditutup sendiri (butir 6)**: `DELETE /api/v1/auth/account` kini penutupan lunak wajib
+  ekspor (`409 EXPORT_REQUIRED` bila belum ada ekspor ≤24 jam, `409 EXPORT_TOO_OLD` bila lebih tua),
+  masa pemulihan **90 hari** (`users.deleted_at` + `users.purge_after`), masuk ditolak
+  (`403 ACCOUNT_DELETED`), admin bisa memulihkan (`POST /api/v1/admin/users/:id/restore`).
+  Penghapusan permanen dilakukan pekerja `retention.run`: baris pengguna hilang, workspace tanpa
+  anggota lain ikut hilang berikut proyek dan berkasnya, workspace yang masih beranggota
+  dipertahankan dengan anggota terlama dinaikkan menjadi `owner`.
+- **Verifikasi email wajib untuk aksi AI (butir 7)**: `accountGate()` menolak `403 EMAIL_NOT_VERIFIED`
+  pada pembuatan run, eksekusi workflow, dan pembuatan kunci API. Mode `VERIFY_EMAIL_REQUIRED`
+  (`auto` bawaan | `on` | `off`); `auto` menegakkan gerbang hanya bila server email aktif, supaya
+  platform tanpa SMTP tidak mengunci penggunanya. `/api/v1/auth/me` melaporkan `emailVerified`.
+- **Admin kedua & wewenang admin (butir 10)**: `PATCH /api/v1/admin/users/:id` menerima `email`
+  (email berubah ⇒ `email_verified` kembali 0), `POST /api/v1/admin/users/:id/password` menyetel
+  sandi (dibuat otomatis bila kosong, mudah dibaca, ditampilkan sekali) dan mencabut semua sesi.
+  Admin kedua cukup ditambahkan ke env `PLATFORM_ADMIN_EMAILS`.
+- **Batas laju pindah ke basis data (butir 15)**: tabel `rate_limit_hits`, kunci berawalan nama
+  aturan, jendela geser, sapuan tiap menit; `status-hub.openPlatform.rateLimits` melaporkan
+  `store: "database"`.
+- Skema basis data: **16**.
+- Uji lokal: `wave8.e2e.ts` (99 pemeriksaan lulus) + `render-check-wave8.tsx`
+  (`ALL_WAVE8_PAGES_RENDERED`); `npm run verify` = 28 suite.
+- Rincian lengkap: `docs/PLAN_WAVE_8.md`. Tindakan operasi butir 11 (prune), 12 (hapus audit uji),
+  dan 14 (batasi relay mailcow) BELUM dijalankan; butir 13 (push GitHub) terhalang kredensial.
 
 Cara memperbarui berkas ini: jangan menulis dari ingatan. Baca kode lebih dulu, lalu catat buktinya.
 Bukti minimum: rute `app.get/post/put/patch/delete` di `apps/api/src/server.ts`, versi schema dan tabel
@@ -582,11 +607,14 @@ Cek tipe (tanpa keluaran berarti lulus; saya jalankan 13 Sep 2026):
 Suite end-to-end lokal tanpa jaringan:
 
 - `cd coder-platform && MOCK_ENGINE=true npx tsx apps/api/test/<suite>.e2e.ts`
-- Cara tercepat sekarang: `cd coder-platform && npm run verify` (27 suite, mencetak `ALL_SUITES_PASSED`).
+- Cara tercepat sekarang: `cd coder-platform && npm run verify` (28 suite, mencetak `ALL_SUITES_PASSED`).
 - Suite yang ditambahkan setelah snapshot 21 suite itu, semuanya hijau 15 Sep 2026:
   `wave3.e2e.ts` (260 lulus, 1 SKIP), `wave4.e2e.ts` (181), `outbox-mail.e2e.ts` (14),
   `csrf-strict.e2e.ts` (13), `backup-restore.e2e.ts` (22), `jobs.e2e.ts` (51), `wave6.e2e.ts` (91),
   `wave7.e2e.ts` (95, menjalankan alur undangan sampai hadiah lewat MOCK_ENGINE).
+- `wave8.e2e.ts` (99, 16 Sep 2026): penutupan akun dua langkah, gerbang verifikasi email dengan
+  `VERIFY_EMAIL_REQUIRED=on`, batas laju berbasis tabel, dan pembersihan akun oleh pekerja retensi
+  (termasuk kasus workspace kosong vs workspace yang masih beranggota).
 - Catatan jujur: `apps/api/tsconfig.json` hanya menyertakan `src/**/*.ts`, jadi berkas uji di `apps/api/test`
   TIDAK diperiksa tipe oleh `tsc --noEmit` (di-type-strip oleh tsx). Yang diperiksa tipe hanya kode server.
 - 21 suite (20 suite lama lulus 14 Sep 2026 sebelum Wave 2 dengan `RUNNER_EXIT=0`; `wave2` lulus

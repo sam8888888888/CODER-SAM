@@ -43,7 +43,7 @@ export type BillingMe = {
 };
 export type PaymentConfig = { gateway: string; xenditEnabled: boolean; midtransEnabled: boolean; xenditConfigured: boolean; midtransConfigured: boolean; instructions: string; updatedAt?: string };
 export type RevenueSummary = { days: number; since: string; revenueIdr: number; costIdr: number; marginIdr: number; marginPercent: number | null; paidOrders: number; pendingOrders: number; tokens: number; costUsd: number; usdIdrRate: number; activeSubscriptions: number; newSubscriptions: number; creditGrantedTokens: number };
-export type AdminUserRow = { id: string; email: string; displayName: string; tier: string; isAdmin: boolean; emailVerified: boolean; createdAt: string; workspaces: number };
+export type AdminUserRow = { id: string; email: string; displayName: string; tier: string; isAdmin: boolean; emailVerified: boolean; createdAt: string; workspaces: number; deletedAt?: string | null; purgeAfter?: string | null };
 export type Branding = { appName: string; tagline: string; primaryColor: string; logoUrl: string; faviconUrl: string; supportEmail: string };
 
 
@@ -204,7 +204,9 @@ export const api = {
   deleteProject: (projectId: string) => request<{ ok: true }>(`/v1/projects/${projectId}`, { method: 'DELETE' }),
   deleteWorkspace: (workspaceId: string, confirm: string) => request<{ ok: true }>(`/v1/workspaces/${workspaceId}`, { method: 'DELETE', body: JSON.stringify({ confirm }) }),
   updateProfile: (displayName: string) => request<{ user: User }>('/v1/auth/me', { method: 'PATCH', body: JSON.stringify({ displayName }) }),
-  deleteAccount: (password: string) => request<{ ok: true; deletedWorkspaces: number }>('/v1/auth/account', { method: 'DELETE', body: JSON.stringify({ password, confirm: 'HAPUS AKUN' }) }),
+  /** Wave 8: closing an account is a soft delete. An export made in the last day is required first. */
+  deleteAccount: (password: string, exportId?: string) => request<{ ok: true; deletedAt: string; purgeAfter: string; recoveryDays: number; exportId: string }>(
+    '/v1/auth/account', { method: 'DELETE', body: JSON.stringify({ password, confirm: 'HAPUS AKUN', exportId }) }),
   usageCsvUrl: (projectId: string) => `/api/v1/projects/${projectId}/usage/export`,
   execution: (executionId: string) => request<ExecutionDetail>(`/v1/workflow-executions/${executionId}`),
   cancelExecution: (executionId: string) => request(`/v1/workflow-executions/${executionId}/cancel`, { method: 'POST' }),
@@ -278,7 +280,12 @@ export const api = {
   updatePlan: (code: string, patch: Partial<Plan>) => request<{ plan: Plan }>(`/v1/admin/plans/${encodeURIComponent(code)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   adminUserList: () => request<{ users: AdminUserRow[] }>('/v1/admin/user-list'),
   adminCreateUser: (input: { email: string; displayName: string; password: string; tier?: string }) => request<{ user: AdminUserRow }>('/v1/admin/users', { method: 'POST', body: JSON.stringify(input) }),
-  adminUpdateUser: (userId: string, patch: { displayName?: string; tier?: string; isAdmin?: boolean; emailVerified?: boolean }) => request<{ user: AdminUserRow }>(`/v1/admin/users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  adminUpdateUser: (userId: string, patch: { displayName?: string; email?: string; tier?: string; isAdmin?: boolean; emailVerified?: boolean }) => request<{ user: AdminUserRow }>(`/v1/admin/users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  /** Wave 8: an admin can set a password for somebody else and bring a closed account back. */
+  adminSetUserPassword: (userId: string, password?: string) => request<{ ok: true; userId: string; email: string; password: string; generated: boolean }>(
+    `/v1/admin/users/${encodeURIComponent(userId)}/password`, { method: 'POST', body: JSON.stringify(password ? { password } : {}) }),
+  adminRestoreUser: (userId: string) => request<{ ok: true; userId: string; email: string }>(
+    `/v1/admin/users/${encodeURIComponent(userId)}/restore`, { method: 'POST' }),
   adminResetQuota: (userId: string) => request<{ ok: boolean; quota: QuotaState }>(`/v1/admin/users/${encodeURIComponent(userId)}/reset-quota`, { method: 'POST' }),
   adminGrantCredit: (userId: string, tokens: number, note?: string) => request<{ creditTokens: number }>(`/v1/admin/users/${encodeURIComponent(userId)}/credit`, { method: 'POST', body: JSON.stringify({ tokens, note }) }),
   setUsdRate: (rate: number) => request<{ usdIdrRate: number }>('/v1/admin/currency', { method: 'PUT', body: JSON.stringify({ rate }) }),

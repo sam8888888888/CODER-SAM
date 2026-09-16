@@ -3,7 +3,7 @@
 Dikumpulkan atas perintah Bapak: "SEMUA MASALAH DAN YANG BELUM BERES, DIKUMPULKAN,
 NANTI TERAKHIR KITA BERESKAN SATU PER SATU."
 
-Versi platform saat daftar ini dibuat: **v0.17.0 (Wave 7 — Pertumbuhan)** — versi ini belum di-deploy saat daftar ditulis.
+Versi platform saat daftar ini diperbarui: **v0.18.0 (Wave 8 — akun, keamanan masuk, dan batas laju tahan restart)**.
 Legenda status: [BAPAK] butuh keputusan/izin Bapak · [TEKNIS] pekerjaan teknis yang bisa saya kerjakan ·
 [FITUR] fitur yang belum ada · [RISIKO] temuan yang berpotensi berbahaya.
 
@@ -21,8 +21,25 @@ Keputusan yang sudah diterima (butir 1-5) dan hasilnya di produksi:
 | 4 | Pakai Midtrans saja | SEBAGIAN | Kunci produksi tersimpan di `.env` produksi dan tervalidasi ke API Midtrans (Snap menjawab 400 validasi = kunci sah; sandbox menolak 401). Penagihan otomatis (pembuatan transaksi Snap + verifikasi tanda tangan webhook) BELUM ada -> pekerjaan berikutnya; gateway masih `manual` |
 | 5 | Matikan tombol Google | SELESAI | Tidak ada tombol "Masuk dengan Google" di UI (hanya nama aplikasi authenticator) |
 
-Butir 1, 2, 5 tidak lagi masuk daftar tunggu. Butir 6 (kebijakan hapus akun) dijawab: pengguna
-boleh menghapus sendiri - sudah jalan. Butir 7, 8 masih menunggu keputusan.
+Butir 1, 2, 5 tidak lagi masuk daftar tunggu. Butir 3, 4 masih berjalan sebagian (DNS menunggu
+Bapak; penagihan otomatis Midtrans belum dibangun).
+
+Keputusan Bapak untuk butir 6-15 sudah diterima dan dikerjakan sebagai Wave 8 (v0.18.0):
+
+| Butir | Keputusan Bapak | Status | Bukti |
+|-------|-----------------|--------|-------|
+| 6 | Akun bisa ditutup sendiri, data disimpan 90 hari, wajib ekspor dulu | SELESAI (kode + uji) | `DELETE /api/v1/auth/account` = penutupan lunak; `409 EXPORT_REQUIRED` tanpa ekspor ≤24 h; `deleted_at` + `purge_after` = +90 hari; `403 ACCOUNT_DELETED` saat masuk; admin `POST /api/v1/admin/users/:id/restore`; pekerja `retention.run` menghapus baris dan berkasnya; `wave8.e2e.ts` bagian 4-6 |
+| 7 | Verifikasi email wajib untuk aksi AI | SELESAI (kode + uji) | `403 EMAIL_NOT_VERIFIED` pada run, eksekusi workflow, dan pembuatan kunci API; mode `VERIFY_EMAIL_REQUIRED=auto/on/off` (auto = ikut status server email); `/auth/me` melaporkan `emailVerified`; `wave8.e2e.ts` bagian 3 (mode `on`) |
+| 8 | Hadiah rujukan 500.000 / 250.000 token | DIKONFIRMASI, tidak berubah | nilai sama seperti Wave 7; hadiah hanya setelah run pertama yang diundang selesai |
+| 9 | CSRF ketat | MENUNGGU KEPUTUSAN | penjelasan di `docs/CSRF_STRICT.md`; `CSRF_STRICT` masih `false` |
+| 10 | Admin kedua + admin boleh ubah email/kata sandi | SELESAI (kode + uji) | `PATCH /admin/users/:id` menerima `email` (verifikasi direset), `POST /admin/users/:id/password` (sandi otomatis mudah dibaca, ditampilkan sekali, semua sesi dicabut), `POST /admin/users/:id/restore`; admin kedua lewat env `PLATFORM_ADMIN_EMAILS` (belum ditambahkan di produksi); `wave8.e2e.ts` bagian 7 |
+| 11 | Prune image Docker | BELUM DIJALANKAN | rekon `docs/RECON_DOCKER_PRUNE.md`; reclaimable milik kita hanya ±15 MB; sisanya milik proyek lain |
+| 12 | Hapus 561 entri audit uji | BELUM DIJALANKAN | akan dijalankan bertarget dengan cadangan lebih dulu |
+| 13 | Push ke GitHub | TERHALANG | tidak ada kredensial GitHub di server; `deploy/*.tar.gz` + `.sha256` masih ter-track dan harus dikeluarkan dari git |
+| 14 | Batasi relay mailcow | BELUM DIJALANKAN | rekon `docs/RECON_MAILCOW_RELAY.md`; rekomendasi: port publik wajib AUTH, port internal dibiarkan; aksi berisiko, ada cadangan `master.cf` + prosedur balik |
+| 15 | Batas laju pindah ke basis data | SELESAI (kode + uji) | tabel `rate_limit_hits`, kunci berawalan nama aturan, jendela geser, sapuan tiap menit; `status-hub.openPlatform.rateLimits.store = "database"`; `wave8.e2e.ts` bagian 1-2 |
+
+Rincian lengkap: `docs/PLAN_WAVE_8.md`.
 
 ## 1. MENUNGGU KEPUTUSAN BAPAK
 
@@ -36,17 +53,18 @@ boleh menghapus sendiri - sudah jalan. Butir 7, 8 masih menunggu keputusan.
 4. [BAPAK] Kunci gateway pembayaran (Xendit/Midtrans). Tanpa kunci, aktivasi paket ditolak
    `400 GATEWAY_NOT_CONFIGURED`; pembayaran hanya bisa manual lewat transfer + bukti.
 5. [BAPAK] Google OAuth client id/secret bila ingin tombol "Masuk dengan Google" berfungsi.
-6. [BAPAK] Kebijakan hapus akun: apakah pengguna boleh menghapus akunnya sendiri, berapa lama
-   data disimpan, dan apakah wajib ekspor sebelum hapus.
-7. [BAPAK] Apakah verifikasi email WAJIB sebelum memakai AI (`email_verified` sekarang tidak
-   ditegakkan).
+6. [SELESAI] Kebijakan hapus akun: pengguna menutup sendiri, masa pemulihan 90 hari, wajib
+   ekspor dulu. Dijawab Bapak dan dibangun di Wave 8.
+7. [SELESAI] Verifikasi email wajib sebelum aksi AI. Dijawab Bapak dan dibangun di Wave 8.
 8. [BAPAK] Batas hadiah program rujukan: besaran token untuk pengundang dan yang diundang
    (sekarang usulan awal 500.000 / 250.000 token, dapat diubah lewat env).
 
 ## 2. MENUNGGU IZIN BAPAK (aksi berisiko di produksi)
 
 9. [BAPAK] Nyalakan `CSRF_STRICT` di produksi (sekarang hanya lapisan Origin/Sec-Fetch-Site).
-10. [BAPAK] Buat admin platform kedua agar tidak bergantung pada satu akun.
+10. [SEBAGIAN] Admin kedua: kode dan uji selesai (Wave 8). Sisa: menambahkan email admin kedua
+    ke `PLATFORM_ADMIN_EMAILS` di `.env` produksi lalu restart. Menunggu email mana yang dipakai
+    dan izin restart.
 11. [BAPAK] Prune image Docker milik proyek lain (30,58 GB reclaimable) — bukan milik COBLAI.
 12. [BAPAK] Hapus 561 baris `audit_events` jejak uji di workspace Bapak (jejak audit, jadi
     menunggu izin).
@@ -57,8 +75,10 @@ boleh menghapus sendiri - sudah jalan. Butir 7, 8 masih menunggu keputusan.
 
 ## 3. UTANG TEKNIS
 
-15. [TEKNIS] Batas laju (rate limit) disimpan di memori proses -> hilang saat restart dan tidak
-    cocok untuk banyak replika.
+15. [SELESAI] Batas laju kini disimpan di tabel `rate_limit_hits` (Wave 8), jadi tahan restart
+    dan aman untuk banyak replika. Cara lama (memori proses) sudah tidak dipakai.
+15b. [TEKNIS] Sapuan tabel `rate_limit_hits` masih dijalankan di dalam proses aplikasi (setiap
+    menit). Bila nanti ada banyak replika, sapuan sebaiknya dipindahkan ke pekerja terjadwal.
 16. [TEKNIS] Deploy memakai `--force-recreate` -> ada jeda singkat tanpa ketersediaan (belum
     zero-downtime).
 17. [TEKNIS] Antrean pekerjaan masih SATU PROSES (belum ada Redis/broker, belum bagi beban).
@@ -87,9 +107,9 @@ boleh menghapus sendiri - sudah jalan. Butir 7, 8 masih menunggu keputusan.
 32. [TEKNIS] Deploy script menambah key `.env` baru otomatis: perubahan nama key lama harus
     diperiksa manual agar tidak ada key usang tertinggal.
 
-32b. [TEKNIS] Anti-tipuan program undangan masih lemah: penjagaan hanya membandingkan email dan IP
-    pendaftaran (`users.signup_ip`). Verifikasi email belum diwajibkan, jadi akun palsu dari IP
-    berbeda tetap bisa lolos. Perlu verifikasi email wajib + pemeriksaan tambahan (mis. perangkat).
+32b. [SEBAGIAN] Anti-tipuan program undangan: verifikasi email sekarang diwajibkan untuk aksi AI
+    (Wave 8, butir 7), jadi akun palsu tanpa kotak surat nyata tidak bisa menghasilkan run. Sisa:
+    penjagaan masih hanya email + IP pendaftaran; perlu pemeriksaan tambahan (mis. perangkat).
 32c. [TEKNIS] `growth_events` belum diisi ulang untuk data lama (tanpa backfill). Grafik aktivitas
     harian dan retensi karena itu baru terisi sejak v0.17.0 — corong (daftar/proyek/run/bayar) tetap
     berlaku surut karena dibaca dari tabel asli.

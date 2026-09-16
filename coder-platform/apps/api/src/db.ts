@@ -472,9 +472,25 @@ CREATE TABLE IF NOT EXISTS onboarding_state (
 /** Wave 7 columns: the registration IP is kept so a referral can spot a self-made account. */
 try { db.exec("ALTER TABLE users ADD COLUMN signup_ip TEXT"); } catch {}
 
+/** Wave 8 columns: an account is closed in two steps, so the row stays until the purge date. */
+try { db.exec("ALTER TABLE users ADD COLUMN deleted_at TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN purge_after TEXT"); } catch {}
+
+/**
+ * Wave 8: rate limit counters live in the database instead of process memory. A restart no
+ * longer clears them, and several application replicas can share one counter. Each row is one
+ * accepted hit, which keeps the sliding window behaviour of the previous in-memory version.
+ */
+db.exec(`
+CREATE TABLE IF NOT EXISTS rate_limit_hits (
+ bucket TEXT NOT NULL, hit_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_bucket ON rate_limit_hits(bucket, hit_at);
+`);
+
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 15;
-export const SCHEMA_VERSION_NOTE = "Referral programme, growth events and onboarding state, on top of the public write API, webhooks and per-key ceilings";
+const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION_NOTE = "Two step account closing with a 90 day recovery window and rate limit counters kept in the database";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

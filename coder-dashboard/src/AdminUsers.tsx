@@ -107,6 +107,10 @@ export function AdminUsers({ isAdmin, onError }: Props) {
   // Panel edit baris terpilih.
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
+  const [editEmail, setEditEmail] = useState('');
+  const [editPassword, setEditPassword] = useState('');
+  /** Kata sandi hasil setel admin; ditampilkan sekali supaya bisa diserahkan ke pengguna. */
+  const [issuedPassword, setIssuedPassword] = useState('');
   const [editTier, setEditTier] = useState('');
   const [editIsAdmin, setEditIsAdmin] = useState(false);
   const [editVerified, setEditVerified] = useState(false);
@@ -171,6 +175,8 @@ export function AdminUsers({ isAdmin, onError }: Props) {
   function closeEdit(): void {
     setEditingId(null);
     setEditName('');
+    setEditEmail('');
+    setEditPassword('');
     setEditTier('');
     setEditIsAdmin(false);
     setEditVerified(false);
@@ -183,6 +189,9 @@ export function AdminUsers({ isAdmin, onError }: Props) {
   function openEdit(row: AdminUserRow): void {
     setEditingId(row.id);
     setEditName(String(row?.displayName ?? ''));
+    setEditEmail(String(row?.email ?? ''));
+    setEditPassword('');
+    setIssuedPassword('');
     setEditTier(String(row?.tier ?? ''));
     setEditIsAdmin(Boolean(row?.isAdmin));
     setEditVerified(Boolean(row?.emailVerified));
@@ -245,10 +254,16 @@ export function AdminUsers({ isAdmin, onError }: Props) {
       setEditError(`Nama tampilan harus ${NAME_MIN}-${NAME_MAX} karakter.`);
       return;
     }
+    const cleanEmail = editEmail.trim().toLowerCase();
+    if (!EMAIL_PATTERN.test(cleanEmail)) {
+      setEditError('Format email tidak valid.');
+      return;
+    }
     setEditBusy('simpan');
     try {
       await api.adminUpdateUser(userId, {
         displayName: cleanName,
+        email: cleanEmail,
         tier: editTier || undefined,
         isAdmin: editIsAdmin,
         emailVerified: editVerified,
@@ -281,6 +296,60 @@ export function AdminUsers({ isAdmin, onError }: Props) {
         : '';
       closeEdit();
       setNotice(`Kuota pengguna sudah direset.${detail}`);
+      await loadUsers();
+    } catch (error) {
+      const message = adminErrorMessage(error);
+      setEditError(message);
+      fail(message);
+    } finally {
+      setEditBusy('');
+    }
+  }
+
+  /**
+   * Wave 8: setel kata sandi pengguna. Bila kolom kata sandi dibiarkan kosong, server membuat
+   * kata sandi pendek yang mudah dibaca; hasilnya ditampilkan sekali di panel ini.
+   */
+  async function setUserPassword(userId: string): Promise<void> {
+    if (!isAdmin || !userId) return;
+    setEditError('');
+    setNotice('');
+    setIssuedPassword('');
+    const asked = editPassword.trim();
+    if (asked && asked.length < PASSWORD_MIN) {
+      setEditError(`Kata sandi minimal ${PASSWORD_MIN} karakter.`);
+      return;
+    }
+    setEditBusy('sandi');
+    try {
+      const result = await api.adminSetUserPassword(userId, asked || undefined);
+      setEditPassword('');
+      setIssuedPassword(String(result?.password ?? ''));
+      setNotice(
+        result?.generated
+          ? `Kata sandi baru untuk ${String(result?.email ?? '')} sudah dibuat. Salin dan sampaikan sekarang; kata sandi tidak bisa dilihat lagi setelah panel ditutup.`
+          : `Kata sandi ${String(result?.email ?? '')} sudah diganti. Semua sesi lama pengguna itu sudah diputus.`,
+      );
+      await loadUsers();
+    } catch (error) {
+      const message = adminErrorMessage(error);
+      setEditError(message);
+      fail(message);
+    } finally {
+      setEditBusy('');
+    }
+  }
+
+  /** Wave 8: batalkan penutupan akun selama masa pemulihan 90 hari belum lewat. */
+  async function restoreUser(userId: string): Promise<void> {
+    if (!isAdmin || !userId) return;
+    setEditError('');
+    setNotice('');
+    setEditBusy('pulihkan');
+    try {
+      const result = await api.adminRestoreUser(userId);
+      closeEdit();
+      setNotice(`Akun ${String(result?.email ?? '')} sudah dipulihkan dan bisa masuk lagi.`);
       await loadUsers();
     } catch (error) {
       const message = adminErrorMessage(error);
@@ -327,6 +396,8 @@ export function AdminUsers({ isAdmin, onError }: Props) {
       })
     : users;
   const options = tierOptions(plans);
+  const editingRow = editingId ? users.find((row) => row.id === editingId) : undefined;
+  const editingClosed = Boolean(editingRow?.deletedAt);
 
   // Tanpa hak admin: cukup tampilkan kartu informasi, tanpa panggilan API admin.
   if (!isAdmin) {
@@ -486,6 +557,34 @@ export function AdminUsers({ isAdmin, onError }: Props) {
               />
             </label>
             <label className="flex flex-col gap-1 text-slate-300">
+              Email
+              <input
+                className={FIELD}
+                type="email"
+                value={editEmail}
+                aria-label="Email pengguna"
+                onChange={(event) => {
+                  setEditEmail(event.target.value);
+                  setEditError('');
+                }}
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-slate-300">
+              Kata sandi baru (opsional)
+              <input
+                className={FIELD}
+                type="password"
+                value={editPassword}
+                autoComplete="new-password"
+                placeholder="Kosongkan agar dibuat otomatis"
+                aria-label="Kata sandi baru untuk pengguna"
+                onChange={(event) => {
+                  setEditPassword(event.target.value);
+                  setEditError('');
+                }}
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-slate-300">
               Tier
               <select
                 className={FIELD}
@@ -561,6 +660,14 @@ export function AdminUsers({ isAdmin, onError }: Props) {
             <button type="button" className={BTN} disabled={Boolean(editBusy)} onClick={() => { void saveEdit(editingId); }}>
               {editBusy === 'simpan' ? 'Menyimpan…' : 'Simpan'}
             </button>
+            <button type="button" className={BTN} disabled={Boolean(editBusy)} onClick={() => { void setUserPassword(editingId); }}>
+              {editBusy === 'sandi' ? 'Menyetel…' : 'Setel kata sandi'}
+            </button>
+            {editingClosed ? (
+              <button type="button" className={BTN} disabled={Boolean(editBusy)} onClick={() => { void restoreUser(editingId); }}>
+                {editBusy === 'pulihkan' ? 'Memulihkan…' : 'Pulihkan akun'}
+              </button>
+            ) : null}
             <button type="button" className={BTN} disabled={Boolean(editBusy)} onClick={() => { void resetQuota(editingId); }}>
               {editBusy === 'kuota' ? 'Mereset…' : 'Reset kuota'}
             </button>
@@ -571,6 +678,16 @@ export function AdminUsers({ isAdmin, onError }: Props) {
               Batal
             </button>
           </div>
+          {editingClosed ? (
+            <p className="mt-2 text-slate-100">
+              Akun ini sedang ditutup. Data dihapus permanen setelah {formatDate(editingRow?.purgeAfter)}. Pulihkan akun sebelum tanggal itu.
+            </p>
+          ) : null}
+          {issuedPassword ? (
+            <p className="mt-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100">
+              Kata sandi baru: <span className="font-mono">{issuedPassword}</span>
+            </p>
+          ) : null}
           {editError ? <p className="mt-2 text-slate-100">{editError}</p> : null}
         </div>
       ) : null}
@@ -582,7 +699,10 @@ export function AdminUsers({ isAdmin, onError }: Props) {
 function TableRow({ row, editing, onEdit }: { row: AdminUserRow; editing: boolean; onEdit: () => void }) {
   return (
     <tr className={editing ? 'bg-slate-800/60' : undefined}>
-      <td className="border-b border-slate-700 px-2 py-2 text-slate-100">{String(row?.email ?? '-')}</td>
+      <td className="border-b border-slate-700 px-2 py-2 text-slate-100">
+        {String(row?.email ?? '-')}
+        {row?.deletedAt ? <span className="ml-2 rounded bg-slate-700 px-2 py-0.5 text-xs">Ditutup</span> : null}
+      </td>
       <td className="border-b border-slate-700 px-2 py-2">{String(row?.displayName ?? '-')}</td>
       <td className="border-b border-slate-700 px-2 py-2">{String(row?.tier ?? '-')}</td>
       <td className="border-b border-slate-700 px-2 py-2">{yesNo(row?.isAdmin)}</td>

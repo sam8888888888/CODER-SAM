@@ -1,7 +1,15 @@
 /**
- * In-memory sliding window rate limiter with no external dependency.
- * One Map per limiter keeps recent hit timestamps (ms) for every key.
+ * Rate limiter backed by the application database (Wave 8, 16 Sep 2026).
+ *
+ * Counters used to live in a Map inside the process, so a restart wiped them and two replicas
+ * kept two different counts. Every accepted hit is now one row in `rate_limit_hits`, which keeps
+ * the same sliding window behaviour: a key is refused once the window holds `max` hits.
+ *
+ * The table stays small because each call deletes the hits that already left the window, and a
+ * sweep every minute drops the rows of inactive keys.
  */
+import { db } from "./db.js";
+
 export type RateLimitRule = { windowMs: number; max: number };
 
 export type RateLimiter = {
@@ -11,56 +19,58 @@ export type RateLimiter = {
   size(): number;
 };
 
-/** Hard cap on tracked keys before the limiter sweeps inactive entries. */
-const MAX_KEYS = 5000;
+/** Longest window any rule uses, plus a margin, so a sweep never removes a live hit. */
+const SWEEP_AFTER_MS = 20 * 60 * 1000;
+/** How often the whole table is swept for rows that belong to no active window. */
+const SWEEP_INTERVAL_MS = 60 * 1000;
 
-/** Removes timestamps outside the window and drops keys left without hits. */
-function prune(stamps: number[], cutoff: number): number[] {
-  return stamps.filter((stamp) => stamp > cutoff);
-}
+export function createRateLimiter(rule: RateLimitRule, namespace = "rate"): RateLimiter {
+  let lastSweep = 0;
+  // Every rule shares one table, so the counter key carries the rule name as well.
+  // Without this, a per-minute API count and a per-hour registration count under the
+  // same address would be added together and block each other.
+  const bucketOf = (key: string) => `${namespace}:${key}`;
 
-export function createRateLimiter(rule: RateLimitRule): RateLimiter {
-  const hits = new Map<string, number[]>();
-
-  /** Sweep: drop every key that has no timestamp inside the active window. */
+  /** Drops rows older than the longest window, whichever key they belong to. */
   function sweep(now: number): void {
-    const cutoff = now - rule.windowMs;
-    for (const [key, stamps] of hits) {
-      const fresh = prune(stamps, cutoff);
-      if (fresh.length === 0) hits.delete(key);
-      else hits.set(key, fresh);
-    }
+    db.prepare("DELETE FROM rate_limit_hits WHERE hit_at <= ?").run(now - SWEEP_AFTER_MS);
+  }
+
+  function hitsInWindow(key: string, cutoff: number): number {
+    const bucket = bucketOf(key);
+    db.prepare("DELETE FROM rate_limit_hits WHERE bucket=? AND hit_at <= ?").run(bucket, cutoff);
+    return Number((db.prepare("SELECT COUNT(*) AS total FROM rate_limit_hits WHERE bucket=?").get(bucket) as { total: number }).total);
   }
 
   return {
     allow(key: string, now: number = Date.now()): boolean {
-      const cutoff = now - rule.windowMs;
-      const stamps = prune(hits.get(key) ?? [], cutoff);
-      if (stamps.length >= rule.max) {
-        hits.set(key, stamps); // keep the pruned list so retryAfterSeconds stays accurate
-        return false;
+      const total = hitsInWindow(key, now - rule.windowMs);
+      if (total >= rule.max) return false;
+      db.prepare("INSERT INTO rate_limit_hits (bucket, hit_at) VALUES (?,?)").run(bucketOf(key), now);
+      if (now - lastSweep > SWEEP_INTERVAL_MS) {
+        lastSweep = now;
+        sweep(now);
       }
-      stamps.push(now);
-      hits.set(key, stamps);
-      if (hits.size > MAX_KEYS) sweep(now);
       return true;
     },
 
     retryAfterSeconds(key: string, now: number = Date.now()): number {
-      const stamps = prune(hits.get(key) ?? [], now - rule.windowMs);
-      if (stamps.length < rule.max) return 0;
+      const total = hitsInWindow(key, now - rule.windowMs);
+      if (total < rule.max) return 0;
       // The slot frees up when the oldest hit leaves the window.
-      const waitMs = Math.min(...stamps) + rule.windowMs - now;
+      const oldest = db.prepare("SELECT hit_at AS hitAt FROM rate_limit_hits WHERE bucket=? ORDER BY hit_at ASC LIMIT 1").get(bucketOf(key)) as { hitAt: number } | undefined;
+      if (!oldest) return 0;
+      const waitMs = oldest.hitAt + rule.windowMs - now;
       return waitMs <= 0 ? 0 : Math.ceil(waitMs / 1000);
     },
 
     reset(key?: string): void {
-      if (key === undefined) hits.clear();
-      else hits.delete(key);
+      if (key === undefined) db.prepare("DELETE FROM rate_limit_hits WHERE bucket LIKE ?").run(`${namespace}:%`);
+      else db.prepare("DELETE FROM rate_limit_hits WHERE bucket=?").run(bucketOf(key));
     },
 
     size(): number {
-      return hits.size;
+      return Number((db.prepare("SELECT COUNT(DISTINCT bucket) AS total FROM rate_limit_hits WHERE bucket LIKE ?").get(`${namespace}:%`) as { total: number }).total);
     },
   };
 }
@@ -90,7 +100,12 @@ const limiters = new Map<LimiterName, RateLimiter>();
 export function limiterFor(name: LimiterName): RateLimiter {
   const existing = limiters.get(name);
   if (existing) return existing;
-  const created = createRateLimiter(RULES[name]);
+  const created = createRateLimiter(RULES[name], name);
   limiters.set(name, created);
   return created;
+}
+
+/** Honest report for the status hub: where the counters really live. */
+export function rateLimitStorage() {
+  return { store: "database" as const, table: "rate_limit_hits", rules: Object.fromEntries(Object.entries(RULES).map(([name, rule]) => [name, rule.max])) };
 }

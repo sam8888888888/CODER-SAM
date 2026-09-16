@@ -258,18 +258,42 @@ if (adminAccountIsPlatformAdmin && platformAdmins <= 1) {
 } else {
   skip("8) akun satu-satunya admin platform -> 409 LAST_ADMIN", `akun uji bukan admin platform tunggal (admin=${adminAccountIsPlatformAdmin}, jumlah_admin_di_db=${platformAdmins}, status=${lastAdminAttempt.status})`);
 }
-// Tambahkan admin kedua lewat DB supaya penghapusan akun uji bisa berhasil.
+// Tambahkan admin kedua lewat DB supaya penutupan akun uji bisa berhasil.
 db.prepare("UPDATE users SET is_admin=1 WHERE id=?").run(ownerReg.json.user.id);
-// Platform admin = is_admin=1 atau email di PLATFORM_ADMIN_EMAILS (rumus sama seperti server).
 check("8) admin platform kedua disiapkan lewat DB sementara", platformAdminCount() >= 2, `jumlah_admin=${platformAdminCount()}`);
+// Wave 8: akun hanya boleh ditutup setelah pemiliknya mengambil salinan datanya.
+const noExport = await extra.call("DELETE", "/api/v1/auth/account", { password, confirm: "HAPUS AKUN" });
+check("8) tanpa ekspor -> 409 EXPORT_REQUIRED", noExport.status === 409 && noExport.json?.error === "EXPORT_REQUIRED", JSON.stringify(noExport.json));
+const dibuatEkspor = await extra.call("POST", "/api/v1/account/export");
+check("8) ekspor data dibuat lewat API", (dibuatEkspor.status === 201 || dibuatEkspor.status === 200) && Boolean(dibuatEkspor.json?.export?.id), JSON.stringify(dibuatEkspor.json)?.slice(0, 160));
+const eksporLama = db.prepare("SELECT created_at AS createdAt FROM data_exports WHERE user_id=?").get(adminReg.json.user.id) as { createdAt: string } | undefined;
+db.prepare("UPDATE data_exports SET created_at=? WHERE user_id=?").run(new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(), adminReg.json.user.id);
+const tooOld = await extra.call("DELETE", "/api/v1/auth/account", { password, confirm: "HAPUS AKUN" });
+check("8) ekspor lebih dari 24 jam -> 409 EXPORT_TOO_OLD", tooOld.status === 409 && tooOld.json?.error === "EXPORT_TOO_OLD", JSON.stringify(tooOld.json));
+db.prepare("UPDATE data_exports SET created_at=? WHERE user_id=?").run(eksporLama?.createdAt ?? new Date().toISOString(), adminReg.json.user.id);
 const accountDeleted = await extra.call("DELETE", "/api/v1/auth/account", { password, confirm: "HAPUS AKUN" });
-check("8) frasa dan kata sandi benar -> 200 {ok:true}", accountDeleted.status === 200 && accountDeleted.json?.ok === true, JSON.stringify(accountDeleted.json));
+check("8) frasa, kata sandi, dan ekspor benar -> 200 {ok:true}", accountDeleted.status === 200 && accountDeleted.json?.ok === true, JSON.stringify(accountDeleted.json));
+check("8) balasan memuat masa pemulihan 90 hari", accountDeleted.json?.recoveryDays === 90 && typeof accountDeleted.json?.purgeAfter === "string", JSON.stringify(accountDeleted.json));
 check("8) cookie sesi dibersihkan pada respons", /coder_session=\s*;/.test(String(accountDeleted.setCookie ?? "")) && String(accountDeleted.setCookie).toLowerCase().includes("expires=thu, 01 jan 1970"), String(accountDeleted.setCookie));
 const staleMe = await fetch(`${base}/api/v1/auth/me`, { headers: { cookie: extra.staleCookie() } });
 check("8) cookie sesi lama tidak berlaku lagi pada GET /auth/me (401)", staleMe.status === 401, String(staleMe.status));
 const meWithoutSession = await extra.call("GET", "/api/v1/auth/me");
 check("8) GET /auth/me tanpa sesi -> 401", meWithoutSession.status === 401, JSON.stringify(meWithoutSession.json));
-check("8) bukti DB: baris user akun uji sudah hilang", (db.prepare("SELECT COUNT(*) AS total FROM users WHERE id=?").get(adminReg.json.user.id) as { total: number }).total === 0, "");
+// Wave 8: baris pengguna TIDAK langsung dihapus. Baris tetap ada sebagai arsip masa pemulihan.
+const closedRow = db.prepare("SELECT deleted_at AS deletedAt, purge_after AS purgeAfter FROM users WHERE id=?").get(adminReg.json.user.id) as { deletedAt: string | null; purgeAfter: string | null } | undefined;
+check("8) bukti DB: baris user masih ada tetapi bertanda deleted_at", Boolean(closedRow?.deletedAt), JSON.stringify(closedRow));
+const selisihHari = closedRow?.purgeAfter && closedRow?.deletedAt ? Math.round((Date.parse(closedRow.purgeAfter) - Date.parse(closedRow.deletedAt)) / 86_400_000) : -1;
+check("8) jarak deleted_at ke purge_after tepat 90 hari", selisihHari === 90, String(selisihHari));
+const loginClosed = await extra.call("POST", "/api/v1/auth/login", { email: "delete-flow-admin@example.test", password });
+check("8) akun yang ditutup tidak bisa masuk -> 403 ACCOUNT_DELETED", loginClosed.status === 403 && loginClosed.json?.error === "ACCOUNT_DELETED", JSON.stringify(loginClosed.json));
+const closeAgain = await extra.call("DELETE", "/api/v1/auth/account", { password, confirm: "HAPUS AKUN" });
+check("8) permintaan kedua ditolak 401 karena sesi sudah hilang", closeAgain.status === 401, JSON.stringify(closeAgain.json));
+const adminRestore = await owner.call("POST", `/api/v1/admin/users/${adminReg.json.user.id}/restore`);
+check("8) admin memulihkan akun -> 200 {ok:true}", adminRestore.status === 200 && adminRestore.json?.ok === true, JSON.stringify(adminRestore.json));
+const restoredRow = db.prepare("SELECT deleted_at AS deletedAt, purge_after AS purgeAfter FROM users WHERE id=?").get(adminReg.json.user.id) as { deletedAt: string | null; purgeAfter: string | null } | undefined;
+check("8) bukti DB: tanda tutup sudah dibersihkan setelah pemulihan", restoredRow?.deletedAt === null && restoredRow?.purgeAfter === null, JSON.stringify(restoredRow));
+const loginRestored = await extra.call("POST", "/api/v1/auth/login", { email: "delete-flow-admin@example.test", password });
+check("8) akun yang dipulihkan bisa masuk lagi -> 200", loginRestored.status === 200, JSON.stringify(loginRestored.json));
 
 // ------------------------------------------------------------------ ringkasan
 console.log(`RINGKASAN cek: lulus=${passed} gagal=${failed} skip=${skipped.length}`);

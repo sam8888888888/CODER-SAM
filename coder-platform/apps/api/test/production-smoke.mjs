@@ -506,5 +506,42 @@ check("wave7 status hub reports the referral programme and the event count",
   JSON.stringify(hubW7.json?.openPlatform?.referrals)?.slice(0, 200));
 console.log(`INFO wave7 growth: codes=${hubW7.json?.openPlatform?.referrals?.codes} total=${hubW7.json?.openPlatform?.referrals?.total} rewarded=${hubW7.json?.openPlatform?.referrals?.rewarded} events=${hubW7.json?.openPlatform?.growthEvents} quota=${quota.json?.level}(${quota.json?.percent}%)`);
 
+// ------------------------------------------------------------------ Wave 8 (v0.18.0)
+// Batas laju disimpan di basis data, akun punya masa pemulihan 90 hari, verifikasi email dijaga.
+const hubW8 = await call("GET", "/api/v1/status-hub");
+check("wave8 the rate limiter counters live in the database, not in process memory",
+  String(hubW8.json?.openPlatform?.rateLimits?.store) === "database" && String(hubW8.json?.openPlatform?.rateLimits?.table) === "rate_limit_hits",
+  JSON.stringify(hubW8.json?.openPlatform?.rateLimits)?.slice(0, 200));
+check("wave8 every rate limit rule is reported as a number",
+  ["login", "register", "password", "api", "referral"].every((name) => Number.isFinite(Number(hubW8.json?.openPlatform?.rateLimits?.rules?.[name]))),
+  JSON.stringify(hubW8.json?.openPlatform?.rateLimits?.rules));
+check("wave8 a closed account keeps a 90 day recovery window",
+  Number(hubW8.json?.openPlatform?.closedAccounts?.recoveryDays) === 90
+  && typeof hubW8.json?.openPlatform?.closedAccounts?.waiting === "number"
+  && typeof hubW8.json?.openPlatform?.closedAccounts?.due === "number",
+  JSON.stringify(hubW8.json?.openPlatform?.closedAccounts));
+check("wave8 the email verification gate reports its mode honestly",
+  ["auto", "on", "off"].includes(String(hubW8.json?.security?.verifyEmailMode))
+  && typeof hubW8.json?.security?.verifyEmailRequired === "boolean",
+  JSON.stringify({ mode: hubW8.json?.security?.verifyEmailMode, required: hubW8.json?.security?.verifyEmailRequired }));
+const meW8 = await call("GET", "/api/v1/auth/me");
+check("wave8 the signed in profile reports email state and account state",
+  meW8.status === 200 && typeof meW8.json?.user?.emailVerified === "boolean" && meW8.json?.user?.accountClosed === false,
+  JSON.stringify(meW8.json?.user));
+check("wave8 production runs with mail enabled, so the verification gate is on and the smoke account is verified",
+  hubW8.json?.security?.verifyEmailRequired === true && meW8.json?.user?.emailVerified === true,
+  JSON.stringify({ required: hubW8.json?.security?.verifyEmailRequired, verified: meW8.json?.user?.emailVerified }));
+const exportsW8 = await call("GET", "/api/v1/account/exports");
+check("wave8 the account export list answers with an array", exportsW8.status === 200 && Array.isArray(exportsW8.json?.exports), JSON.stringify(exportsW8.json)?.slice(0, 160));
+const closeNoExport = await call("DELETE", "/api/v1/auth/account", { password: "SandiSalahSekali2026!", confirm: "hapus" });
+check("wave8 closing the account without the exact phrase is refused and changes nothing",
+  closeNoExport.status === 400 && closeNoExport.json?.error === "CONFIRM_REQUIRED",
+  JSON.stringify(closeNoExport.json));
+const closeBadPassword = await call("DELETE", "/api/v1/auth/account", { password: "SandiSalahSekali2026!", confirm: "HAPUS AKUN" });
+check("wave8 a wrong password never closes an account", closeBadPassword.status === 403 && closeBadPassword.json?.error === "INVALID_PASSWORD", JSON.stringify(closeBadPassword.json));
+const stillMe = await call("GET", "/api/v1/auth/me");
+check("wave8 the smoke account is untouched after the close attempts", stillMe.status === 200 && stillMe.json?.user?.email === meW8.json?.user?.email, JSON.stringify(stillMe.json?.user));
+console.log(`INFO wave8 limits=${JSON.stringify(hubW8.json?.openPlatform?.rateLimits?.rules)} closedWaiting=${hubW8.json?.openPlatform?.closedAccounts?.waiting} closedDue=${hubW8.json?.openPlatform?.closedAccounts?.due} verifyMode=${hubW8.json?.security?.verifyEmailMode} verifyRequired=${hubW8.json?.security?.verifyEmailRequired} verified=${meW8.json?.user?.emailVerified}`);
+
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);
