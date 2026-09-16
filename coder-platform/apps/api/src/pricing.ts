@@ -65,6 +65,20 @@ export function setPricingMarkup(markup: number, actorId?: string | null): Prici
   return pricingSettings();
 }
 
+/**
+ * Housekeeping step run once at start up. Usage rows written by an older release have no billed
+ * amount, because the column did not exist yet. If such a database is restored from a backup the
+ * price console would report zero revenue and a negative margin, so the missing amounts are filled
+ * in from the stored upstream cost. Only rows with no value at all are touched, which makes the step
+ * safe to repeat on every start.
+ */
+export function backfillSellCosts(): number {
+  const markup = pricingSettings().markup;
+  const runs = db.prepare("UPDATE run_usage SET sell_cost_micros = CAST(ROUND(COALESCE(cost_micros,0) * ?) AS INTEGER) WHERE sell_cost_micros IS NULL").run(markup);
+  const users = db.prepare("UPDATE user_usage SET sell_cost_micros = CAST(ROUND(COALESCE(cost_micros,0) * ?) AS INTEGER) WHERE sell_cost_micros IS NULL").run(markup);
+  return Number(runs.changes) + Number(users.changes);
+}
+
 /* --------------------------------------------------------------- prices */
 
 let overrideCache: Map<string, PriceNumbers & { updatedAt: string; updatedBy: string | null }> | null = null;

@@ -6,7 +6,7 @@ import { extname, join, normalize, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
-import { catalogPriceFor, clearPriceOverride, priceView, pricingSettings, pricingTable, quoteCosts, savePriceOverride, sellForBaseMicros, setPricingMarkup, validatePrice } from "./pricing.js";
+import { backfillSellCosts, catalogPriceFor, clearPriceOverride, priceView, pricingSettings, pricingTable, quoteCosts, savePriceOverride, sellForBaseMicros, setPricingMarkup, validatePrice } from "./pricing.js";
 import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
 import { extractText } from "./text-extract.js";
 import { generateTotpSecret, otpAuthUrl, verifyTotp } from "./totp.js";
@@ -3948,6 +3948,12 @@ function startBackgroundWork() {
 
 startBackgroundWork();
 ensureCommerceSeed();
+// Billed amounts written before the price column existed are filled in, so a database restored from
+// an older backup does not report zero revenue and a negative margin in the price console.
+{
+  const filled = backfillSellCosts();
+  if (filled > 0) console.log(`[pricing] harga jual baris lama dilengkapi: ${filled} baris`);
+}
 if (config.WORKER_ONLY) {
   // The dedicated worker container must never listen: nginx points at the API container only.
   console.log("[worker] HTTP tidak dijalankan (WORKER_ONLY=true); proses ini hanya mengerjakan antrean");

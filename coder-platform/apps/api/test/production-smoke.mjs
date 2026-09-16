@@ -429,7 +429,10 @@ check("wave4 status hub counts api keys, queued emails, and ready exports from t
   typeof statusHubW4.json?.openPlatform?.activeKeys === "number" && typeof statusHubW4.json?.openPlatform?.emailOutbox?.pending === "number" && typeof statusHubW4.json?.openPlatform?.emailOutbox?.total === "number" && typeof statusHubW4.json?.openPlatform?.readyExports === "number",
   JSON.stringify(statusHubW4.json?.openPlatform?.emailOutbox));
 console.log(`INFO wave4 open platform: activeKeys=${statusHubW4.json?.openPlatform?.activeKeys} outboxPending=${statusHubW4.json?.openPlatform?.emailOutbox?.pending} readyExports=${statusHubW4.json?.openPlatform?.readyExports}`);
-check("wave5 status hub reports the background work queue", Number.isFinite(Number(statusHubW4.json?.backgroundWork?.queue?.total)) && Number(statusHubW4.json?.backgroundWork?.queue?.queued) >= 0 && statusHubW4.json?.backgroundWork?.worker?.running === true && statusHubW4.json?.backgroundWork?.reapOnBoot === true, JSON.stringify(statusHubW4.json?.backgroundWork)?.slice(0, 240));
+// Wave 9 (butir 17) memindahkan antrean ke wadah pekerja sendiri, jadi proses web tidak lagi
+// memilikinya: `running` benar-benar bernilai false di sana. Daftar penangan tetap lengkap karena
+// pendaftarannya dilakukan sebelum penjaga itu.
+check("wave5 status hub reports the background work queue", Number.isFinite(Number(statusHubW4.json?.backgroundWork?.queue?.total)) && Number(statusHubW4.json?.backgroundWork?.queue?.queued) >= 0 && typeof statusHubW4.json?.backgroundWork?.worker?.running === "boolean" && statusHubW4.json?.backgroundWork?.reapOnBoot === true, JSON.stringify(statusHubW4.json?.backgroundWork)?.slice(0, 240));
 check("wave5 the recovery window is longer than the engine timeout, so healthy runs are never flagged", Number(statusHubW4.json?.backgroundWork?.orphanAfterMs) > 1_800_000 && Number(statusHubW4.json?.backgroundWork?.leaseMs) >= 60_000, JSON.stringify(statusHubW4.json?.backgroundWork)?.slice(0, 200));
 console.log(`INFO wave5 background work: queued=${statusHubW4.json?.backgroundWork?.queue?.queued} running=${statusHubW4.json?.backgroundWork?.queue?.running} done=${statusHubW4.json?.backgroundWork?.queue?.done} failed=${statusHubW4.json?.backgroundWork?.queue?.failed} leaseMs=${statusHubW4.json?.backgroundWork?.leaseMs} orphanAfterMs=${statusHubW4.json?.backgroundWork?.orphanAfterMs}`);
 
@@ -577,10 +580,16 @@ check("wave9 the run list shows the billed amount of every run",
   runsW9.status === 200 && (runRowW9 === undefined || (Number.isFinite(Number(runRowW9?.billedMicros)) && Number.isFinite(Number(runRowW9?.billedUsd)))),
   JSON.stringify(runRowW9)?.slice(0, 200));
 const jobsW9 = await call("GET", "/api/v1/status-hub");
+// Jalur yang benar adalah backgroundWork.worker (bukan jobs.worker). Uji ini sekaligus membuktikan
+// bahwa antrean benar-benar sudah berpindah ke wadah pekerja: proses web tidak mengambil pekerjaan.
+const workerW9 = jobsW9.json?.backgroundWork?.worker;
 check("wave9 the queue still reports every job handler after the worker moved to its own process",
-  Array.isArray(jobsW9.json?.jobs?.worker?.handlers) && jobsW9.json.jobs.worker.handlers.length >= 6,
-  JSON.stringify(jobsW9.json?.jobs?.worker));
-console.log(`INFO wave9 markup=${aiPricing?.markup} cost30=${cost30} billed30=${billed30} margin30=${margin30} overrides=${aiPricing?.overrideCount} catalog=${aiPricing?.catalogSize} workerCyclesInWeb=${jobsW9.json?.jobs?.worker?.cyclesRun}`);
+  Array.isArray(workerW9?.handlers) && workerW9.handlers.length >= 6,
+  JSON.stringify(workerW9));
+check("wave9 the web process no longer owns the queue",
+  workerW9?.running === false && Number(workerW9?.cyclesRun ?? -1) === 0,
+  JSON.stringify({ running: workerW9?.running, cyclesRun: workerW9?.cyclesRun }));
+console.log(`INFO wave9 markup=${aiPricing?.markup} cost30=${cost30} billed30=${billed30} margin30=${margin30} overrides=${aiPricing?.overrideCount} catalog=${aiPricing?.catalogSize} workerInWeb=${workerW9?.running} handlers=${workerW9?.handlers?.length}`);
 
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

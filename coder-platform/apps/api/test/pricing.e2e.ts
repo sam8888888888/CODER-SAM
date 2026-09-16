@@ -13,7 +13,9 @@
  *     harga jual di `sell_cost_micros = ROUND(cost_micros x markup)`;
  *  6) rute admin harga hanya untuk admin platform (403 ADMIN_REQUIRED untuk pengguna biasa);
  *  7) `GET /api/v1/status-hub` memuat blok `aiPricing`;
- *  8) `validatePrice` menolak angka negatif/bukan angka dan menerima 0.
+ *  8) `validatePrice` menolak angka negatif/bukan angka dan menerima 0;
+ *  9) `backfillSellCosts` melengkapi baris lama yang belum punya harga jual (kasus basis data yang
+ *     dipulihkan dari cadangan rilis lama) dan aman dijalankan berulang.
  *
  * Jalankan: npx tsx apps/api/test/pricing.e2e.ts
  */
@@ -53,6 +55,7 @@ const { MODEL_PRICES, priceForModel } = await import("../src/model-prices.js");
 const {
   pricingSettings, setPricingMarkup, priceView, quoteCosts, sellForBaseMicros,
   validatePrice, savePriceOverride, clearPriceOverride, overrideCount, usageByModel, pricingTable,
+  backfillSellCosts,
 } = await import("../src/pricing.js");
 
 await new Promise((resolve) => setTimeout(resolve, 1200));
@@ -382,6 +385,30 @@ if (usageRow) {
   check("9) pada markup 1, harga jual = harga pokok pada baris nyata", Number(finalRow?.sellCostMicros) === Number(finalRow?.costMicros), JSON.stringify(finalRow));
   check("9) harga pokok tetap sama setelah seluruh perubahan markup", Number(finalRow?.costMicros) === Number(usageRow.costMicros), JSON.stringify(finalRow));
   console.log(`INFO setelah markup 1: cost_micros=${finalRow?.costMicros} sell_cost_micros=${finalRow?.sellCostMicros}`);
+}
+
+// ------------------------------------------------------------------ 10) pelengkapan baris lama
+// Baris yang ditulis sebelum kolom harga jual ada tidak punya nilainya. Bila basis data dipulihkan
+// dari cadangan rilis lama, konsol akan melaporkan pendapatan nol dan margin negatif. Pelengkapan
+// hanya menyentuh baris kosong, jadi aman diulang setiap aplikasi menyala.
+if (usageRow) {
+  const backfillMarkup = pricingSettings().markup;
+  const backfillId = `w9-backfill-${stamp}`;
+  const backfillCost = 4321;
+  db.prepare(`INSERT INTO run_usage (id, run_id, project_id, model, provider, input_tokens, output_tokens, total_tokens, cost_micros, estimated, created_at, sell_cost_micros)
+    VALUES (?,?,?,?,?,?,?,?,?,0,?,NULL)`)
+    .run(backfillId, usageRow.runId, projectId, RUN_MODEL, "mock", 100, 50, 150, backfillCost, new Date().toISOString());
+  const kosong = scalar<{ sell: number | null }>("SELECT sell_cost_micros AS sell FROM run_usage WHERE id=?", backfillId);
+  check("10) baris lama tanpa harga jual memang kosong", kosong?.sell === null, JSON.stringify(kosong));
+  const diisi = backfillSellCosts();
+  check("10) pelengkapan mengisi baris kosong", diisi >= 1, `baris diisi=${diisi}`);
+  const terisi = scalar<{ sell: number | null }>("SELECT sell_cost_micros AS sell FROM run_usage WHERE id=?", backfillId);
+  check("10) harga jual terisi = harga pokok x markup", Number(terisi?.sell) === Math.round(backfillCost * backfillMarkup), `sell=${terisi?.sell} markup=${backfillMarkup}`);
+  const ulang = backfillSellCosts();
+  check("10) pelengkapan aman diulang (tidak menyentuh baris terisi)", ulang === 0, `baris=${ulang}`);
+  db.prepare("DELETE FROM run_usage WHERE id=?").run(backfillId);
+} else {
+  skip("10) pelengkapan baris lama tanpa harga jual", "baris run_usage nyata tidak tersedia");
 }
 
 // ------------------------------------------------------------------ ringkasan
