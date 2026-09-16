@@ -50,7 +50,9 @@ await new Promise((resolve) => setTimeout(resolve, 1200));
 // Putaran pekerjaan pertama berjalan sendiri saat server menyala dan ia MENJADWALKAN pekerjaan
 // retensi berkala. Uji ini harus menunggu putaran itu selesai dulu; kalau tidak, pekerjaan
 // berkala yang menghapus akun kedaluwarsa bisa berlomba dengan data uji yang baru disiapkan.
-for (let attempt = 0; attempt < 120; attempt += 1) {
+// Batas tunggu 40 detik > selang pekerja (15 detik) supaya putaran berkala berikutnya pasti
+// sempat menyelesaikan pekerjaan retensi walau putaran pertama belum sempat mengambilnya.
+for (let attempt = 0; attempt < 200; attempt += 1) {
   const scheduled = db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE kind='retention.run' AND status IN ('queued','running')").get() as { n: number };
   if (jobWorkerState().cyclesRun >= 1 && Number(scheduled?.n ?? 0) === 0) break;
   await new Promise((resolve) => setTimeout(resolve, 100));
@@ -92,8 +94,9 @@ const admin = client(); const owner = client(); const heir = client(); const ano
 const tableCount = (sql: string, ...params: unknown[]) => Number((db.prepare(sql).get(...params as any[]) as { n: number }).n ?? 0);
 
 // ------------------------------------------------------------------ 1) skema 16
+const { SCHEMA_VERSION } = await import("../src/db.js");
 const version = Number((db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v);
-check("1) skema basis data versi 16", version === 16, String(version));
+check(`1) skema basis data versi ${SCHEMA_VERSION}`, version === SCHEMA_VERSION, String(version));
 const rlTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='rate_limit_hits'").get() as { name: string } | undefined;
 check("1) tabel rate_limit_hits ada", rlTable?.name === "rate_limit_hits", JSON.stringify(rlTable));
 const rlCols = (db.prepare("PRAGMA table_info(rate_limit_hits)").all() as { name: string }[]).map((row) => row.name);

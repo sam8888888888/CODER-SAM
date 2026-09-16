@@ -237,7 +237,10 @@ export function ensureRecurringJobs(now: Date = new Date()): string[] {
     const lastAt = last?.value ? new Date(String(last.value)).getTime() : 0;
     if (lastAt && now.getTime() - lastAt < entry.intervalMs) continue;
     const bucket = Math.floor(now.getTime() / entry.intervalMs);
-    const queued = enqueueJob({ kind: entry.kind, payload: entry.payload ?? {}, maxAttempts: entry.maxAttempts ?? 3, dedupeKey: `${entry.kind}:${bucket}` });
+    // Penting: pekerjaan berkala diberi runAfter = waktu acuan putaran ini, bukan "sekarang".
+    // Tanpa itu, jam pekerjaan sedikit di depan jam putaran (selisih milidetik) sehingga
+    // pekerjaan yang baru dijadwalkan tidak ikut diambil di putaran yang sama.
+    const queued = enqueueJob({ kind: entry.kind, payload: entry.payload ?? {}, maxAttempts: entry.maxAttempts ?? 3, dedupeKey: `${entry.kind}:${bucket}`, runAfter: now });
     if (queued.queued) created.push(entry.kind);
   }
   return created;

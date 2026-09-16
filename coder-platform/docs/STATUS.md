@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 16 Sep 2026 (versi 0.18.0, Wave 8: akun, keamanan masuk, dan batas laju)
+Terakhir diperbarui: 16 Sep 2026 (versi 0.19.0, Wave 9: deploy tanpa henti, antrean di proses sendiri, gerbang migrasi, harga jual AI)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -15,6 +15,48 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
 
+Wave 9 (v0.19.0, 16 Sep 2026) — jawaban butir 16–20, semuanya di kode dan diuji:
+
+- **Deploy tanpa berhenti layanan (butir 16)**: `docker-compose.austria.yml` kini memakai satu anchor
+  `x-app` untuk tiga layanan: `coder-platform-app` (biru, 127.0.0.1:3402),
+  `coder-platform-app-green` (hijau, 127.0.0.1:3403, profil `green`), dan `coder-platform-worker`.
+  `deploy/deploy-austria.sh` menjalankan tiga gerbang berurutan: rehearsal migrasi (butir 18),
+  tukar hijau-biru lewat `point_nginx` + `wait_ready`, lalu pembuatan ulang wadah antrean (butir 17).
+  Volume baru `coder-platform-engine-sessions` dipasang ke `/app/engine-sessions` (`ENGINE_ROOT_DIR`),
+  jadi sesi mesin tidak lagi hilang setiap deploy dan bisa dipakai bersama biru, hijau, dan worker.
+  Bila pola `proxy_pass http://127.0.0.1:34xx` tidak ada di berkas nginx, skrip mencetak
+  `ZERO_DOWNTIME_SKIPPED` dan memakai cara lama; bila hijau tidak siap, skrip berhenti dengan
+  `DEPLOY_BLOCKED` dan trafik tidak pernah diarahkan ke proses yang belum siap.
+- **Antrean di proses sendiri (butir 17)**: `apps/api/src/worker.ts` menyalakan `WORKER_ONLY=true`
+  dan `JOB_WORKER_IN_WEB=true` sebelum memuat `server.js`, jadi penangan pekerjaan tetap satu
+  implementasi tetapi proses ini tidak membuka HTTP. `config.ts` menambah `JOB_WORKER_IN_WEB`
+  (bawaan true, produksi false) dan `WORKER_ONLY`. Healthcheck wadah worker dimatikan dan diganti
+  denyut log tiap 30 detik. Uji `worker-split.e2e.ts`: 17/17 lulus.
+- **Gerbang migrasi tiap deploy (butir 18)**: `apps/api/src/migration-rehearsal.ts` ikut terkompilasi
+  ke `dist/api` sehingga ada di dalam citra. Dipakai dua tempat: gerbang pertama `run-all.cjs`
+  (`npm run verify`) dan gerbang pertama `deploy-austria.sh` (wadah sekali pakai berisi citra BARU,
+  hanya volume cadangan yang dipasang baca-saja; kegagalan → `DEPLOY_ABORTED` sebelum apa pun
+  diganti). Pemeriksaannya: versi skema, tabel dan kolom wajib, jumlah baris 24 tabel penting tidak
+  berubah, `PRAGMA integrity_check`, kunci asing, dua sisipan percobaan (satu dibatalkan), dan
+  idempotensi dengan membuka berkas yang sama di proses kedua.
+- **Harga AI bisa dijual lagi (butir 19)**: kolom `cost_micros` tetap harga pokok dari penyedia dan
+  TIDAK pernah disentuh markup; kolom baru `sell_cost_micros` = `round(cost_micros x markup)` adalah
+  jumlah yang ditagihkan. Markup global disimpan di `platform_settings` (key `ai_pricing`, bawaan 1,
+  rentang 0,1–100); harga per model bisa ditimpa lewat tabel `model_price_overrides`. Rute admin:
+  `GET /api/v1/admin/pricing`, `PUT .../pricing/settings`, `PUT/DELETE/GET .../pricing/models/:model`.
+  Halaman baru "Harga AI" di dashboard menampilkan ringkasan, pengatur markup, pencarian model,
+  saringan semua/dipakai/harga sendiri, dan editor harga per model dengan pesan galat Indonesia.
+  Uji `pricing.e2e.ts`: 130 lulus / 0 gagal / 0 lewat; `render-check-wave9.tsx`:
+  `ALL_WAVE9_PAGES_RENDERED`.
+- **Pengatur waktu TLS diperiksa (butir 20)**: `certbot.timer` aktif, sertifikat berlaku ±85 hari,
+  `certbot renew --dry-run` melaporkan semua pembaruan simulasi berhasil. Tidak ada perubahan.
+- Skema basis data: **17**.
+- Empat bug nyata diperbaiki: `catalog` pada konsol harga memakai harga override; `sell_cost_micros`
+  terisi nilai markup bukan hasil kali; pengatur waktu `startJobWorker()` di-`unref` sehingga worker
+  tanpa HTTP keluar sendiri; pekerjaan berkala dijadwalkan beberapa milidetik di depan waktu acuan
+  putaran sehingga tidak ikut diambil pada putaran yang sama (ini yang membuat `wave8.e2e.ts`
+  sesekali berlomba dengan pekerjaan retensi).
+- Dokumen: `docs/PLAN_WAVE_9.md`.
 Wave 8 (v0.18.0, 16 Sep 2026) — jawaban butir 6–15, semuanya di kode dan diuji:
 - **Akun bisa ditutup sendiri (butir 6)**: `DELETE /api/v1/auth/account` kini penutupan lunak wajib
   ekspor (`409 EXPORT_REQUIRED` bila belum ada ekspor ≤24 jam, `409 EXPORT_TOO_OLD` bila lebih tua),

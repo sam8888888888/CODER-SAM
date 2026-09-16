@@ -1,22 +1,57 @@
+# COBLAI Coder, production compose (Austria).
+#
+# Wave 9 (item 16 + 17) changed the shape of this file:
+#  - one shared anchor defines the application image, so blue and green can never drift apart;
+#  - `coder-platform-app-green` is the second copy used during a deploy, so the live copy can be
+#    replaced while nginx serves the other one (no downtime);
+#  - `coder-platform-worker` runs the durable queue in its own container, so a long job never delays
+#    an HTTP request. The API then runs with JOB_WORKER_IN_WEB=false (see .env.austria.example).
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile.austria
+  image: coder-platform-app:0.1.1
+  restart: unless-stopped
+  env_file:
+    - .env
+  volumes:
+    - coder-platform-data:/app/data
+    - coder-platform-backups:/app/backups
+    - coder-agent-data:/root/.prime
+    - coder-platform-workspace:/workspace
+    # Shared with the worker container: an engine session started by one process can be resumed by
+    # the other, and a deploy no longer throws the session files away.
+    - coder-platform-engine-sessions:/app/engine-sessions
+  networks:
+    - coder-net
+
 services:
+  # The live copy. nginx points here (127.0.0.1:3402) outside a deploy window.
   coder-platform-app:
-    build:
-      context: .
-      dockerfile: Dockerfile.austria
-    image: coder-platform-app:0.1.1
+    <<: *app
     container_name: coder-platform-app
-    restart: unless-stopped
-    env_file:
-      - .env
     ports:
       - "127.0.0.1:3402:3402"
-    volumes:
-      - coder-platform-data:/app/data
-      - coder-platform-backups:/app/backups
-      - coder-agent-data:/root/.prime
-      - coder-platform-workspace:/workspace
-    networks:
-      - coder-net
+
+  # The standby copy. It is only started during a deploy (`docker compose --profile green up -d
+  # coder-platform-app-green`), serves on 3403, and is stopped again when the switch is complete.
+  coder-platform-app-green:
+    <<: *app
+    container_name: coder-platform-app-green
+    ports:
+      - "127.0.0.1:3403:3402"
+    profiles:
+      - green
+
+  # The queue. Same image, no HTTP listener (`node dist/api/worker.js`), no published port.
+  coder-platform-worker:
+    <<: *app
+    container_name: coder-platform-worker
+    command: ["node", "dist/api/worker.js"]
+    # The image health check calls /health over HTTP; this container has no HTTP, so the check is off
+    # and liveness is read from its own heartbeat line in the logs instead.
+    healthcheck:
+      disable: true
 
 volumes:
   coder-platform-data:
@@ -28,6 +63,8 @@ volumes:
     name: coder-agent-data
   coder-platform-workspace:
     name: coder-platform-workspace
+  coder-platform-engine-sessions:
+    name: coder-platform-engine-sessions
 
 networks:
   coder-net:

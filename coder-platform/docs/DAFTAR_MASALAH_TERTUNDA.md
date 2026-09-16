@@ -3,7 +3,7 @@
 Dikumpulkan atas perintah Bapak: "SEMUA MASALAH DAN YANG BELUM BERES, DIKUMPULKAN,
 NANTI TERAKHIR KITA BERESKAN SATU PER SATU."
 
-Versi platform saat daftar ini diperbarui: **v0.18.0 (Wave 8 — akun, keamanan masuk, dan batas laju tahan restart)**.
+Versi platform saat daftar ini diperbarui: **v0.19.0 (Wave 9 — deploy tanpa henti, antrean di proses sendiri, gerbang migrasi, harga jual AI)**.
 Legenda status: [BAPAK] butuh keputusan/izin Bapak · [TEKNIS] pekerjaan teknis yang bisa saya kerjakan ·
 [FITUR] fitur yang belum ada · [RISIKO] temuan yang berpotensi berbahaya.
 
@@ -40,6 +40,18 @@ Keputusan Bapak untuk butir 6-15 sudah diterima dan dikerjakan sebagai Wave 8 (v
 | 15 | Batas laju pindah ke basis data | SELESAI (kode + uji) | tabel `rate_limit_hits`, kunci berawalan nama aturan, jendela geser, sapuan tiap menit; `status-hub.openPlatform.rateLimits.store = "database"`; `wave8.e2e.ts` bagian 1-2 |
 
 Rincian lengkap: `docs/PLAN_WAVE_8.md`.
+
+Keputusan Bapak untuk butir 16-20 sudah diterima dan dikerjakan sebagai Wave 9 (v0.19.0):
+
+| Butir | Keputusan Bapak | Status | Bukti |
+|-------|-----------------|--------|-------|
+| 16 | `--force-recreate` diizinkan; tanpa henti layanan boleh dicoba | SELESAI (kode + uji) | `docker-compose.austria.yml` memakai satu anchor `x-app` untuk biru (3402), hijau (3403, profil `green`), dan worker; `deploy/deploy-austria.sh` menjalankan `point_nginx` + `wait_ready`; kalau pola nginx tidak ada → `ZERO_DOWNTIME_SKIPPED` dan kembali ke cara lama; log deploy memuat `READY 3403`, `NGINX_POINTED 3403`, `NGINX_POINTED 3402`, `ZERO_DOWNTIME_DONE`; volume baru `coder-platform-engine-sessions` membuat sesi mesin bertahan lintas deploy |
+| 17 | Antrean di proses sendiri boleh, asal rapi | SELESAI (kode + uji) | `apps/api/src/worker.ts` + `JOB_WORKER_IN_WEB`/`WORKER_ONLY` di `config.ts`; wadah `coder-platform-worker` menjalankan `node dist/api/worker.js` tanpa port; `apps/api/test/worker-split.e2e.ts` 17/17 lulus (`ALL_WORKER_SPLIT_TESTS_PASSED`) |
+| 18 | Alat periksa migrasi boleh jalan tiap deploy, harus benar | SELESAI (kode + uji) | `apps/api/src/migration-rehearsal.ts` ada di dalam citra; dijalankan atas cadangan produksi terbaru di wadah sekali pakai (volume data hidup TIDAK dipasang); gagal → `DEPLOY_ABORTED`; `migration-check.ts` jadi pembungkus tipis dan gerbang pertama `run-all.cjs`; dua mode lulus (`MIGRATION_REHEARSAL_OK`, `INTEGRITY_CHECK ok`, `ROW_COUNTS_PRESERVED true`, `REOPEN_IDEMPOTENT true`) |
+| 19 | Kolom harga asli per 1 juta token + faktor markup | SELESAI (kode + uji + PRODUKSI) | `apps/api/src/pricing.ts`; `cost_micros` = harga pokok (tidak pernah disentuh markup), `sell_cost_micros` = `round(cost x markup)`; rute `GET/PUT/DELETE /api/v1/admin/pricing[...]`; halaman `Harga AI` di dashboard; `pricing.e2e.ts` 130 lulus / 0 gagal / 0 lewat; `render-check-wave9.tsx` `ALL_WAVE9_PAGES_RENDERED`; blok `aiPricing` di smoke produksi |
+| 20 | Periksa dan uji pengatur waktu pembaruan TLS | SELESAI (diperiksa) | `systemctl is-active certbot.timer` = `active`; sertifikat berlaku ±85 hari; `certbot renew --dry-run` = "all simulated renewals succeeded"; tidak ada perubahan konfigurasi |
+
+Rincian lengkap: `docs/PLAN_WAVE_9.md`.
 
 ## 1. MENUNGGU KEPUTUSAN BAPAK
 

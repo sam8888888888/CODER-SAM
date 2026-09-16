@@ -6,7 +6,7 @@ import { extname, join, normalize, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
-import { estimateCostMicros } from "./model-prices.js";
+import { catalogPriceFor, clearPriceOverride, priceView, pricingSettings, pricingTable, quoteCosts, savePriceOverride, sellForBaseMicros, setPricingMarkup, validatePrice } from "./pricing.js";
 import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
 import { extractText } from "./text-extract.js";
 import { generateTotpSecret, otpAuthUrl, verifyTotp } from "./totp.js";
@@ -882,10 +882,14 @@ function recordRunUsage(runId: string, projectId: string, prompt: string, answer
   const totalTokens = typeof reported?.totalTokens === "number" ? Math.round(reported.totalTokens) : inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
   const model = typeof reported?.model === "string" ? reported.model : (config.PRIME_AGENT_MODEL ?? null);
   // Cost is only reported when the engine sent real tokens; the price table resolves the rest.
-  const costMicros = hasTokens ? (typeof reported?.costMicros === "number" ? Math.round(reported.costMicros) : estimateCostMicros(model, { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens })) : null;
+  // The engine number and the catalogue are upstream cost (cost of goods); the billed amount is
+  // that cost times the owner markup, stored in its own column (Wave 9, item 19).
+  const quote = quoteCosts(model, { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens });
+  const costMicros = !hasTokens ? null : (typeof reported?.costMicros === "number" ? Math.round(reported.costMicros) : quote.baseMicros);
+  const sellCostMicros = sellForBaseMicros(costMicros, quote.markup);
   const provider = model ? providerForModel(model) : config.PRIME_AGENT_PROVIDER ?? null;
-  db.prepare("INSERT INTO run_usage (id,run_id,project_id,model,provider,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost_micros,estimated,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-    .run(randomUUID(), runId, projectId, model, provider, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, costMicros, hasTokens ? 0 : 1, reported ? JSON.stringify(reported.raw ?? null).slice(0, 4000) : null, new Date().toISOString());
+  db.prepare("INSERT INTO run_usage (id,run_id,project_id,model,provider,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost_micros,sell_cost_micros,estimated,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run(randomUUID(), runId, projectId, model, provider, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, costMicros, sellCostMicros, hasTokens ? 0 : 1, reported ? JSON.stringify(reported.raw ?? null).slice(0, 4000) : null, new Date().toISOString());
   // Token over the tier limit is paid from purchased credit. Workflow steps fall back to the workspace owner.
   const payerId = userId ?? (db.prepare("SELECT m.user_id AS userId FROM memberships m JOIN projects p ON p.workspace_id=m.workspace_id WHERE p.id=? AND m.role='owner' LIMIT 1").get(projectId) as { userId: string } | undefined)?.userId;
   if (payerId) chargeQuota(payerId, totalTokens);
@@ -1094,12 +1098,12 @@ app.get<{ Params: { projectId: string }; Querystring: { conversationId?: string;
            r.status, r.prompt, r.result, r.model, r.error_code AS errorCode,
            r.created_at AS createdAt, r.finished_at AS finishedAt,
            COALESCE(u.input_tokens,0) AS inputTokens, COALESCE(u.output_tokens,0) AS outputTokens,
-           COALESCE(u.cost_micros,0) AS costMicros, COALESCE(u.estimated,0) AS estimated
+           COALESCE(u.cost_micros,0) AS costMicros, COALESCE(u.sell_cost_micros,0) AS billedMicros, COALESCE(u.estimated,0) AS estimated
     FROM runs r LEFT JOIN run_usage u ON u.run_id = r.id
     WHERE r.project_id = ?
       AND (? IS NULL OR EXISTS (SELECT 1 FROM messages m WHERE m.run_id = r.id AND m.conversation_id = ?))
     ORDER BY r.created_at DESC LIMIT ?`).all(request.params.projectId, conversationId, conversationId, limit);
-  return { runs: rows.map((row: any) => ({ ...row, costUsd: Number(((row.costMicros ?? 0) / 1_000_000).toFixed(6)) })) };
+  return { runs: rows.map((row: any) => ({ ...row, costUsd: Number(((row.costMicros ?? 0) / 1_000_000).toFixed(6)), billedUsd: Number(((row.billedMicros ?? 0) / 1_000_000).toFixed(6)) })) };
 });
 
 /** Rename a project. Owners and admins of the workspace may do this. */
@@ -1562,17 +1566,18 @@ app.get<{ Params: { projectId: string }; Querystring: { days?: string } }>("/api
   if (!allowed) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
   const days = Math.min(Math.max(Number(request.query?.days ?? 30) || 30, 1), 365);
   const since = new Date(Date.now() - days * 86_400_000).toISOString();
-  const totals = db.prepare("SELECT COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens, COALESCE(SUM(cache_write_tokens),0) AS cacheWriteTokens, COALESCE(SUM(total_tokens),0) AS totalTokens, COALESCE(SUM(cost_micros),0) AS costMicros, COALESCE(SUM(estimated),0) AS estimatedRuns, COUNT(*) - COALESCE(SUM(estimated),0) AS measuredRuns, SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END) AS unpricedRuns FROM run_usage WHERE project_id=? AND created_at>=?").get(request.params.projectId, since) as any;
-  const byModel = db.prepare("SELECT COALESCE(model,'unknown') AS model, COALESCE(provider,'unknown') AS provider, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens, COALESCE(SUM(cost_micros),0) AS costMicros FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY COALESCE(model,'unknown'), COALESCE(provider,'unknown') ORDER BY runs DESC").all(request.params.projectId, since) as any[];
-  const daily = db.prepare("SELECT substr(created_at,1,10) AS day, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cost_micros),0) AS costMicros FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day DESC LIMIT 60").all(request.params.projectId, since) as any[];
+  const totals = db.prepare("SELECT COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens, COALESCE(SUM(cache_write_tokens),0) AS cacheWriteTokens, COALESCE(SUM(total_tokens),0) AS totalTokens, COALESCE(SUM(cost_micros),0) AS costMicros, COALESCE(SUM(sell_cost_micros),0) AS billedMicros, COALESCE(SUM(estimated),0) AS estimatedRuns, COUNT(*) - COALESCE(SUM(estimated),0) AS measuredRuns, SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END) AS unpricedRuns FROM run_usage WHERE project_id=? AND created_at>=?").get(request.params.projectId, since) as any;
+  const byModel = db.prepare("SELECT COALESCE(model,'unknown') AS model, COALESCE(provider,'unknown') AS provider, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens, COALESCE(SUM(cost_micros),0) AS costMicros, COALESCE(SUM(sell_cost_micros),0) AS billedMicros FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY COALESCE(model,'unknown'), COALESCE(provider,'unknown') ORDER BY runs DESC").all(request.params.projectId, since) as any[];
+  const daily = db.prepare("SELECT substr(created_at,1,10) AS day, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens, COALESCE(SUM(cost_micros),0) AS costMicros, COALESCE(SUM(sell_cost_micros),0) AS billedMicros FROM run_usage WHERE project_id=? AND created_at>=? GROUP BY substr(created_at,1,10) ORDER BY day DESC LIMIT 60").all(request.params.projectId, since) as any[];
   // Keeps sub-cent costs visible: eight decimal places of a US dollar.
   const toUsd = (micros: number | null | undefined) => Number(((micros ?? 0) / 1e6).toFixed(8));
+  const markup = pricingSettings().markup;
   return {
-    days, since,
-    totals: { ...totals, costUsd: toUsd(totals.costMicros) },
-    byModel: byModel.map((row) => ({ ...row, costUsd: toUsd(row.costMicros) })),
-    daily: daily.map((row) => ({ ...row, costUsd: toUsd(row.costMicros) })),
-    note: "Tokens come from the engine; runs without engine tokens are estimated from text length (estimatedRuns). Cost uses the published price table and stays null when the model price is unknown (unpricedRuns).",
+    days, since, markup,
+    totals: { ...totals, costUsd: toUsd(totals.costMicros), billedUsd: toUsd(totals.billedMicros) },
+    byModel: byModel.map((row) => ({ ...row, costUsd: toUsd(row.costMicros), billedUsd: toUsd(row.billedMicros) })),
+    daily: daily.map((row) => ({ ...row, costUsd: toUsd(row.costMicros), billedUsd: toUsd(row.billedMicros) })),
+    note: "Tokens come from the engine; runs without engine tokens are estimated from text length (estimatedRuns). costMicros is what the platform pays upstream and stays null when the model price is unknown (unpricedRuns); billedMicros is that cost times the owner markup.",
   };
 });
 
@@ -2952,6 +2957,12 @@ app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) 
     database: { ok: databaseOk, detail: databaseDetail, tables, migrations },
     counts,
     money: { todayTokens, payments: { gateway: payments.gateway, xenditEnabled: payments.xenditEnabled, midtransEnabled: payments.midtransEnabled, xenditConfigured: payments.xenditConfigured, midtransConfigured: payments.midtransConfigured } },
+    /** Wave 9 (item 19): the price console state, so an operator can see the resale margin at a glance. */
+    aiPricing: (() => {
+      const settings = pricingSettings();
+      const table = pricingTable({ days: 30, limit: 1, only: "used" });
+      return { markup: settings.markup, currency: settings.currency, updatedAt: settings.updatedAt, overrideCount: table.overrideCount, catalogSize: table.catalogSize, costMicros30d: table.totals.baseMicros, billedMicros30d: table.totals.sellMicros, marginMicros30d: table.totals.marginMicros };
+    })(),
     mail: { configured: mailerConfigured(), from: config.SMTP_FROM, host: config.SMTP_HOST ? `${config.SMTP_HOST}:${config.SMTP_PORT}` : null, secure: config.SMTP_SECURE },
     security: { csrfStrict: config.CSRF_STRICT, sessionCookie: "httpOnly", adminEmails: config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim()).filter(Boolean).length, metricsEnabled: Boolean(config.METRICS_TOKEN),
       /** Wave 8: whether an unverified email blocks AI work, and why. */
@@ -3037,9 +3048,11 @@ app.post<{ Body: { prompt?: string; model?: string; thinking?: string; personaId
   const usageModel = typeof reported?.model === "string" ? reported.model : (model ?? config.PRIME_AGENT_MODEL ?? null);
   const inputTokens = reportedTokens ? Math.round(reported?.inputTokens ?? 0) : Math.ceil(prompt.length / 4);
   const outputTokens = reportedTokens ? Math.round(reported?.outputTokens ?? 0) : Math.ceil(text.length / 4);
-  const costMicros = estimateCostMicros(usageModel, { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
-  db.prepare("INSERT INTO user_usage (id,user_id,run_id,source,model,provider,input_tokens,output_tokens,total_tokens,cost_micros,estimated,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
-    .run(randomUUID(), userId, playgroundRunId, "playground", usageModel, usageModel ? providerForModel(usageModel) : config.PRIME_AGENT_PROVIDER ?? null, inputTokens, outputTokens, tokens, costMicros, reportedTokens ? 0 : 1, new Date().toISOString());
+  const playgroundQuote = quoteCosts(usageModel, { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
+  const costMicros = playgroundQuote.baseMicros;
+  const sellCostMicros = sellForBaseMicros(costMicros, playgroundQuote.markup);
+  db.prepare("INSERT INTO user_usage (id,user_id,run_id,source,model,provider,input_tokens,output_tokens,total_tokens,cost_micros,sell_cost_micros,estimated,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run(randomUUID(), userId, playgroundRunId, "playground", usageModel, usageModel ? providerForModel(usageModel) : config.PRIME_AGENT_PROVIDER ?? null, inputTokens, outputTokens, tokens, costMicros, sellCostMicros, reportedTokens ? 0 : 1, new Date().toISOString());
   chargeQuota(userId, tokens);
   return { text, usage, thinking, autonomous, model: usageModel, systemBlocks: blocks.length, tools: playgroundTools ?? null, tokens, durationMs: Date.now() - started, sessionId };
 });
@@ -3603,6 +3616,82 @@ app.put("/api/v1/account/notification-preferences", { preHandler: requireUser },
   return { preferences, message: "Preferensi email disimpan." };
 });
 
+// ---------------------------------------------------------------- admin: AI price console (Wave 9, item 19)
+
+/**
+ * The price console. The owner sees, for every model: the published price from the engine catalogue,
+ * the price really paid (when set), the markup, and the amount billed to customers. Money is shown
+ * both as cost of goods (what the platform pays) and as the billed amount, never mixed.
+ */
+app.get("/api/v1/admin/pricing", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat harga AI." });
+  const table = pricingTable({
+    search: typeof request.query?.search === "string" ? request.query.search : undefined,
+    only: request.query?.only === "used" || request.query?.only === "overridden" ? request.query.only : "all",
+    limit: Number(request.query?.limit ?? 500) || 500,
+    days: Number(request.query?.days ?? 30) || 30,
+  });
+  return {
+    markup: table.markup, currency: table.currency, updatedAt: table.updatedAt, updatedBy: table.updatedBy,
+    catalogSize: table.catalogSize, overrideCount: table.overrideCount, days: table.days,
+    models: table.models.map((row) => ({ ...row, marginMicros: row.sellMicros - row.baseMicros })),
+    totals: table.totals,
+    note: "costMicros = yang Anda bayar ke penyedia AI. sellMicros = yang ditagihkan ke pelanggan (harga x markup).",
+  };
+});
+
+/** Sets the markup factor applied on top of every model price. 1 means selling at cost. */
+app.put<{ Body: { markup?: number | string } }>("/api/v1/admin/pricing/settings", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah markup." });
+  const raw = request.body?.markup;
+  const markup = Number(raw);
+  if (!Number.isFinite(markup)) return reply.code(400).send({ error: "INVALID_MARKUP", message: "Markup harus berupa angka, misalnya 1.5 untuk 1,5 kali harga dasar." });
+  if (markup < 0.1 || markup > 100) return reply.code(400).send({ error: "MARKUP_OUT_OF_RANGE", message: "Markup harus antara 0,1 dan 100." });
+  const settings = setPricingMarkup(markup, request.user!.id);
+  recordAudit(null, request.user!.id, "admin.pricing_updated", { markup: settings.markup });
+  // The billed column is recomputed from the stored upstream cost, so the whole history agrees with
+  // the markup that is in force now. The cost of goods is never touched.
+  const runs = db.prepare("UPDATE run_usage SET sell_cost_micros = CAST(ROUND(COALESCE(cost_micros,0) * ?) AS INTEGER)").run(settings.markup);
+  db.prepare("UPDATE user_usage SET sell_cost_micros = CAST(ROUND(COALESCE(cost_micros,0) * ?) AS INTEGER)").run(settings.markup);
+  return {
+    ok: true, markup: settings.markup, updatedAt: settings.updatedAt,
+    rowsUpdated: runs.changes, totals: pricingTable({ days: 30, limit: 1 }).totals,
+    message: `Markup disimpan: harga jual = harga dasar x ${settings.markup}.`,
+  };
+});
+
+/** Stores the real price paid for one model, in US dollars per million tokens. */
+app.put<{ Params: { model: string }, Body: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } }>("/api/v1/admin/pricing/models/:model", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah harga model." });
+  const model = String(request.params.model ?? "").trim();
+  if (!model || model.length > 200) return reply.code(400).send({ error: "INVALID_MODEL", message: "Nama model tidak sah." });
+  const input = { input: Number(request.body?.input), output: Number(request.body?.output), cacheRead: Number(request.body?.cacheRead ?? 0), cacheWrite: Number(request.body?.cacheWrite ?? 0) };
+  const problem = validatePrice(input);
+  if (problem) return reply.code(400).send({ error: "INVALID_PRICE", message: problem });
+  const view = savePriceOverride(model, input, request.user!.id);
+  recordAudit(null, request.user!.id, "admin.pricing_updated", { model, price: view.base });
+  return { ok: true, price: view, message: `Harga ${model} disimpan: ${view.base.input} / ${view.base.output} USD per 1 juta token.` };
+});
+
+/** Drops an owner price and returns the model to the published catalogue price. */
+app.delete<{ Params: { model: string } }>("/api/v1/admin/pricing/models/:model", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah harga model." });
+  const model = String(request.params.model ?? "").trim();
+  const removed = clearPriceOverride(model);
+  if (!removed) return reply.code(404).send({ error: "PRICE_NOT_OVERRIDDEN", message: "Model ini belum pernah diberi harga sendiri." });
+  recordAudit(null, request.user!.id, "admin.pricing_reset", { model });
+  return { ok: true, price: priceView(model), message: `Harga ${model} dikembalikan ke daftar resmi.` };
+});
+
+/** A single model price, used by the editor when the table is filtered. */
+app.get<{ Params: { model: string } }>("/api/v1/admin/pricing/models/:model", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat harga AI." });
+  const model = String(request.params.model ?? "").trim();
+  const settings = pricingSettings();
+  const view = priceView(model, settings.markup);
+  return { ...view, markup: settings.markup, catalog: catalogPriceFor(model) };
+});
+
 // ---------------------------------------------------------------- admin: background jobs (Wave 5)
 
 /** Queue health for the admin console: what is waiting, what failed, and what the worker is doing. */
@@ -3829,9 +3918,18 @@ function projectIdOfExecution(executionId: string): string {
  * a workflow execution still marked running) was left behind by the previous process. Single-process
  * deployments repair those rows at once; set JOB_REAP_ON_BOOT=false if the API ever runs in more than
  * one process at a time.
+ *
+ * Wave 9 (item 17): only ONE process may own the queue. In production the API runs with
+ * JOB_WORKER_IN_WEB=false and the dedicated container (`dist/api/worker.js`, WORKER_ONLY=true) owns the
+ * queue: leases, the boot repair, and the interval cycles. Without that rule two processes would fight
+ * over the same rows, and the API would mark a healthy long run as lost while the worker was running it.
  */
 function startBackgroundWork() {
   registerBackgroundHandlers();
+  if (!config.JOB_WORKER_IN_WEB && !config.WORKER_ONLY) {
+    console.log("[jobs] antrean milik proses pekerja terpisah (JOB_WORKER_IN_WEB=false); proses ini hanya melayani HTTP");
+    return;
+  }
   const recovered = recoverExpiredLeases();
   let boot = { runs: 0, executions: 0 };
   if (config.JOB_REAP_ON_BOOT) {
@@ -3850,10 +3948,14 @@ function startBackgroundWork() {
 
 startBackgroundWork();
 ensureCommerceSeed();
-await app.listen({ host: config.HOST, port: config.PORT });
-
-// Reads the engine model catalogue once at start-up so the first user request never pays the CLI cost.
-setTimeout(() => { try { engineModelCatalogue(); } catch { /* the catalogue is optional, runs still work */ } }, 0);
+if (config.WORKER_ONLY) {
+  // The dedicated worker container must never listen: nginx points at the API container only.
+  console.log("[worker] HTTP tidak dijalankan (WORKER_ONLY=true); proses ini hanya mengerjakan antrean");
+} else {
+  await app.listen({ host: config.HOST, port: config.PORT });
+  // Reads the engine model catalogue once at start-up so the first user request never pays the CLI cost.
+  setTimeout(() => { try { engineModelCatalogue(); } catch { /* the catalogue is optional, runs still work */ } }, 0);
+}
 
 const stop = async () => { await app.close(); db.close(); process.exit(0); };
 process.on("SIGTERM", stop); process.on("SIGINT", stop);

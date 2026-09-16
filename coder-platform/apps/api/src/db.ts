@@ -200,6 +200,10 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFA
 try { db.exec("ALTER TABLE run_usage ADD COLUMN cache_read_tokens INTEGER"); } catch {}
 try { db.exec("ALTER TABLE run_usage ADD COLUMN cache_write_tokens INTEGER"); } catch {}
 try { db.exec("ALTER TABLE run_usage ADD COLUMN total_tokens INTEGER"); } catch {}
+// Wave 9: the billed amount is stored next to the real upstream cost, so a markup can be applied
+// without ever rewriting what the platform really paid.
+try { db.exec("ALTER TABLE run_usage ADD COLUMN sell_cost_micros INTEGER"); } catch {}
+try { db.exec("ALTER TABLE user_usage ADD COLUMN sell_cost_micros INTEGER"); } catch {}
 try { db.exec("ALTER TABLE runs ADD COLUMN model TEXT"); } catch {}
 try { db.exec("ALTER TABLE auth_sessions ADD COLUMN last_seen_at TEXT"); } catch {}
 try { db.exec("ALTER TABLE auth_sessions ADD COLUMN user_agent TEXT"); } catch {}
@@ -487,10 +491,20 @@ CREATE TABLE IF NOT EXISTS rate_limit_hits (
 );
 CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_bucket ON rate_limit_hits(bucket, hit_at);
 `);
+// Wave 9 (item 19): the owner can replace the published price of a model with the price really paid.
+db.exec(`
+CREATE TABLE IF NOT EXISTS model_price_overrides (
+ model TEXT PRIMARY KEY,
+ input_per_mtok REAL NOT NULL, output_per_mtok REAL NOT NULL,
+ cache_read_per_mtok REAL NOT NULL DEFAULT 0, cache_write_per_mtok REAL NOT NULL DEFAULT 0,
+ currency TEXT NOT NULL DEFAULT 'USD', updated_at TEXT NOT NULL, updated_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_model_price_overrides_updated ON model_price_overrides(updated_at DESC);
+`);
 
 /** Records the applied schema version so operators can see which shape the database has. */
-const SCHEMA_VERSION = 16;
-export const SCHEMA_VERSION_NOTE = "Two step account closing with a 90 day recovery window and rate limit counters kept in the database";
+export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION_NOTE = "Owner priced AI models: real upstream price per million tokens plus a markup for the billed amount";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

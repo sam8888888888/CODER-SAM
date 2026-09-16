@@ -166,6 +166,25 @@ export type JobCycleReport = { owner: string; startedAt: string; finishedAt: str
 export type JobWorkerInfo = { running: boolean; intervalMs: number; leaseMs: number; batchSize: number; orphanAfterMs: number; handlers: string[]; cyclesRun: number; lastCycle: JobCycleReport | null };
 export type AdminJobsResponse = { worker: JobWorkerInfo; stats: JobStats; jobs: BackgroundJob[]; kinds: string[] };
 
+
+/** Wave 9 (butir 19): konsol harga AI. costMicros = yang dibayar platform, sellMicros = yang ditagihkan. */
+export type PricingNumbers = { input: number; output: number; cacheRead: number; cacheWrite: number };
+export type PricingModel = {
+  model: string; provider: string | null; source: 'catalog' | 'override' | 'none';
+  base: PricingNumbers; sell: PricingNumbers; updatedAt: string | null; updatedBy: string | null;
+  used: boolean; runs: number; baseMicros: number; sellMicros: number; marginMicros: number;
+};
+export type PricingTotals = { runs: number; baseMicros: number; sellMicros: number; marginMicros: number; pricedRuns: number; unpricedRuns: number; modelsUsed: number };
+export type PricingTable = {
+  markup: number; currency: string; updatedAt: string | null; updatedBy: string | null;
+  catalogSize: number; overrideCount: number; days: number; models: PricingModel[]; totals: PricingTotals; note: string;
+};
+export type PricingSettingsResult = { ok: true; markup: number; updatedAt: string | null; rowsUpdated: number; totals: PricingTotals; message: string };
+export type PricingModelResult = { ok: true; price: PricingModel; message: string };
+
+/** Properti halaman konsol harga. Sudah dipakai halaman AdminPricing.tsx. */
+export type PricingQuery = { search?: string; only?: 'all' | 'used' | 'overridden'; limit?: number; days?: number };
+
 export const api = {
   me: () => request<{ user: User }>('/v1/auth/me'),
   login: (username: string, password: string, code?: string) => request<{ user: User; mfaEnabled?: boolean; referral?: { accepted: boolean; error?: string } }>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: username, password, code }) }),
@@ -372,4 +391,20 @@ export const api = {
   adminReferrals: (limit = 100) => request<{ stats: ReferralStats; leaderboard: ReferralLeader[]; referrals: (ReferralRow & { inviterEmail: string; inviteeEmailConfirmed: string })[] }>(`/v1/admin/referrals?limit=${encodeURIComponent(String(limit))}`),
   /** Wave 7: dokumentasi API publik tanpa sesi. */
   publicDocs: () => request<PublicApiDocs>('/v1/public/docs'),
+  /** Wave 9 (butir 19): konsol harga AI. Hanya admin platform yang boleh memakainya. */
+  adminPricing: (query: PricingQuery = {}) => {
+    const params = new URLSearchParams();
+    if (query.search) params.set('search', query.search);
+    if (query.only) params.set('only', query.only);
+    if (query.limit) params.set('limit', String(query.limit));
+    if (query.days) params.set('days', String(query.days));
+    const suffix = params.toString();
+    return request<PricingTable>(`/v1/admin/pricing${suffix ? `?${suffix}` : ''}`);
+  },
+  adminPricingSetMarkup: (markup: number) =>
+    request<PricingSettingsResult>('/v1/admin/pricing/settings', { method: 'PUT', body: JSON.stringify({ markup }) }),
+  adminPricingSetModel: (model: string, price: { input: number; output: number; cacheRead?: number; cacheWrite?: number }) =>
+    request<PricingModelResult>(`/v1/admin/pricing/models/${encodeURIComponent(model)}`, { method: 'PUT', body: JSON.stringify(price) }),
+  adminPricingResetModel: (model: string) =>
+    request<PricingModelResult>(`/v1/admin/pricing/models/${encodeURIComponent(model)}`, { method: 'DELETE' }),
 };

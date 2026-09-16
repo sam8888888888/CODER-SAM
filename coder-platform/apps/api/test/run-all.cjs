@@ -15,11 +15,26 @@ const suites = fs.readdirSync(here)
   .filter((name) => name.endsWith(".e2e.ts"))
   .filter((name) => !["real-ai.e2e.ts", "real-usage.e2e.ts"].includes(name))
   .sort();
-// migration-check.ts TIDAK dijalankan otomatis: itu alat manual yang butuh argumen
-// (berkas DB sumber + DATA_DIR tujuan). Jalankan manual: npx tsx apps/api/test/migration-check.ts <db> <dir>
+// Gerbang migrasi (Wave 9, butir 18): dijalankan otomatis di sini. Tanpa argumen ia membangun
+// basis data baru dari nol dan membuktikan versi skema, tabel, kolom, dan idempotensi buka-ulang.
+// Di jalur deploy, alat yang sama (apps/api/src/migration-rehearsal.ts) dijalankan pada salinan
+// cadangan produksi terbaru sebelum container diganti.
+
+/** Runs the migration gate first: a broken migration must stop the run before any suite. */
+function runMigrationGate() {
+  const started = Date.now();
+  const run = spawnSync(process.execPath, ["--import", "tsx", path.join(here, "migration-check.ts")], { cwd: root, encoding: "utf8", env: { ...process.env } });
+  const ms = Date.now() - started;
+  const output = `${run.stdout || ""}${run.stderr || ""}`;
+  const tail = output.trim().split("\n").slice(-3).join(" | ");
+  const ok = run.status === 0;
+  console.log(`${ok ? "OK  " : "GAGAL"} ${"migration-check.ts".padEnd(28)} ${String(ms).padStart(6)}ms  ${tail.slice(0, 160)}`);
+  return ok;
+}
 
 let failed = 0;
 const results = [];
+if (!runMigrationGate()) failed += 1;
 for (const suite of suites) {
   const started = Date.now();
   const run = spawnSync(process.execPath, ["--import", "tsx", path.join(here, suite)], { cwd: root, encoding: "utf8", env: { ...process.env } });
@@ -31,7 +46,8 @@ for (const suite of suites) {
   results.push({ suite, ok, ms, tail });
   console.log(`${ok ? "OK  " : "GAGAL"} ${suite.padEnd(28)} ${String(ms).padStart(6)}ms  ${tail.slice(0, 160)}`);
 }
+const total = suites.length + 1;
 console.log("");
-console.log(`RINGKASAN: ${suites.length - failed}/${suites.length} suite hijau.`);
+console.log(`RINGKASAN: ${total - failed}/${total} suite hijau (termasuk gerbang migrasi).`);
 if (failed) { console.log("SUITES_FAILED"); process.exit(1); }
 console.log("ALL_SUITES_PASSED");

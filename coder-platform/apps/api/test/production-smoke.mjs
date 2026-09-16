@@ -543,5 +543,44 @@ const stillMe = await call("GET", "/api/v1/auth/me");
 check("wave8 the smoke account is untouched after the close attempts", stillMe.status === 200 && stillMe.json?.user?.email === meW8.json?.user?.email, JSON.stringify(stillMe.json?.user));
 console.log(`INFO wave8 limits=${JSON.stringify(hubW8.json?.openPlatform?.rateLimits?.rules)} closedWaiting=${hubW8.json?.openPlatform?.closedAccounts?.waiting} closedDue=${hubW8.json?.openPlatform?.closedAccounts?.due} verifyMode=${hubW8.json?.security?.verifyEmailMode} verifyRequired=${hubW8.json?.security?.verifyEmailRequired} verified=${meW8.json?.user?.emailVerified}`);
 
+// ------------------------------------------------------------------ Wave 9 (v0.19.0)
+// Harga AI: harga pokok dari penyedia tetap apa adanya, jumlah yang ditagihkan = harga pokok x markup.
+const hubW9 = await call("GET", "/api/v1/status-hub");
+const aiPricing = hubW9.json?.aiPricing;
+check("wave9 the status hub reports the AI pricing settings",
+  typeof aiPricing?.markup === "number" && Number(aiPricing?.markup) >= 0.1 && String(aiPricing?.currency) === "USD" && Number(aiPricing?.catalogSize) > 0,
+  JSON.stringify(aiPricing));
+const cost30 = Number(aiPricing?.costMicros30d ?? 0);
+const billed30 = Number(aiPricing?.billedMicros30d ?? 0);
+const margin30 = Number(aiPricing?.marginMicros30d ?? 0);
+check("wave9 the billed amount follows the owner markup and the margin is the difference",
+  Math.abs(billed30 - cost30 * Number(aiPricing?.markup ?? 1)) <= Math.max(1000, cost30 * Number(aiPricing?.markup ?? 1) * 0.05 + 1)
+  && margin30 === billed30 - cost30,
+  JSON.stringify({ markup: aiPricing?.markup, cost30, billed30, margin30 }));
+check("wave9 the real upstream price is never overwritten by the markup", cost30 >= 0 && (cost30 === 0 || billed30 >= cost30),
+  JSON.stringify({ cost30, billed30 }));
+const pricingBlocked = await call("GET", "/api/v1/admin/pricing");
+check("wave9 the price console refuses a normal account", pricingBlocked.status === 403 && pricingBlocked.json?.error === "ADMIN_REQUIRED", JSON.stringify(pricingBlocked.json));
+const markupBlocked = await call("PUT", "/api/v1/admin/pricing/settings", { markup: 2 });
+check("wave9 the markup can only be changed by a platform admin", markupBlocked.status === 403 && markupBlocked.json?.error === "ADMIN_REQUIRED", JSON.stringify(markupBlocked.json));
+const priceBlocked = await call("PUT", "/api/v1/admin/pricing/models/uji-model", { input: 1, output: 2 });
+check("wave9 a model price can only be set by a platform admin", priceBlocked.status === 403 && priceBlocked.json?.error === "ADMIN_REQUIRED", JSON.stringify(priceBlocked.json));
+const usageW9 = await call("GET", `/api/v1/projects/${projectId}/usage?days=30`);
+check("wave9 the project usage reports cost, billed amount and the markup used",
+  usageW9.status === 200 && typeof usageW9.json?.markup === "number" && Number.isFinite(Number(usageW9.json?.totals?.billedMicros))
+  && Number(usageW9.json?.totals?.billedMicros) >= Number(usageW9.json?.totals?.costMicros ?? 0)
+  && Number.isFinite(Number(usageW9.json?.totals?.billedUsd)),
+  JSON.stringify(usageW9.json?.totals)?.slice(0, 240));
+const runsW9 = await call("GET", `/api/v1/projects/${projectId}/runs?limit=5`);
+const runRowW9 = Array.isArray(runsW9.json?.runs) ? runsW9.json.runs[0] : undefined;
+check("wave9 the run list shows the billed amount of every run",
+  runsW9.status === 200 && (runRowW9 === undefined || (Number.isFinite(Number(runRowW9?.billedMicros)) && Number.isFinite(Number(runRowW9?.billedUsd)))),
+  JSON.stringify(runRowW9)?.slice(0, 200));
+const jobsW9 = await call("GET", "/api/v1/status-hub");
+check("wave9 the queue still reports every job handler after the worker moved to its own process",
+  Array.isArray(jobsW9.json?.jobs?.worker?.handlers) && jobsW9.json.jobs.worker.handlers.length >= 6,
+  JSON.stringify(jobsW9.json?.jobs?.worker));
+console.log(`INFO wave9 markup=${aiPricing?.markup} cost30=${cost30} billed30=${billed30} margin30=${margin30} overrides=${aiPricing?.overrideCount} catalog=${aiPricing?.catalogSize} workerCyclesInWeb=${jobsW9.json?.jobs?.worker?.cyclesRun}`);
+
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

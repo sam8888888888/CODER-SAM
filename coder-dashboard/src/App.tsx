@@ -10,6 +10,7 @@ import { WorkspaceAdmin } from './WorkspaceAdmin';
 import { Billing } from './Billing';
 import { AdminCommerce } from './AdminCommerce';
 import { AdminUsers } from './AdminUsers';
+import { AdminPricing } from './AdminPricing';
 import { CommandPalette, type PaletteItem } from './CommandPalette';
 import { ShareMenu } from './ShareMenu';
 import { ThemeToggle, bacaTema, terapkanTema, type ThemeName } from './ThemeToggle';
@@ -313,6 +314,7 @@ function App() {
     : page === 'apiKeys' && user ? <ApiKeys onError={setError} />
     : page === 'privacy' && user ? <DataPrivacy onError={setError} />
     : page === 'adminEmail' && user && isAdmin ? <AdminEmailOutbox onError={setError} />: page === 'adminJobs' && user && isAdmin ? <AdminJobs onError={setError} />
+    : page === 'adminPricing' && user && isAdmin ? <AdminPricing isAdmin={isAdmin} onError={setError} />
     : page === 'apiWebhooks' && user ? <ApiWebhooks onError={setError} />
     : page === 'referrals' && user ? <Referrals onError={setError} />
     : page === 'growth' && user && isAdmin ? <Growth onError={setError} />

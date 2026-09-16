@@ -68,6 +68,18 @@ const Env = z.object({
   // previous process. Single-process deployments can reap it after this grace period. Turn this off
   // if the API is ever started in more than one process at a time.
   JOB_REAP_ON_BOOT: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
+  /**
+   * Wave 9 (item 17): who runs the queue. `true` (default) keeps the worker inside the API process, which
+   * is what tests and a single-container install expect. Production sets it to `false` and runs a second,
+   * dedicated container (`node dist/api/worker.js`) so long jobs cannot compete with HTTP requests.
+   */
+  JOB_WORKER_IN_WEB: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
+  /**
+   * Wave 9 (item 17): the process that runs `dist/api/worker.js` sets this itself. It owns the queue
+   * (leases, reaping, interval cycles) and does not open an HTTP listener, so the API container can
+   * never claim the same work.
+   */
+  WORKER_ONLY: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
   JOB_REAP_BOOT_MIN_AGE_MS: z.coerce.number().int().min(1000).default(60000),
   // Wave 6: outgoing webhooks. Delivery goes through the durable queue, so a dead process does not lose
   // an event. The local flag exists for tests and local installs: without it localhost targets are refused.
