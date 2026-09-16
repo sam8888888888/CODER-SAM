@@ -57,6 +57,40 @@ mengulang pekerjaan, dan memaksa satu putaran; 8 rute Wave 6 untuk dua rute tuli
 dokumentasi publik, robot, dan sitemap).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
 
+## Deploy & operasi produksi v0.18.0 (16 Sep 2026)
+
+- **Versi LIVE: `0.18.0`** (`coder-platform-app:0.18.0`, sehat, engine `rpc-stdio` tersedia).
+  Deploy lewat `bash deploy/deploy-austria.sh 0.18.0` (`DEPLOY_OK`), cadangan basis data dibuat
+  lebih dulu dengan `docker exec coder-platform-app node dist/api/backup.js`
+  (`/app/backups/coder-2026-09-16T13-11-31.337Z.db`).
+- **Smoke produksi: 166 PASS / 0 FAIL / 0 SKIP → `PRODUCTION_SMOKE_PASSED`**
+  (`/tmp/w8_smoke_prod.txt`), termasuk blok cek Wave 8 (`limits={"login":10,"register":20,...}`,
+  `closedDue=0`, `verifyMode=auto`, `verifyRequired=true`).
+- **status-hub produksi**: `openPlatform.rateLimits = { store: "database", table: "rate_limit_hits" }`,
+  `closedAccounts.recoveryDays = 90`, `security.verifyEmailRequired = true`, `verifyEmailMode = "auto"`.
+- **Akun lama ditandai terverifikasi** (keduanya dibuat sebelum server surat aktif sehingga verifikasi
+  tidak mungkin dilakukan): `samianpacing@gmail.com` dan `smoke.bot@coder.sam.university`.
+  Bukti: `GET /api/v1/auth/me` → `emailVerified: true`, `accountClosed: false`.
+  Tanpa langkah ini pemilik platform akan tertahan `403 EMAIL_NOT_VERIFIED` pada setiap run.
+- **Admin kedua (butir 10)**: `samian@sam.university` dibuat dengan paket `enterprise`, `isAdmin=1`,
+  `emailVerified=1`; `PLATFORM_ADMIN_EMAILS` kini `samianpacing@gmail.com,samian@sam.university`
+  (`security.adminEmails = 2`). Cadangan env: `/home/dinda/coder-app/.env.bak-wave8`.
+- **Butir 12 — pembersihan jejak uji audit**: 980 baris `audit_events` dihapus
+  (48 baris ruang kerja Bapak + 932 baris ruang kerja `smoke.bot`), 34 baris keamanan global
+  (masuk/keluar, kata sandi, admin) DIPERTAHANKAN, lalu 1 baris catatan `admin.audit_cleanup`
+  ditulis. Cadangan dibuat sebelum penghapusan. Sisa tabel: 35 baris.
+- **Butir 11 — rapikan disk Docker (aman, hanya milik kita)**: 14 tag `coder-platform-app`
+  (0.9.3–0.16.0) dihapus (0.17.0 disimpan sebagai sasaran rollback), `docker builder prune -f`
+  membebaskan 222,7 MB, `docker image prune -f` hanya 14 kB (image `dangling` lain dipakai container
+  proyek lain sehingga otomatis dilewati). `/tmp/node-compile-cache` (482 MB) TIDAK dihapus karena
+  bukan milik kita (izin ditolak). Prune `-a`/container/volume tetap TIDAK dijalankan.
+- **Butir 14 — relay mailcow**: pengetatan port publik 25/465/587 selesai. Bukti sebelum/sesudah,
+  cadangan, dan skrip rollback ada di `docs/PATCH_MAILCOW_RELAY.md` + `deploy/mailcow/`.
+  Ringkas: relay tanpa autentikasi dari host `250 Ok` → `454/554 Relay access denied`; jalur sah
+  aplikasi tetap `sasl_username=noreply@coblai.com` + `status=sent`; antrean surat kosong.
+- **Butir 13 — push GitHub**: masih TERHAMBAT, tidak ada kredensial. Berkas paket deploy sudah
+  dikeluarkan dari git dan masuk `.gitignore`; pemindaian paket + riwayat git bersih.
+
 ## Wave 7 (v0.17.0) — Pertumbuhan: undangan, angka pertumbuhan, langkah awal, kuota, permukaan publik
 
 Tema: pemakaian yang tumbuh bisa diukur dan dihadiahi, tanpa menambah risiko pada data lama.
