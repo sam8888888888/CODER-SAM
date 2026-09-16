@@ -139,6 +139,21 @@ adalah tantangan HTTP-01 tertutup oleh perubahan nginx; berkas nginx untuk situs
    di depan waktu acuan putaran), sehingga pekerjaan yang baru dijadwalkan tidak ikut diambil pada
    putaran yang sama. Akibatnya putaran pertama saat server menyala tidak menjalankan pekerjaan
    berkala dan uji Wave 8 bisa berlomba dengan pekerjaan retensi. Diperbaiki dengan `runAfter: now`.
+5. **Ditemukan oleh gerbang deploy, bukan oleh uji lokal.** Gerbang rehearsal pada deploy pertama
+   v0.19.0 berhenti dengan `MIGRATION_REHEARSAL_FAILED 1` dan `DEPLOY_ABORTED`. Laporan menunjukkan
+   `ROW_COUNTS_PRESERVED false` dengan nilai "sebelum" `-1` untuk SETIAP tabel. Sebabnya: alat
+   rehearsal membuka berkas cadangan asli secara hanya-baca, sedangkan gerbang deploy memasang volume
+   cadangan dengan `:ro`. SQLite menolak membuka basis data mode WAL di tempat hanya-baca karena ia
+   ingin membuat berkas `-shm` di sampingnya. Bukti langsung di lingkungan lokal: berkas basis data
+   mode WAL di direktori hanya-baca, dibuka `{ readonly: true }` sebagai pengguna bukan root →
+   `READ_FAILED attempt to write a readonly database`; berkas yang sama di direktori yang bisa
+   ditulis → berhasil. Diperbaiki: salinan dibuat LEBIH DULU, jumlah baris dibaca dari salinan
+   (`chmod 644` pada salinan, karena `copyFileSync` mewarisi mode `0444` dari aslinya), dan bila ada
+   jumlah baris yang tetap tidak terbaca, laporan menyebutkannya sebagai masalah yang jelas, bukan
+   sebagai selisih baris yang membingungkan. Diuji ulang persis pada kondisi gagal (direktori 0555,
+   berkas 0444, pengguna `nobody`) → `ROW_COUNTS_PRESERVED true`, `MIGRATION_REHEARSAL_OK`.
+   `worker-split.e2e.ts` menambah 4 pemeriksaan (21/21) yang memastikan berkas asli tidak pernah
+   berubah ukuran, mode, maupun waktu ubahnya.
 
 ## Urutan kerja
 

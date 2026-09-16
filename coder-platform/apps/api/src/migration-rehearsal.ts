@@ -19,7 +19,7 @@
  *   node dist/api/migration-rehearsal.js /app/backups/coder-<stamp>.db
  */
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -98,12 +98,21 @@ export async function runMigrationRehearsal(options: { sourceDb?: string | null;
   const target = join(dataDir, "coder.db");
   let before: Record<string, number> | null = null;
   if (source) {
-    // The real database is opened read only, only to remember the row counts before migration.
-    const reader = new Database(source, { readonly: true });
+    // The copy is made FIRST and the row counts are read from the COPY, never from the original.
+    // The original can sit on a read only mount: the deploy mounts the backup volume with `:ro`, and
+    // SQLite wants to touch the side files of a write ahead logging database (the `-shm` file), which
+    // a read only mount refuses. Reading the original directly therefore reported every count as -1.
+    copyFileSync(source, target);
+    // The copy inherits the mode of the original, and a backup on a read only mount is often 0444.
+    // The rehearsal must be able to migrate the copy, so give the owner write permission back.
+    chmodSync(target, 0o644);
+    const reader = new Database(target, { readonly: true });
     before = {};
     for (const table of IMPORTANT_TABLES) before[table] = countRows(reader, table);
     reader.close();
-    copyFileSync(source, target);
+    const unreadable = IMPORTANT_TABLES.filter((table) => Number(before![table]) < 0);
+    // Failing loudly beats reporting a mismatch that is really a reading failure.
+    if (unreadable.length) problems.push(`jumlah baris sebelum migrasi tidak bisa dibaca dari salinan: ${unreadable.slice(0, 5).join(", ")}`);
   }
 
   // The dummy value is replaced below as soon as the real connection exists. It keeps the shape of

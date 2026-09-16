@@ -13,8 +13,10 @@
  *
  * Jalankan: npx tsx apps/api/test/worker-split.e2e.ts
  */
-import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -146,6 +148,33 @@ try {
   check("5) skrip deploy me-recreate container pekerja", deployScript.includes("--force-recreate coder-platform-worker"));
   check("5) alat rehearsal ada di dalam paket aplikasi (ikut terkompilasi)",
     readFileSync(`${repoRoot}/apps/api/src/migration-rehearsal.ts`, "utf8").includes("MIGRATION_REHEARSAL_OK"));
+
+  // --- 6) rehearsal migrasi atas cadangan hanya-baca -------------------------------------------
+  // Kegagalan nyata di gerbang deploy 16 Sep 2026: volume cadangan dipasang `:ro`, dan SQLite
+  // menolak membuka basis data mode WAL secara hanya-baca di sana karena ia ingin membuat berkas
+  // `-shm` di sampingnya ("attempt to write a readonly database"). Alat rehearsal sekarang menyalin
+  // dulu lalu membaca salinannya, dan berkas aslinya tidak boleh tersentuh sama sekali. Sebagian
+  // pemeriksaan di bawah tetap berguna saat dijalankan sebagai root, karena root bisa menembus izin
+  // berkas: yang diperiksa adalah ukuran, mode, dan waktu ubah berkas aslinya.
+  db.pragma("wal_checkpoint(TRUNCATE)");
+  const roDir = mkdtempSync(join(tmpdir(), "coder-ro-"));
+  const roSource = join(roDir, "coder.db");
+  copyFileSync(join(dataDir, "coder.db"), roSource);
+  chmodSync(roSource, 0o444);
+  chmodSync(roDir, 0o555);
+  const roBefore = { size: statSync(roSource).size, mode: statSync(roSource).mode & 0o777, mtime: statSync(roSource).mtimeMs };
+  const rehearsal = spawnSync(process.execPath, ["--import", "tsx", "apps/api/src/migration-rehearsal.ts", roSource],
+    { cwd: repoRoot, encoding: "utf8", env: { ...process.env }, timeout: 240_000 });
+  const rehearsalOut = `${rehearsal.stdout ?? ""}${rehearsal.stderr ?? ""}`;
+  const rehearsalTail = rehearsalOut.slice(-260).replace(/\s+/g, " ");
+  check("6) rehearsal lulus atas salinan cadangan hanya-baca", rehearsalOut.includes("MIGRATION_REHEARSAL_OK"), rehearsalTail);
+  check("6) jumlah baris tabel penting tidak berubah", rehearsalOut.includes("ROW_COUNTS_PRESERVED true"), rehearsalTail);
+  check("6) berkas asli tidak diubah (ukuran, mode, waktu ubah sama)",
+    statSync(roSource).size === roBefore.size && (statSync(roSource).mode & 0o777) === roBefore.mode && statSync(roSource).mtimeMs === roBefore.mtime,
+    `size=${statSync(roSource).size} mode=${(statSync(roSource).mode & 0o777).toString(8)}`);
+  check("6) berkas asli masih hanya-baca", (statSync(roSource).mode & 0o777) === 0o444);
+  chmodSync(roDir, 0o755);
+  rmSync(roDir, { recursive: true, force: true });
 } finally {
   await stop(worker, "pekerja");
   await stop(api, "API");
