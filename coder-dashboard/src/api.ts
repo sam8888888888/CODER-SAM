@@ -407,4 +407,16 @@ export const api = {
     request<PricingModelResult>(`/v1/admin/pricing/models/${encodeURIComponent(model)}`, { method: 'PUT', body: JSON.stringify(price) }),
   adminPricingResetModel: (model: string) =>
     request<PricingModelResult>(`/v1/admin/pricing/models/${encodeURIComponent(model)}`, { method: 'DELETE' }),
+  /** Wave 10: gerbang umum untuk halaman baru. Jalur ditulis tanpa awalan /api, dan cookie CSRF
+   *  ditambahkan otomatis untuk metode yang mengubah data. */
+  get: <T>(path: string) => request<T>(path),
+  send: <T>(path: string, method: 'POST' | 'PUT' | 'PATCH' | 'DELETE', body?: unknown) =>
+    request<T>(path, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }),
+  /** Jawaban teks biasa, misalnya /v1/metrics, yang TIDAK berformat JSON. */
+  text: async (path: string) => {
+    const response = await fetch(`/api${path}`, { credentials: 'include' });
+    const body = await response.text();
+    if (!response.ok) throw new Error(body.slice(0, 200) || `Request gagal (${response.status})`);
+    return body;
+  },
 };

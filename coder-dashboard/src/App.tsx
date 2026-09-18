@@ -37,9 +37,16 @@ import { PublicDocs } from './PublicDocs';
 import { Referrals } from './Referrals';
 import { Growth } from './Growth';
 import { Onboarding } from './Onboarding';
+// Wave 10 (butir 21-32D, v0.20.0): pencarian global, perangkat + notifikasi peramban, metrik,
+// pelengkapan data pertumbuhan, dan riwayat pengiriman webhook.
+import { SearchPanel } from './SearchPanel';
+import { DevicesPanel } from './DevicesPanel';
+import { MetricsPanel } from './MetricsPanel';
+import { AdminGrowthBackfill } from './AdminGrowthBackfill';
+import { WebhookDeliveries } from './WebhookDeliveries';
 
 /** Halaman yang hanya boleh dilihat admin platform. */
-const ADMIN_PAGES: PageKey[] = ['admin', 'adminEmail', 'adminJobs', 'growth'];
+const ADMIN_PAGES: PageKey[] = ['admin', 'adminEmail', 'adminJobs', 'growth', 'metrics', 'growthBackfill'];
 
 const starterPrompts = ['Tinjau kode saya dan temukan masalahnya', 'Buatkan rencana implementasi fitur ini', 'Rangkum dokumen yang saya kirim', 'Bantu saya melakukan riset mendalam'];
 
@@ -178,6 +185,8 @@ function App() {
     }).catch(() => setPersonaList([]));
   }, [user]);
   useEffect(() => {
+    // Katalog butuh sesi; tanpa sesi permintaan ini hanya menghasilkan 401 di konsol pengunjung.
+    if (!user) return;
     // The catalogue comes from the engine itself, so an empty list means the picker stays hidden.
     api.models().then(data => {
       const options = [{ value: '', label: data.default.model ? `Bawaan (${data.default.model})` : 'Model bawaan' }].concat(data.models.map(row => ({ value: row.model, label: `${row.provider} · ${row.model}` })));
@@ -185,7 +194,7 @@ function App() {
       const stored = localStorage.getItem('coblai.model') || '';
       if (stored && data.models.some(row => row.model === stored)) setModel(stored);
     }).catch(() => setModelOptions([]));
-  }, []);
+  }, [user]);
 
   /** Applies the saved theme and keeps the browser tab colour in sync. */
   useEffect(() => { terapkanTema(tema); }, [tema]);
@@ -270,6 +279,9 @@ function App() {
       if (authMode !== 'login' && refCode && d.referral && !d.referral.accepted) setNotice(`Kode undangan tidak dipakai: ${d.referral.error ?? 'tidak dikenal'}.`);
       if (authMode !== 'login' && d.referral?.accepted) setNotice('Kode undangan diterima. Hadiah keluar setelah run pertama Anda selesai.');
       setUser(d.user); setAuthOpen(false); setMfaNeeded(false); setError('');
+      // Jawaban daftar/masuk tidak memuat penanda admin dan status verifikasi email, jadi sesi dibaca
+      // ulang dari server. Tanpa ini, menu khusus admin tidak muncul sampai halaman dimuat ulang.
+      void api.me().then(fresh => setUser(fresh.user)).catch(() => undefined);
     } catch (e) {
       // The API asks for a second factor with MFA_REQUIRED; the form then shows the code field.
       const message = (e as Error).message;
@@ -318,6 +330,11 @@ function App() {
     : page === 'apiWebhooks' && user ? <ApiWebhooks onError={setError} />
     : page === 'referrals' && user ? <Referrals onError={setError} />
     : page === 'growth' && user && isAdmin ? <Growth onError={setError} />
+    : page === 'search' && user ? <SearchPanel isAdmin={isAdmin} onOpen={(hit) => { setPage(hit.kind === 'project' ? 'projects' : hit.kind === 'workflow' ? 'workflow' : hit.kind === 'knowledge' ? 'knowledge' : hit.kind === 'artifact' ? 'artifacts' : 'chat'); }} />
+    : page === 'devices' && user ? <DevicesPanel isAdmin={isAdmin} onError={setError} />
+    : page === 'metrics' && user && isAdmin ? <MetricsPanel />
+    : page === 'growthBackfill' && user && isAdmin ? <AdminGrowthBackfill />
+    : page === 'webhookDeliveries' && user ? <WebhookDeliveries />
     : projectId && isToolPage(page) ? <Tools projectId={projectId} workspaceId={workspaceId} tab={page} embedded />: <div className="page-shell-inner"><p className="settings-hint">Halaman ini butuh proyek aktif. Buat atau pilih proyek dulu.</p><button type="button" className="primary" onClick={() => setPage('projects')}>Buka halaman Proyek</button></div>}</section>}</main></div>{banner && <button className="toast notice-toast" onClick={() => setBanner('')}>{banner}</button>}{error && <button className="toast" onClick={() => setError('')}>{error}</button>}{notice && <button className="toast notice-toast" onClick={() => setNotice('')}>{notice}</button>}{toolsOpen && projectId && <Tools projectId={projectId} workspaceId={workspaceId} onClose={() => setToolsOpen(false)} />} {settingsOpen && user && <Settings user={user} workspaceId={workspaceId} workspaceName={workspaceOptions.find(w => w.id === workspaceId)?.name} onClose={() => setSettingsOpen(false)} onLogout={logout} onSelectWorkspace={id => void switchWorkspace(id)} onWorkspaceCreated={id => void switchWorkspace(id)} onWorkspaceDeleted={() => void reloadWorkspaces()} />} {paletteOpen && <CommandPalette items={paletteItems} onSelect={jalankanPerintah} onClose={() => setPaletteOpen(false)} />} {resetToken && <ResetPassword token={resetToken} onClose={() => { setResetToken(null); window.history.replaceState({}, '', '/'); }} onDone={(msg) => { setResetToken(null); window.history.replaceState({}, '', '/'); setBanner(msg); setAuthMode('login'); setAuthOpen(true); }} />} {authOpen && <Auth mode={authMode} onClose={() => setAuthOpen(false)} onSwitch={() => { setAuthMode(v => v === 'login' ? 'register' : 'login'); setError(''); }} onSubmit={submitAuth} error={error} mfaNeeded={mfaNeeded} />}</div>;
 }
 

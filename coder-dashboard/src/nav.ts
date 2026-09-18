@@ -1,5 +1,5 @@
 /** Pages of the workspace shell. Shared by the sidebar, the dashboard cards and the tool panels. */
-export type PageKey = 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'billing' | 'admin' | 'settings' | 'memory' | 'templates' | 'personas' | 'playground' | 'skills' | 'status' | 'agents' | 'diff' | 'tokenSaver' | 'apiKeys' | 'privacy' | 'adminEmail' | 'adminJobs' | 'adminPricing' | 'apiWebhooks' | 'referrals' | 'growth';
+export type PageKey = 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'billing' | 'admin' | 'settings' | 'memory' | 'templates' | 'personas' | 'playground' | 'skills' | 'status' | 'agents' | 'diff' | 'tokenSaver' | 'apiKeys' | 'privacy' | 'adminEmail' | 'adminJobs' | 'adminPricing' | 'apiWebhooks' | 'referrals' | 'growth' | 'search' | 'devices' | 'metrics' | 'growthBackfill' | 'webhookDeliveries';
 
 export type NavItem = { key: PageKey; label: string; icon: string; blurb: string };
 
@@ -34,6 +34,12 @@ export const NAV_ITEMS: NavItem[] = [
   { key: 'apiWebhooks', label: 'Webhook', icon: '⇄', blurb: 'Kirim peristiwa run ke sistem lain dengan tanda tangan HMAC dan percobaan ulang' },
   { key: 'referrals', label: 'Undangan', icon: '❖', blurb: 'Kode undangan Anda, status tiap undangan dan hadiah tokennya' },
   { key: 'growth', label: 'Pertumbuhan', icon: '◈', blurb: 'Corong pendaftaran, aktivitas harian, retensi dan undangan (khusus admin)' },
+  // Wave 10 (butir 21-32D, v0.20.0).
+  { key: 'search', label: 'Pencarian', icon: '⌕', blurb: 'Cari di seluruh proyek: percakapan, pesan, artefak, pengetahuan dan workflow' },
+  { key: 'devices', label: 'Perangkat', icon: '▣', blurb: 'Peramban yang pernah masuk ke akun Anda, sesi aktif, dan notifikasi peramban' },
+  { key: 'metrics', label: 'Metrik', icon: '◈', blurb: 'Angka operasional platform dan keluaran /metrics untuk pemantauan (khusus admin)' },
+  { key: 'growthBackfill', label: 'Pelengkapan data', icon: '⇪', blurb: 'Lengkapi peristiwa pertumbuhan dari tabel asli, dengan pratinjau sebelum dijalankan (khusus admin)' },
+  { key: 'webhookDeliveries', label: 'Riwayat webhook', icon: '⇉', blurb: 'Urutan pengiriman webhook, percobaan, dan tombol kirim ulang' },
 ];
 
 export const TOOL_PAGES: PageKey[] = ['knowledge', 'workflow', 'team', 'artifacts', 'usage', 'audit'];

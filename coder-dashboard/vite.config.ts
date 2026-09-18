@@ -10,6 +10,10 @@ export default defineConfig({
     VitePWA({
       registerType: 'autoUpdate',
       includeAssets: ['favicon.png', 'apple-touch-icon.png'],
+      // Wave 10 (butir 31): notifikasi peramban. Berkas kecil ini disalin apa adanya ke dist/ dan
+      // dimuat oleh service worker utama, jadi push ditangani peramban yang sama yang menyimpan
+      // aplikasi ini sebagai PWA — tidak ada service worker kedua.
+      workbox: { importScripts: ['push-sw.js'] },
       manifest: {
         id: '/',
         name: 'COBLAI Coder',
