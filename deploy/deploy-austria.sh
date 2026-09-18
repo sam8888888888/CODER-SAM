@@ -60,16 +60,36 @@ rm -rf public && mkdir public
 cp -a ../coder-dashboard/dist/. public/
 
 # Secrets live in one persistent file outside the release folders, so a deploy never
-# wipes a provider key. Keys added to the example file are appended with their defaults.
+# wipes a provider key. Butir 32 (Wave 10): penyelarasan kunci memakai deploy/env-sync.sh
+# dengan daftar resmi deploy/env.keys.txt. Skrip itu menambahkan kunci baru beserta nilai
+# bawaannya, TIDAK pernah menimpa nilai lama, melaporkan kunci usang (ENV_OBSOLETE_KEYS)
+# dan kunci asing (ENV_UNKNOWN_KEYS), serta membuat cadangan bernomor .bak.N sebelum
+# berkas diubah. Pratinjau --check dijalankan lebih dulu supaya log deploy memuat daftar
+# kunci yang masih hilang (ENV_MISSING).
 PERSIST="/home/dinda/coder-app/.env"
 if [[ ! -f "\${PERSIST}" ]]; then
   cp .env.austria.example "\${PERSIST}"
 fi
-while IFS= read -r line; do
-  key="\$(printf '%s' "\${line}" | sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p')"
-  [[ -z "\${key}" ]] && continue
-  grep -q "^\${key}=" "\${PERSIST}" || printf '%s\n' "\${line}" >> "\${PERSIST}"
-done < .env.austria.example
+# Jalur relatif terhadap direktori kerja remote (${REMOTE_DIR}/src/coder-platform).
+# Paket tar memuat deploy/ di dalam coder-platform/, jadi kandidat pertama adalah
+# deploy/env-sync.sh; ../deploy/env-sync.sh dipakai bila pengemas menaruh deploy/ di
+# samping coder-platform. Bila tidak ada, deploy berhenti (jangan diam-diam melewatkan).
+ENV_SYNC_SCRIPT=""
+ENV_KEYS_FILE=""
+for candidate in "deploy/env-sync.sh" "../deploy/env-sync.sh"; do
+  if [[ -f "\${candidate}" && -f "\${candidate%/*}/env.keys.txt" ]]; then
+    ENV_SYNC_SCRIPT="\${candidate}"
+    ENV_KEYS_FILE="\${candidate%/*}/env.keys.txt"
+    break
+  fi
+done
+if [[ -z "\${ENV_SYNC_SCRIPT}" ]]; then
+  echo "DEPLOY_ABORTED deploy/env-sync.sh + deploy/env.keys.txt tidak ada di paket (butir 32)" >&2
+  exit 1
+fi
+echo "ENV_SYNC_SCRIPT \${ENV_SYNC_SCRIPT} (daftar kunci: \${ENV_KEYS_FILE})"
+bash "\${ENV_SYNC_SCRIPT}" "\${PERSIST}" --check --keys-file "\${ENV_KEYS_FILE}"
+bash "\${ENV_SYNC_SCRIPT}" "\${PERSIST}" --keys-file "\${ENV_KEYS_FILE}"
 # The running version is reported by the app itself, so the value is refreshed on every deploy.
 if grep -q "^APP_VERSION=" "\${PERSIST}"; then
   sed -i "s#^APP_VERSION=.*#APP_VERSION=${VERSION}#" "\${PERSIST}"

@@ -3,7 +3,7 @@
 Dikumpulkan atas perintah Bapak: "SEMUA MASALAH DAN YANG BELUM BERES, DIKUMPULKAN,
 NANTI TERAKHIR KITA BERESKAN SATU PER SATU."
 
-Versi platform saat daftar ini diperbarui: **v0.19.0 (Wave 9 — deploy tanpa henti, antrean di proses sendiri, gerbang migrasi, harga jual AI)**.
+Versi platform saat daftar ini diperbarui: **v0.20.0 (Wave 10 — gerbang tipe uji, uji UI peramban, webhook berurutan, kuota run berjalan, backfill pertumbuhan, perangkat & sesi, pencarian global, push peramban, penyelarasan `.env`)**. Paketnya sudah dibuat 18 Sep 2026; deploy ke server + smoke produksi belum dijalankan.
 Legenda status: [BAPAK] butuh keputusan/izin Bapak · [TEKNIS] pekerjaan teknis yang bisa saya kerjakan ·
 [FITUR] fitur yang belum ada · [RISIKO] temuan yang berpotensi berbahaya.
 
@@ -91,45 +91,71 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
     dan aman untuk banyak replika. Cara lama (memori proses) sudah tidak dipakai.
 15b. [TEKNIS] Sapuan tabel `rate_limit_hits` masih dijalankan di dalam proses aplikasi (setiap
     menit). Bila nanti ada banyak replika, sapuan sebaiknya dipindahkan ke pekerja terjadwal.
-16. [TEKNIS] Deploy memakai `--force-recreate` -> ada jeda singkat tanpa ketersediaan (belum
-    zero-downtime).
-17. [TEKNIS] Antrean pekerjaan masih SATU PROSES (belum ada Redis/broker, belum bagi beban).
-18. [TEKNIS] `migration-check.ts` berdiri sendiri, tidak ikut runner suite otomatis.
+16. [SELESAI] Wave 9 memasang tukar hijau-biru: profil `green` di `coder-platform/docker-compose.austria.yml`
+    plus `point_nginx`/`wait_ready` di `deploy/deploy-austria.sh` (hijau melayani port 3403 selagi biru
+    dibuat ulang). Terbukti saat deploy v0.19.0 (smoke produksi 176 lulus).
+17. [SELESAI] Antrean kini punya proses/wadah sendiri: layanan `coder-platform-worker` di
+    `coder-platform/docker-compose.austria.yml`, dan produksi memakai `JOB_WORKER_IN_WEB=false` sehingga
+    proses web tidak mengambil pekerjaan. Redis/broker tetap belum ada; itu pekerjaan baru bila nanti
+    butuh banyak pekerja.
+18. [SELESAI] `migration-check.ts` sekarang ikut runner suite sebagai gerbang migrasi (`runMigrationGate()`
+    di `apps/api/test/run-all.cjs`), jadi pemeriksaan skema selalu ikut `npm run verify`.
 19. [TEKNIS] Angka biaya AI (`cost_micros`) belum dicocokkan dengan tagihan DeepSeek nyata.
 20. [TEKNIS] Timer pembaruan TLS certbot belum diverifikasi (sertifikat habis 11 Des 2026).
-21. [TEKNIS] Berkas uji TIDAK diperiksa tipe oleh `tsc` (`apps/api/tsconfig.json` hanya memuat
-    `src/**/*.ts`); kesalahan tipe di suite hanya terlihat saat dijalankan.
-22. [TEKNIS] Belum ada uji UI otomatis di peramban (Playwright/Chromium tidak tersedia di
-    lingkungan kerja ini).
-23. [TEKNIS] Webhook: tidak ada pembersihan otomatis riwayat pengiriman, tidak ada tombol kirim
-    ulang dari UI, tidak ada jaminan urutan peristiwa.
-24. [TEKNIS] Kuota token per kunci API dihitung dari run yang sudah selesai; run yang sedang
-    berjalan belum terhitung sampai selesai.
-25. [TEKNIS] Pengukuran pertumbuhan (`growth_events`) hanya berlaku sejak Wave 7 dipasang;
-    tidak ada backfill data lama.
-26. [TEKNIS] Anti-penyalahgunaan rujukan berbasis email unik + IP pendaftaran: lemah terhadap
-    akun palsu dengan IP berbeda, dan verifikasi email belum diwajibkan.
-27. [TEKNIS] Smoke produksi menulis data uji nyata (satu percakapan di proyek smoke bot setiap
-    dijalankan) — perlu pembersihan berkala atau mode kering.
-28. [TEKNIS] Belum ada halaman UI untuk `/metrics` (endpoint ada, butuh token).
-29. [TEKNIS] Pencarian global lintas proyek belum ada.
-30. [TEKNIS] Multi-bahasa (i18n) belum ada; aplikasi hanya Bahasa Indonesia.
-31. [TEKNIS] Notifikasi hanya di dalam aplikasi (lonceng); belum ada email/push saat
-    `NOTIFY_EMAIL_ENABLED` mati.
-32. [TEKNIS] Deploy script menambah key `.env` baru otomatis: perubahan nama key lama harus
-    diperiksa manual agar tidak ada key usang tertinggal.
-
-32b. [SEBAGIAN] Anti-tipuan program undangan: verifikasi email sekarang diwajibkan untuk aksi AI
-    (Wave 8, butir 7), jadi akun palsu tanpa kotak surat nyata tidak bisa menghasilkan run. Sisa:
-    penjagaan masih hanya email + IP pendaftaran; perlu pemeriksaan tambahan (mis. perangkat).
-32c. [TEKNIS] `growth_events` belum diisi ulang untuk data lama (tanpa backfill). Grafik aktivitas
-    harian dan retensi karena itu baru terisi sejak v0.17.0 — corong (daftar/proyek/run/bayar) tetap
-    berlaku surut karena dibaca dari tabel asli.
-32d. [TEKNIS] Tidak ada suite uji untuk lapisan UI (tidak ada Playwright/Chrome di container), jadi
-    halaman baru hanya diuji render statis (`render-check-wave7.tsx`) dan tsc.
-
-## 4. FITUR YANG BELUM ADA (dibanding chat.coblai.com versi lama)
-
+21. [SELESAI] Berkas uji sekarang diperiksa tipe: `tsconfig.test.json` (akar `coder-platform`, memuat
+    `apps/api/test/**/*.ts`) dijalankan lewat `npx tsc -p tsconfig.test.json` sebagai gerbang PERTAMA
+    `apps/api/test/run-all.cjs`; semua galat tipe suite lama sudah diperbaiki, bukan dimatikan.
+    Terbukti: baris `tsconfig.test.json` muncul di `npm run verify` (39/39 suite hijau, 18 Sep 2026).
+22. [SELESAI] Ada uji UI otomatis di peramban: `playwright` (devDependency `coder-dashboard`) + suite
+    `coder-dashboard/e2e/ui.e2e.mjs` yang menyajikan `dist/` hasil `vite build` dan mengklik alur nyata
+    (daftar akun, masuk, semua halaman Wave 10 lewat menu, cari global, halaman admin, service worker
+    push). Jalankan `cd coder-dashboard && npm run e2e` (`npm run e2e:full` membangun `dist/` dulu) atau
+    `npm run test:ui` dari `coder-platform`. Terbukti 28/28 lulus, 0 gagal, 0 lewat, keluar 0.
+23. [SELESAI] Webhook: kolom `sequence` (monoton per webhook) dan `resend_of` + jaminan urutan
+    (pengiriman berikutnya `deferred` selama kiriman lebih awal masih menunggu, batas
+    `MAX_ORDER_DEFERRALS`), rute kirim ulang `POST /api/v1/webhooks/:id/deliveries/:deliveryId/resend`
+    (jawab 201), tabel riwayat + tombol kirim ulang di halaman Webhook, pembersihan otomatis lewat
+    retensi (`RETENTION_WEBHOOK_DAYS`, bawaan 30) plus tombol bersihkan-sekarang dengan mode kering.
+    Terbukti `webhook-order.e2e.ts` 64/64.
+24. [SELESAI] `runs.reserved_tokens` diisi saat run dari kunci API dimulai, dan `apiKeyUsageToday()`
+    menghitung token run `queued`/`running`; API serta UI menampilkan `inFlightTokens`. Terbukti
+    `wave10.e2e.ts` 137/137 dan `apikey-inflight.e2e.ts` 53/53.
+25. [SELESAI] `backfillGrowthEvents()` mengisi ulang `growth_events` dari tabel asli (`created_at`
+    asli, `source='backfill'`), idempoten, punya mode kering dan mode terapkan, dan bisa dipicu admin
+    (`GET`/`POST /api/v1/admin/growth/backfill`). Terbukti `growth-backfill.e2e.ts` 70/70.
+26. [SELESAI] Anti-penyalahgunaan rujukan kini tiga gerbang: `SAME_EMAIL`, `SAME_IP`, dan `SAME_DEVICE`
+    (tabel `user_devices` + `auth_sessions.device_id`), dan hadiah hanya dibayar bila email undangan
+    sudah diverifikasi (`REFERRAL_REQUIRE_VERIFIED_EMAIL`).
+27. [SELESAI] Smoke: `SMOKE_KEEP_DATA=1` untuk melewati pembersihan, mode kering retensi
+    (`RETENTION_DRY_RUN`), dan pekerjaan berkala `smoke.cleanup` (`SMOKE_CLEANUP_ENABLED`,
+    `SMOKE_CLEANUP_HOURS`, bawaan mati = hanya melaporkan). Pembersihan sungguhan baru berjalan setelah
+    diaktifkan di `.env` produksi.
+28. [SELESAI] Halaman "Metrik" di UI + `GET /api/v1/admin/metrics` (JSON, sesi admin) dan isian token
+    untuk mengambil teks Prometheus mentah. `/metrics` tanpa token tetap menjawab 404 tanpa keterangan.
+29. [SELESAI] `GET /api/v1/search` lintas proyek (FTS5 `message_search` + FTS knowledge + `LIKE` untuk
+    proyek, percakapan, artefak, workflow) dengan kotak cari global di UI. Terbukti `wave10-search.e2e.ts`
+    70/70 dengan 0 lewat.
+30. [SELESAI] Keputusan tetap: Bahasa Indonesia saja, tanpa i18n — ditulis di
+    `docs/KEPUTUSAN_BAHASA_INDONESIA.md` dan dijaga `wave10-bahasa.e2e.ts` (14/14).
+31. [SELESAI] Email (SMTP) + Web Push peramban: `apps/api/src/push.ts` (kunci VAPID disimpan di
+    `platform_settings`, langganan di `push_subscriptions`), service worker `public/push-sw.js`, tombol
+    aktif/nonaktif di Pengaturan, dan rute uji kirim. Email tetap mengikuti `NOTIFY_EMAIL_ENABLED`
+    (bawaan `false`).
+32. [SELESAI] `deploy/env.keys.txt` (daftar resmi 76 kunci + bagian `#usang`) dan `deploy/env-sync.sh`
+    dipanggil `deploy/deploy-austria.sh`: menambah key yang hilang beserta nilai bawaannya, TIDAK pernah
+    menimpa nilai lama, melaporkan `ENV_OBSOLETE_KEYS`/`ENV_UNKNOWN_KEYS`/`ENV_MISSING`/`ENV_ADDED`,
+    cadangan bernomor, idempoten, tanpa `eval`/`source`/`sed -i`, dan hanya mencetak NAMA key. Terbukti
+    `deploy-env-sync.e2e.ts` 70/70. Temuan: `PLATFORM_WEBHOOK_URL` sudah tidak dibaca kode (masuk bagian
+    usang) dan enam key yang dibaca kode belum ada di `.env.austria.example` (sudah ditambahkan).
+32b. [SELESAI] Pemeriksaan perangkat sudah ada: `SAME_DEVICE` (perangkat sama tidak bisa saling
+    merujuk) plus halaman "Perangkat & sesi" (lihat, ubah nama, tandai tepercaya, cabut) dan notifikasi
+    perangkat baru. Hanya itu yang diaktifkan; `DEVICE_VERIFY_NEW` tetap `off` supaya tidak ada risiko
+    akun terkunci.
+32c. [SELESAI] Backfill sudah ada (lihat butir 25): grafik aktivitas harian bisa diisi surut lewat
+    `POST /api/v1/admin/growth/backfill` (idempoten, ada mode kering), sedangkan corong tetap berlaku
+    surut karena dibaca dari tabel asli.
+32d. [SELESAI] Ada suite UI di peramban (Playwright/Chromium terpasang lewat devDependency dashboard),
+    jadi halaman baru diuji dengan klik nyata — bukan hanya `render-check-wave7.tsx` + tsc.
 33. [FITUR] Integrasi pihak ketiga (mis. GitHub, Slack) selain webhook keluar.
 34. [FITUR] Multimodal (unggah gambar/audio untuk percakapan) — lampiran saat ini hanya berkas
     teks.

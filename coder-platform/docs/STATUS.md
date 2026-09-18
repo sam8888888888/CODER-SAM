@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 16 Sep 2026 (versi 0.19.0 LIVE — deploy tanpa henti, antrean di proses sendiri, gerbang migrasi, harga jual AI; smoke produksi 176 PASS / 0 FAIL)
+Terakhir diperbarui: 18 Sep 2026 (versi 0.20.0 SELESAI dikerjakan dan paketnya siap — gerbang tipe uji, uji UI peramban, webhook berurutan, kuota run berjalan, backfill pertumbuhan, perangkat & sesi, pencarian global, push peramban, penyelarasan `.env`. PENTING: yang LIVE di server masih 0.19.0; deploy v0.20.0 dan smoke produksinya belum dijalankan)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -14,6 +14,90 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - DNS `coblai.com` belum dipasang (MX/SPF/DKIM); rinciannya di `docs/DNS_COBLAI_COM.md`.
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
+
+Wave 10 (v0.20.0, 18 Sep 2026) — jawaban butir 21–32D, semuanya di kode dan diuji.
+Catatan jujur: **belum di-deploy**. Yang LIVE di server masih 0.19.0; deploy + smoke produksi
+menunggu izin Bapak.
+
+- **Gerbang tipe untuk berkas uji (butir 21)**: `tsconfig.test.json` di akar `coder-platform` memuat
+  `apps/api/test/**/*.ts`; `apps/api/test/run-all.cjs` menjalankannya dengan `npx tsc -p
+  tsconfig.test.json` sebagai **gerbang PERTAMA**, sebelum gerbang migrasi. Semua galat tipe di suite
+  lama diperbaiki (bukan dimatikan) dan ringkasan `npm run verify` sekarang berbunyi "(termasuk gerbang
+  tipe uji dan gerbang migrasi)".
+- **Uji UI di peramban sungguhan (butir 22 + 32d)**: `playwright` (devDependency dashboard, tidak masuk
+  image produksi) + suite `coder-dashboard/e2e/ui.e2e.mjs`. Suite menyajikan SPA hasil `vite build`
+  (`dist/`) bersama API lokal bermesin mock, lalu mengklik alur nyata: daftar akun, masuk, setiap
+  halaman Wave 10 lewat menu samping, kotak cari global, halaman admin, plus pemeriksaan service worker
+  dan penangan push (gagal di peramban dicatat sebagai galat konsol, jadi halaman kosong tidak dianggap
+  lulus). Jalankan `cd coder-dashboard && npm run e2e` (atau `npm run e2e:full` untuk membangun `dist/`
+  dulu; dari platform: `npm run test:ui`). Hasil terakhir: **28/28 lulus, 0 gagal, 0 lewat, keluar 0**.
+  Dua cacat nyata ditemukan suite ini sendiri: (1) `npx` membungkus server dengan proses cucu sehingga
+  `SIGKILL` tidak menutup pipa stdout — suite mencetak `UI_E2E_PASSED` tetapi prosesnya tidak pernah
+  berakhir (gejala `SELESAI=124`), sudah diganti `process.execPath --import tsx` + penutupan pipa;
+  (2) `dist/` harus ada lebih dulu, dan suite keluar 2 dengan `UI_E2E_SKIPPED` supaya tidak berbohong.
+- **Webhook: urutan, kirim ulang, pembersihan (butir 23)**: kolom `webhook_deliveries.sequence` (monoton
+  per webhook) dan `resend_of`; pengiriman MENUNGGU bila kiriman berurutan lebih awal masih `queued`
+  (status `deferred`, dicoba lagi sampai `MAX_ORDER_DEFERRALS`); header `X-COBLAI-Sequence`; rute
+  `POST /api/v1/webhooks/:id/deliveries/:deliveryId/resend` (jawab **201**); tabel riwayat + tombol
+  "Kirim ulang" di halaman Webhook; pembersihan riwayat lewat retensi (`RETENTION_WEBHOOK_DAYS`, bawaan
+  30) plus tombol bersihkan-sekarang dengan mode kering.
+- **Kuota token termasuk run yang sedang berjalan (butir 24)**: `runs.reserved_tokens` diisi saat run
+  dari kunci API dimulai; `apiKeyUsageToday()` = token selesai + token cadangan run `queued`/`running`;
+  API dan UI menampilkan `inFlightTokens`/`tokensReserved`.
+- **Backfill peristiwa pertumbuhan (butir 25 + 32c)**: `backfillGrowthEvents()` merekonstruksi peristiwa
+  dari tabel nyata (`users`, `projects`, `conversations`, `runs`, `run_usage`, `api_keys`, `webhooks`,
+  `orders`, `referrals`) memakai `created_at` asli, menandai baris `source='backfill'`, idempoten, punya
+  mode kering dan mode terapkan, dan bisa dipicu admin (`GET`/`POST /api/v1/admin/growth/backfill`).
+  Katalog peristiwa tumbuh dari 16 ke 18 (tambah sumber artefak dan workflow).
+- **Perangkat & sesi, verifikasi email (butir 26 + 32b)**: tabel `user_devices`, `auth_sessions.device_id`,
+  halaman "Perangkat & sesi" (daftar, ubah nama, tandai tepercaya, cabut sesi), notifikasi + email
+  "perangkat baru", dan gerbang rujukan baru `SAME_DEVICE` di samping `SAME_EMAIL`/`SAME_IP`; gerbang
+  `DEVICE_VERIFY_NEW` tetap `off` supaya tidak ada risiko akun terkunci.
+- **Mode kering + pembersihan berkala (butir 27)**: `RETENTION_DRY_RUN` + `runRetention({dryRun})`;
+  skrip smoke membersihkan data ujinya sendiri (`SMOKE_KEEP_DATA=1` untuk melewati); pekerjaan berkala
+  `smoke.cleanup` (`SMOKE_CLEANUP_ENABLED`, `SMOKE_CLEANUP_HOURS`) dengan mode lapor bila belum aktif.
+- **Halaman Metrik (butir 28)**: `GET /api/v1/admin/metrics` (sesi admin, JSON) untuk UI + halaman
+  "Metrik" dengan kartu indikator, tabel, tombol segarkan, dan isian token untuk mengambil teks
+  Prometheus mentah. `/metrics` tanpa token yang benar tetap menjawab `404` tanpa keterangan.
+- **Pencarian global lintas proyek (butir 29)**: `apps/api/src/search.ts` memakai FTS5 `message_search`
+  (dijaga trigger insert/delete/update) + FTS knowledge + `LIKE` untuk proyek, percakapan, artefak, dan
+  workflow. Rute `GET /api/v1/search?q=`, `GET /api/v1/search/status`, `POST
+  /api/v1/admin/search/reindex`. Kata kunci di bawah 2 huruf ditolak `400 SEARCH_QUERY_TOO_SHORT`, di
+  atas 200 huruf `400 SEARCH_QUERY_TOO_LONG`, istilah dipotong, dan hasil hanya dari ruang kerja tempat
+  pengguna menjadi anggota.
+- **Bahasa Indonesia saja (butir 30)**: keputusan tetap ditulis di `docs/KEPUTUSAN_BAHASA_INDONESIA.md`
+  (tidak ada i18n; `error` = kode mesin, `message` = kalimat Indonesia) dan dijaga suite
+  `apps/api/test/wave10-bahasa.e2e.ts` (14 pemeriksaan). Suite itu menemukan satu ketidakcocokan nyata:
+  enam jawaban `WEBHOOK_NOT_FOUND` tidak punya `message` — sekarang semuanya memakai "Webhook itu tidak
+  ditemukan di ruang kerja ini."
+- **Notifikasi email dan push peramban (butir 31)**: `apps/api/src/push.ts` (kunci VAPID dibuat sekali dan
+  disimpan di `platform_settings`; langganan di `push_subscriptions`), rute `GET /api/v1/push/key`,
+  `GET/POST/DELETE /api/v1/account/push*`, `POST /api/v1/account/push/test`; service worker
+  `coder-dashboard/public/push-sw.js` menangani `push` + `notificationclick`; tombol aktif/nonaktif di
+  Pengaturan. Kunci pribadi VAPID tidak pernah ikut dalam jawaban API (juga diperiksa smoke produksi).
+- **Penyelarasan kunci `.env` (butir 32)**: `deploy/env.keys.txt` (daftar resmi 76 kunci + komentar, satu
+  bagian `#usang`) dan `deploy/env-sync.sh` (`--check` untuk pratinjau): menambah kunci yang hilang
+  beserta nilai bawaannya, **tidak pernah menimpa nilai lama**, melaporkan `ENV_MISSING`/`ENV_ADDED`/
+  `ENV_OBSOLETE_KEYS`/`ENV_UNKNOWN_KEYS`, cadangan bernomor `<env>.bak.1/.bak.2` hanya bila ada
+  penambahan, idempoten, tanpa `eval`/`source`/`sed -i`, dan hanya mencetak NAMA kunci (nilai rahasia
+  tidak pernah muncul di log). Dipanggil `deploy/deploy-austria.sh` (pratinjau dulu, lalu penyelarasan;
+  berhenti `DEPLOY_ABORTED` bila berkas tidak ikut dalam paket) dan diuji suite
+  `apps/api/test/deploy-env-sync.e2e.ts` (70 pemeriksaan, semuanya di `/tmp`; berkas `.env` sungguhan
+  tidak disentuh). Dua temuan nyata: (1) `PLATFORM_WEBHOOK_URL` terbukti tidak pernah dibaca kode
+  (`config.ts` hanya mendeklarasikan skema) → masuk bagian `#usang` dan hanya dilaporkan, tidak dihapus;
+  (2) enam kunci yang SUDAH dibaca kode (`CSRF_STRICT`, `WORKER_ONLY`, empat `RATE_LIMIT_*`) belum ada
+  di `.env.austria.example` → sekarang ditambahkan beserta nilai bawaannya supaya tidak lagi muncul
+  sebagai kunci asing. Satu kunci sisa (`MOCK_ENGINE_SILENT_USAGE`) sengaja TIDAK dimasukkan karena
+  hanya dipakai suite uji.
+- **Paket rilis kini bisa dibuat ulang**: `deploy/buat-paket.sh <versi>` membangun
+  `deploy/coder-sam-university-v<versi>.tar.gz` dari berkas yang sudah di-commit (`git ls-files`), jadi
+  `node_modules`/`dist`/`.env`/`data` tidak pernah ikut, dan wajib menyertakan
+  `coder-platform/deploy/env-sync.sh` + `env.keys.txt` (kalau tidak ada, skrip gagal) — inilah sebab
+  berkas penyelarasan `.env` harus di-commit sebelum paket dibuat.
+- **Kebersihan uji**: cabang `skip(...)` bersyarat di tiga suite Wave 10 (`webhook-order`,
+  `wave10-search`, `growth-backfill`) diubah menjadi `check(...)` keras setelah kode memenuhi spec, jadi
+  regresi di masa depan akan terlihat sebagai GAGAL, bukan dilewati diam-diam. Suite Wave 10 sekarang
+  melaporkan **skip 0**.
 
 Wave 9 (v0.19.0, 16 Sep 2026) — jawaban butir 16–20, semuanya di kode dan diuji:
 
