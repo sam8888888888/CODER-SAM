@@ -91,11 +91,43 @@ const Env = z.object({
   // tier limit still applies, so an owner can hand out a key without thinking about numbers.
   API_KEY_DAILY_REQUESTS_DEFAULT: z.coerce.number().int().min(0).default(0),
   API_KEY_DAILY_TOKENS_DEFAULT: z.coerce.number().int().min(0).default(0),
+  /**
+   * Wave 10 (item 24): a run that is still in flight has not produced any usage row yet, so its cost
+   * would escape the per-key ceiling until it finished. The API therefore reserves an estimate at
+   * start: the prompt tokens counted by the engine adapter plus this allowance for the answer. Zero
+   * turns the reservation off and restores the old behaviour.
+   */
+  API_KEY_INFLIGHT_OUTPUT_TOKENS: z.coerce.number().int().min(0).default(4000),
+  /** Wave 10 (item 23): how long a delivery history row is kept before the retention pass removes it. */
+  RETENTION_WEBHOOK_DAYS: z.coerce.number().int().min(1).default(30),
+  /** Wave 10 (item 27): `true` makes every retention pass report what it would delete and delete nothing. */
+  RETENTION_DRY_RUN: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
+  /**
+   * Wave 10 (item 26): the device an account signs in from. Tracking is what feeds the "Perangkat &
+   * sesi" page and the referral device check. `DEVICE_VERIFY_NEW` follows the email server by default
+   * and stays off, so a new device is reported but never locks the owner out unless he asks for it.
+   */
+  DEVICE_TRACKING: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
+  DEVICE_VERIFY_NEW: z.enum(["auto", "on", "off"]).default("off"),
+  /** Wave 10 (item 26): a ceiling on remembered browsers, so the device list cannot grow without end. */
+  DEVICE_MAX_PER_USER: z.coerce.number().int().min(1).max(50).default(20),
+  /** Wave 10 (item 27): leftover data from the production smoke run, cleaned on a schedule. */
+  SMOKE_CLEANUP_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
+  SMOKE_CLEANUP_HOURS: z.coerce.number().int().min(1).default(24),
+  SMOKE_ACCOUNT_EMAIL: z.string().default("smoke.bot@coder.sam.university"),
+  /** Wave 10 (item 29): how many hits one global search may return per group. */
+  SEARCH_MAX_RESULTS: z.coerce.number().int().min(1).max(100).default(10),
+  /** Wave 10 (item 31): browser push. The VAPID key pair is generated once and kept in the database. */
+  PUSH_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
+  PUSH_SUBJECT: z.string().default("mailto:noreply@coblai.com"),
+  PUSH_MAX_PER_USER: z.coerce.number().int().min(1).max(20).default(5),
   // Wave 7: referral programme. The reward is token credit, granted only AFTER the invited account
   // finishes its first run, so "register many accounts and collect at once" does not pay out.
   REFERRAL_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
   REFERRAL_INVITER_TOKENS: z.coerce.number().int().min(0).default(500000),
   REFERRAL_INVITEE_TOKENS: z.coerce.number().int().min(0).default(250000),
+  /** Wave 10 (item 26): a rewarded invitee must have proven its email address first. */
+  REFERRAL_REQUIRE_VERIFIED_EMAIL: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
   // Zero means "no ceiling". A ceiling keeps a single account from farming the programme forever.
   REFERRAL_MAX_REWARDED_PER_USER: z.coerce.number().int().min(0).default(50),
   // Wave 7: default window (in days) for the admin growth screen when the request names no window.

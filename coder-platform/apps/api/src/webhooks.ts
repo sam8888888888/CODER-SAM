@@ -24,6 +24,12 @@ export type WebhookRow = {
 
 export type WebhookDeliveryRow = {
   id: string; webhookId: string; event: string; payload: unknown; status: string; attempts: number;
+  /** Wave 10 (item 23): the position of this event in the hook's own stream, counted from 1. */
+  sequence: number | null;
+  /** Wave 10 (item 23): set when an operator sent this delivery again; points at the first row. */
+  resendOf: string | null;
+  /** Wave 10 (item 23): how often this row stepped aside because an earlier event was still pending. */
+  deferrals: number;
   responseStatus: number | null; lastError: string | null; durationMs: number | null; jobId: string | null;
   createdAt: string; updatedAt: string; deliveredAt: string | null;
 };
@@ -78,6 +84,8 @@ function toDeliveryRow(value: any): WebhookDeliveryRow | null {
   return {
     id: String(value.id), webhookId: String(value.webhookId), event: String(value.event), payload,
     status: String(value.status), attempts: Number(value.attempts ?? 0),
+    sequence: value.sequence === null || value.sequence === undefined ? null : Number(value.sequence),
+    resendOf: value.resendOf ?? null, deferrals: Number(value.deferrals ?? 0),
     responseStatus: value.responseStatus === null || value.responseStatus === undefined ? null : Number(value.responseStatus),
     lastError: value.lastError ?? null, durationMs: value.durationMs === null || value.durationMs === undefined ? null : Number(value.durationMs),
     jobId: value.jobId ?? null, createdAt: String(value.createdAt), updatedAt: String(value.updatedAt), deliveredAt: value.deliveredAt ?? null,
@@ -86,7 +94,7 @@ function toDeliveryRow(value: any): WebhookDeliveryRow | null {
 
 const HOOK_COLUMNS = `id, workspace_id AS workspaceId, user_id AS userId, url, events, active, description,
   created_at AS createdAt, updated_at AS updatedAt, last_delivery_at AS lastDeliveryAt, last_status AS lastStatus, failure_count AS failureCount`;
-const DELIVERY_COLUMNS = `id, webhook_id AS webhookId, event, payload, status, attempts, response_status AS responseStatus,
+const DELIVERY_COLUMNS = `id, webhook_id AS webhookId, event, payload, status, attempts, sequence, resend_of AS resendOf, deferrals, response_status AS responseStatus,
   last_error AS lastError, duration_ms AS durationMs, job_id AS jobId, created_at AS createdAt, updated_at AS updatedAt, delivered_at AS deliveredAt`;
 
 export function countWebhooks(workspaceId: string): number {
@@ -119,6 +127,12 @@ export function getWebhook(workspaceId: string, id: string): WebhookRow | null {
   return row ? toHookRow(row) : null;
 }
 
+/** The row for one id without the secret; the queue has no session, so it cannot name a workspace. */
+export function webhookRowById(id: string): WebhookRow | null {
+  const row = db.prepare(`SELECT ${HOOK_COLUMNS} FROM webhooks WHERE id=?`).get(id) as any;
+  return row ? toHookRow(row) : null;
+}
+
 /** Internal use only: delivery needs the secret, so it never reaches a route response. */
 function webhookWithSecret(id: string): (WebhookRow & { secret: string }) | null {
   const row = db.prepare(`SELECT ${HOOK_COLUMNS}, secret FROM webhooks WHERE id=?`).get(id) as any;
@@ -144,7 +158,10 @@ export function deleteWebhook(workspaceId: string, id: string): boolean {
 
 export function listDeliveries(webhookId: string, limit = 50): WebhookDeliveryRow[] {
   const size = Math.min(Math.max(Number(limit) || 50, 1), 200);
-  const rows = db.prepare(`SELECT ${DELIVERY_COLUMNS} FROM webhook_deliveries WHERE webhook_id=? ORDER BY created_at DESC LIMIT ?`).all(webhookId, size) as any[];
+  // Wave 10 (item 23): newest first by the stream position when there is one, so the page shows the
+  // same order in which the events were produced rather than the order in which they were written.
+  const rows = db.prepare(`SELECT ${DELIVERY_COLUMNS} FROM webhook_deliveries WHERE webhook_id=?
+    ORDER BY COALESCE(sequence, 0) DESC, created_at DESC LIMIT ?`).all(webhookId, size) as any[];
   return rows.map((row) => toDeliveryRow(row) as WebhookDeliveryRow);
 }
 
@@ -160,20 +177,95 @@ export function hooksFor(workspaceId: string, event: WebhookEvent): (WebhookRow 
 
 /** The body that is signed and sent. Kept in one place so the signature always matches the payload. */
 function deliveryBody(delivery: WebhookDeliveryRow): string {
-  return JSON.stringify({ id: delivery.id, event: delivery.event, createdAt: delivery.createdAt, data: delivery.payload ?? {} });
+  return JSON.stringify({ id: delivery.id, event: delivery.event, createdAt: delivery.createdAt, sequence: delivery.sequence, data: delivery.payload ?? {} });
 }
+
+/**
+ * Wave 10 (item 23): how long a delivery steps aside for an earlier one, and how many times.
+ * After the last step the event is sent out of order on purpose: a receiver that is slow must not hold
+ * every later event of the hook forever. The sequence header still lets the receiver sort its side.
+ */
+/** Gap before a held-back delivery is tried again, in milliseconds. */
+export const ORDER_DEFER_DELAY_MS = 3000;
+/**
+ * How many times one delivery may step aside before it is sent out of order anyway. It is exported so
+ * the tests and the operations screen can talk about the same number instead of copying it.
+ */
+export const MAX_ORDER_DEFERRALS = 40;
 
 export function signPayload(secret: string, timestamp: string, body: string): string {
   return "sha256=" + createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex");
 }
 
+/** The next free position in this hook's stream. Counting from the highest row keeps it gap free. */
+export function nextSequence(webhookId: string): number {
+  const row = db.prepare("SELECT COALESCE(MAX(sequence), 0) AS last FROM webhook_deliveries WHERE webhook_id=?").get(webhookId) as { last: number };
+  return Number(row.last) + 1;
+}
+
 /** Stores one delivery row. `jobId` is empty when the caller sends the request straight away. */
-export function createDeliveryRow(input: { webhookId: string; event: string; payload: unknown; jobId?: string | null; id?: string }): WebhookDeliveryRow {
+export function createDeliveryRow(input: { webhookId: string; event: string; payload: unknown; jobId?: string | null; id?: string; resendOf?: string | null }): WebhookDeliveryRow {
   const id = input.id ?? randomUUID();
   const now = new Date().toISOString();
-  db.prepare("INSERT INTO webhook_deliveries (id,webhook_id,event,payload,status,attempts,job_id,created_at,updated_at) VALUES (?,?,?,?,?,0,?,?,?)")
-    .run(id, input.webhookId, input.event, JSON.stringify(input.payload ?? {}), "queued", input.jobId ?? null, now, now);
+  const sequence = nextSequence(input.webhookId);
+  db.prepare("INSERT INTO webhook_deliveries (id,webhook_id,event,payload,status,attempts,job_id,created_at,updated_at,sequence,resend_of) VALUES (?,?,?,?,?,0,?,?,?,?,?)")
+    .run(id, input.webhookId, input.event, JSON.stringify(input.payload ?? {}), "queued", input.jobId ?? null, now, now, sequence, input.resendOf ?? null);
   return getDelivery(id) as WebhookDeliveryRow;
+}
+
+/**
+ * Wave 10 (item 23): an operator sends one recorded event again.
+ *
+ * A new row is created instead of resetting the old one: the history of the first attempt must stay
+ * readable, and the new row takes the next position in the stream so the receiver still sees an
+ * ordered, complete sequence. It is refused while the same event is still waiting to be delivered.
+ */
+export function resendDelivery(deliveryId: string): { delivery: WebhookDeliveryRow; jobId: string } | { error: string; message: string } {
+  const original = getDelivery(deliveryId);
+  if (!original) return { error: "WEBHOOK_DELIVERY_NOT_FOUND", message: "Riwayat pengiriman itu tidak ditemukan." };
+  if (original.status === "queued") return { error: "WEBHOOK_DELIVERY_PENDING", message: "Pengiriman itu masih menunggu di antrean. Tunggu sampai selesai sebelum mengirim ulang." };
+  const id = randomUUID();
+  const delivery = createDeliveryRow({ id, webhookId: original.webhookId, event: original.event, payload: original.payload, resendOf: original.id });
+  const job = enqueueJob({ kind: "webhook.deliver", payload: { deliveryId: id }, maxAttempts: config.WEBHOOK_MAX_ATTEMPTS, dedupeKey: `webhook.deliver:${id}` });
+  if (job.id) db.prepare("UPDATE webhook_deliveries SET job_id=?, updated_at=? WHERE id=?").run(job.id, new Date().toISOString(), id);
+  return { delivery: getDelivery(id) as WebhookDeliveryRow, jobId: job.id ?? "" };
+}
+
+/**
+ * Wave 10 (item 23): the event that must go out before this one can.
+ *
+ * Events of one hook are delivered in the order they happened. A row steps aside while an earlier row
+ * of the same hook is still waiting in the queue, or is being retried by it. A row that finally failed,
+ * or one whose job is done, never holds the stream back: an undeliverable event must not block every
+ * later event forever.
+ */
+export function blockingEarlierDelivery(delivery: WebhookDeliveryRow): WebhookDeliveryRow | null {
+  if (delivery.sequence === null || delivery.sequence === undefined) return null;
+  const row = db.prepare(`SELECT ${DELIVERY_COLUMNS} FROM webhook_deliveries d
+    WHERE d.webhook_id=? AND d.sequence IS NOT NULL AND d.sequence < ? AND d.id <> ?
+      AND (d.status='queued' OR (d.status='failed' AND EXISTS (SELECT 1 FROM jobs j WHERE j.id=d.job_id AND j.status IN ('queued','running'))))
+    ORDER BY d.sequence ASC LIMIT 1`).get(delivery.webhookId, delivery.sequence, delivery.id) as any;
+  return toDeliveryRow(row);
+}
+
+/** Counts how often one row stepped aside, so an operator can see a slow receiver. */
+function noteDeferral(deliveryId: string): number {
+  db.prepare("UPDATE webhook_deliveries SET deferrals=deferrals+1, updated_at=? WHERE id=?").run(new Date().toISOString(), deliveryId);
+  return Number((db.prepare("SELECT deferrals AS n FROM webhook_deliveries WHERE id=?").get(deliveryId) as { n: number }).n);
+}
+
+/** Removes old rows of the delivery history. Used by the retention pass and by the admin button. */
+export function cleanupWebhookDeliveries(options: { days?: number; dryRun?: boolean; webhookId?: string | null } = {}): { cutoff: string; candidates: number; removed: number; dryRun: boolean } {
+  const days = Math.max(1, Math.round(options.days ?? config.RETENTION_WEBHOOK_DAYS));
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const scope = options.webhookId ? " AND webhook_id=?" : "";
+  const args: unknown[] = options.webhookId ? [cutoff, options.webhookId] : [cutoff];
+  // Only rows that are finished count as candidates: a queued row is work in progress and is protected.
+  const candidates = Number((db.prepare(`SELECT COUNT(*) AS n FROM webhook_deliveries WHERE created_at < ? AND status IN ('delivered','failed')${scope}`).get(...args) as { n: number }).n);
+  if (options.dryRun) return { cutoff, candidates, removed: 0, dryRun: true };
+  // A row that is still waiting, or being retried, is never removed: it is still work in progress.
+  const removed = Number(db.prepare(`DELETE FROM webhook_deliveries WHERE created_at < ? AND status IN ('delivered','failed')${scope}`).run(...args).changes ?? 0);
+  return { cutoff, candidates, removed, dryRun: false };
 }
 
 /** Queues one delivery. The dedupe key is the delivery id, so a retry never creates a second event. */
@@ -219,9 +311,33 @@ export type DeliveryReport = { status: string; responseStatus: number | null; er
  * One delivery attempt. The queue handler calls this, and the "test" route calls it once, so the same
  * signing and recording code is used in both places.
  */
-export async function deliverWebhook(deliveryId: string): Promise<DeliveryReport> {
+export async function deliverWebhook(deliveryId: string, options: { force?: boolean } = {}): Promise<DeliveryReport> {
   const delivery = getDelivery(deliveryId);
   if (!delivery) throw new Error("WEBHOOK_DELIVERY_NOT_FOUND");
+  // A manual test is sent at once: the person watching the sender wants the receiver's answer now,
+  // and the order rule only exists to keep automated events in sequence.
+  const blocker = options.force ? null : blockingEarlierDelivery(delivery);
+  // The note about a send that overtook an earlier event is kept even when the receiver answers 200,
+  // because it explains the order of the history. It is NOT a failure and it is not a redelivery hint.
+  let orderNote: string | null = null;
+  if (blocker) {
+    // The counter counts the times the row really stepped aside. The attempt that gives up and sends
+    // anyway is NOT counted: it did not step aside, and the operator reads this number as waiting time.
+    if (Number(delivery.deferrals ?? 0) < MAX_ORDER_DEFERRALS) {
+      const deferrals = noteDeferral(deliveryId);
+      enqueueJob({
+        kind: "webhook.deliver",
+        payload: { deliveryId },
+        runAfter: new Date(Date.now() + ORDER_DEFER_DELAY_MS).toISOString(),
+        maxAttempts: config.WEBHOOK_MAX_ATTEMPTS,
+        dedupeKey: `webhook.deliver:${deliveryId}:defer:${deferrals}`,
+      });
+      return { status: "deferred", responseStatus: null, error: null, durationMs: 0 };
+    }
+    orderNote = `Dikirim mendahului peristiwa #${blocker.sequence} setelah menunggu terlalu lama.`;
+    db.prepare("UPDATE webhook_deliveries SET last_error=?, updated_at=? WHERE id=?")
+      .run(orderNote, new Date().toISOString(), deliveryId);
+  }
   const hook = webhookWithSecret(delivery.webhookId);
   const now = new Date().toISOString();
   const attempts = delivery.attempts + 1;
@@ -248,6 +364,7 @@ export async function deliverWebhook(deliveryId: string): Promise<DeliveryReport
         "x-coblai-event": delivery.event,
         "x-coblai-delivery": delivery.id,
         "x-coblai-timestamp": timestamp,
+        "x-coblai-sequence": delivery.sequence === null || delivery.sequence === undefined ? "" : String(delivery.sequence),
         "x-coblai-signature": signPayload(hook.secret, timestamp, body),
       },
       body,
@@ -262,27 +379,30 @@ export async function deliverWebhook(deliveryId: string): Promise<DeliveryReport
   const durationMs = Date.now() - started;
   const finishedAt = new Date().toISOString();
   if (!error && status >= 200 && status < 300) {
-    db.prepare("UPDATE webhook_deliveries SET status='delivered', attempts=?, response_status=?, last_error=NULL, duration_ms=?, updated_at=?, delivered_at=? WHERE id=?")
-      .run(attempts, status, durationMs, finishedAt, finishedAt, deliveryId);
+    db.prepare("UPDATE webhook_deliveries SET status='delivered', attempts=?, response_status=?, last_error=?, duration_ms=?, updated_at=?, delivered_at=? WHERE id=?")
+      .run(attempts, status, orderNote, durationMs, finishedAt, finishedAt, deliveryId);
     db.prepare("UPDATE webhooks SET last_delivery_at=?, last_status=?, failure_count=0, updated_at=? WHERE id=?").run(finishedAt, `delivered:${status}`, finishedAt, hook.id);
     return { status: "delivered", responseStatus: status, error: null, durationMs };
   }
+  // A failure message wins over the order note, so the operator sees why the event did not arrive.
   db.prepare("UPDATE webhook_deliveries SET status='failed', attempts=?, response_status=?, last_error=?, duration_ms=?, updated_at=? WHERE id=?")
-    .run(attempts, status || null, error, durationMs, finishedAt, deliveryId);
+    .run(attempts, status || null, error ?? orderNote, durationMs, finishedAt, deliveryId);
   db.prepare("UPDATE webhooks SET last_delivery_at=?, last_status=?, failure_count=failure_count+1, updated_at=? WHERE id=?").run(finishedAt, `failed:${status || "no-response"}`, finishedAt, hook.id);
   // Throwing makes the job queue retry with its own backoff; the row keeps the last error for the operator.
   throw new Error(error ?? "Pengiriman webhook gagal.");
 }
 
-export function webhookStats(workspaceId?: string): { hooks: number; active: number; deliveries: number; queued: number; delivered: number; failed: number; lastDeliveryAt: string | null } {
+export function webhookStats(workspaceId?: string): { hooks: number; active: number; deliveries: number; queued: number; delivered: number; failed: number; deferred: number; oldestQueuedAt: string | null; lastDeliveryAt: string | null } {
   const filter = workspaceId ? " WHERE workspace_id=?" : "";
   const args = workspaceId ? [workspaceId] : [];
   const hooks = db.prepare(`SELECT COUNT(*) AS total, COALESCE(SUM(active),0) AS active FROM webhooks${filter}`).get(...args) as { total: number; active: number };
   const delivered = db.prepare(`SELECT COUNT(*) AS total FROM webhook_deliveries d JOIN webhooks w ON w.id=d.webhook_id WHERE d.status='delivered'${workspaceId ? " AND w.workspace_id=?" : ""}`).get(...args) as { total: number };
   const failed = db.prepare(`SELECT COUNT(*) AS total FROM webhook_deliveries d JOIN webhooks w ON w.id=d.webhook_id WHERE d.status='failed'${workspaceId ? " AND w.workspace_id=?" : ""}`).get(...args) as { total: number };
   const queued = db.prepare(`SELECT COUNT(*) AS total FROM webhook_deliveries d JOIN webhooks w ON w.id=d.webhook_id WHERE d.status='queued'${workspaceId ? " AND w.workspace_id=?" : ""}`).get(...args) as { total: number };
+  const deferred = db.prepare(`SELECT COUNT(*) AS total FROM webhook_deliveries d JOIN webhooks w ON w.id=d.webhook_id WHERE d.deferrals > 0${workspaceId ? " AND w.workspace_id=?" : ""}`).get(...args) as { total: number };
   const last = db.prepare(`SELECT MAX(d.created_at) AS at FROM webhook_deliveries d JOIN webhooks w ON w.id=d.webhook_id${filter}`).get(...args) as { at: string | null };
-  return { hooks: Number(hooks.total), active: Number(hooks.active), deliveries: Number(queued.total) + Number(delivered.total) + Number(failed.total), queued: Number(queued.total), delivered: Number(delivered.total), failed: Number(failed.total), lastDeliveryAt: last.at ?? null };
+  const oldest = db.prepare(`SELECT MIN(d.created_at) AS at FROM webhook_deliveries d JOIN webhooks w ON w.id=d.webhook_id WHERE d.status='queued'${workspaceId ? " AND w.workspace_id=?" : ""}`).get(...args) as { at: string | null };
+  return { hooks: Number(hooks.total), active: Number(hooks.active), deliveries: Number(queued.total) + Number(delivered.total) + Number(failed.total), queued: Number(queued.total), delivered: Number(delivered.total), failed: Number(failed.total), deferred: Number(deferred.total), oldestQueuedAt: oldest.at ?? null, lastDeliveryAt: last.at ?? null };
 }
 
 /** Documents the event names so the UI and the docs never drift apart. */

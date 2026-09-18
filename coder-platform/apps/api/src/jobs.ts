@@ -26,7 +26,7 @@ import { db } from "./db.js";
 export type JobStatus = "queued" | "running" | "done" | "failed";
 
 /** Jenis pekerjaan yang dikenal platform. Jenis lain tetap boleh (dipakai uji), tetapi bukan bawaan. */
-export const JOB_KINDS = ["run.execute", "email.deliver", "retention.run", "run.reap", "workflow.reap", "webhook.deliver"] as const;
+export const JOB_KINDS = ["run.execute", "email.deliver", "retention.run", "smoke.cleanup", "run.reap", "workflow.reap", "webhook.deliver"] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 export type JobRow = {
@@ -225,6 +225,9 @@ export function ensureRecurringJobs(now: Date = new Date()): string[] {
   const schedule: { kind: string; intervalMs: number; enabled: boolean; payload?: unknown; maxAttempts?: number }[] = [
     { kind: "email.deliver", intervalMs: 60_000, enabled: config.NOTIFY_EMAIL_ENABLED, maxAttempts: 3 },
     { kind: "retention.run", intervalMs: 6 * 60 * 60 * 1000, enabled: true, maxAttempts: 2 },
+    // Wave 10 (item 27): the production smoke test writes real rows so that every check is real. This
+    // pass clears them again, and it only runs when the operator switched it on.
+    { kind: "smoke.cleanup", intervalMs: Math.max(60_000, config.SMOKE_CLEANUP_HOURS * 60 * 60 * 1000), enabled: config.SMOKE_CLEANUP_ENABLED, maxAttempts: 2 },
     { kind: "run.reap", intervalMs: REAP_INTERVAL_MS, enabled: true, maxAttempts: 1 },
     { kind: "workflow.reap", intervalMs: REAP_INTERVAL_MS, enabled: true, maxAttempts: 1 },
   ];

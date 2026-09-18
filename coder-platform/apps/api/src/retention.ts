@@ -5,15 +5,15 @@ import { config } from "./config.js";
  *  The report always works and never changes anything. Deletion happens only when RETENTION_ENABLED=true
  *  and the caller asks for a real run, so an operator can review the numbers first. */
 
-export type RetentionPolicy = { enabled: boolean; auditDays: number; notificationDays: number; runEventDays: number; exportDays: number };
+export type RetentionPolicy = { enabled: boolean; dryRunForced: boolean; auditDays: number; notificationDays: number; runEventDays: number; exportDays: number; webhookDays: number };
 
 export type RetentionTableReport = { table: string; column: string; cutoff: string; candidates: number; removed: number };
 
 export function retentionPolicy(): RetentionPolicy {
   return {
-    enabled: config.RETENTION_ENABLED, auditDays: config.RETENTION_AUDIT_DAYS,
+    enabled: config.RETENTION_ENABLED, dryRunForced: config.RETENTION_DRY_RUN, auditDays: config.RETENTION_AUDIT_DAYS,
     notificationDays: config.RETENTION_NOTIFICATION_DAYS, runEventDays: config.RETENTION_RUN_EVENT_DAYS,
-    exportDays: config.RETENTION_EXPORT_DAYS,
+    exportDays: config.RETENTION_EXPORT_DAYS, webhookDays: config.RETENTION_WEBHOOK_DAYS,
   };
 }
 
@@ -26,6 +26,9 @@ const TARGETS: Target[] = [
   { table: "notifications", column: "created_at", where: "created_at < ?", days: (policy) => policy.notificationDays },
   { table: "run_events", column: "created_at", where: "created_at < ?", days: (policy) => policy.runEventDays },
   { table: "auth_tokens", column: "expires_at", where: "expires_at < ?", days: (policy) => 1 },
+  // Wave 10 (item 23): the history of a busy hook grows without limit. Only rows that are finished are
+  // removed: a delivery that is still waiting, or being retried, is work in progress.
+  { table: "webhook_deliveries", column: "created_at", where: "created_at < ? AND status IN ('delivered','failed')", days: (policy) => policy.webhookDays },
 ];
 
 /** Wave 8: how long a closed account can still be recovered before its rows are removed. */
@@ -101,7 +104,12 @@ export function retentionReport(now = new Date()): { policy: RetentionPolicy; ge
 export function runRetention(options: { dryRun?: boolean; now?: Date } = {}): { policy: RetentionPolicy; dryRun: boolean; tables: RetentionTableReport[]; totalRemoved: number; reason?: string; purgedAccounts?: number; removedWorkspaces?: string[] } {
   const now = options.now ?? new Date();
   const policy = retentionPolicy();
-  const dryRun = options.dryRun ?? !policy.enabled;
+  // Wave 10 (item 27): RETENTION_DRY_RUN=true keeps the pass in report mode even when a caller asks for
+  // a real run. It is the seat belt for an operator who wants the numbers without the deletion.
+  const dryRun = policy.dryRunForced || (options.dryRun ?? !policy.enabled);
+  if (policy.dryRunForced) {
+    return { policy, dryRun: true, tables: retentionReport(now).tables, totalRemoved: 0, reason: "RETENTION_DRY_RUN" };
+  }
   if (!policy.enabled && !dryRun) {
     return { policy, dryRun: true, tables: retentionReport(now).tables, totalRemoved: 0, reason: "RETENTION_DISABLED" };
   }

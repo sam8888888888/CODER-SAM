@@ -111,9 +111,12 @@ function expectedBaseMicros(model: string, input: number, output: number, cacheR
   return Math.round(usd * 1e6);
 }
 
-// ------------------------------------------------------------------ 1) skema 17
+// ------------------------------------------------------------------ 1) skema terbaru
+// Versi diambil dari modul basis data, bukan angka mati, supaya uji ini tidak basi setiap Wave
+// menambah migrasi. Yang diperiksa tetap artinya sama: kolom migrasi cocok dengan versi kode.
+const expectedSchema = (await import("../src/db.js")).SCHEMA_VERSION;
 const version = Number((scalar<{ v: number }>("SELECT MAX(version) AS v FROM schema_migrations") ?? { v: 0 }).v);
-check("1) skema basis data versi 17", version === 17, String(version));
+check(`1) skema basis data versi ${expectedSchema}`, version === expectedSchema, String(version));
 const overrideTable = scalar<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name='model_price_overrides'");
 check("1) tabel model_price_overrides ada", overrideTable?.name === "model_price_overrides", JSON.stringify(overrideTable));
 const overrideCols = columnsOf("model_price_overrides").map((row) => row.name);
@@ -298,7 +301,7 @@ if (!usageRow) {
   const setMarkup3 = await admin.call("PUT", "/api/v1/admin/pricing/settings", { markup: 3 });
   check("5) PUT markup 3 -> 200 ok", setMarkup3.status === 200 && setMarkup3.json?.markup === 3, JSON.stringify(setMarkup3.json)?.slice(0, 200));
   check("5) rowsUpdated menghitung baris run_usage yang dihitung ulang", Number(setMarkup3.json?.rowsUpdated) >= 1, String(setMarkup3.json?.rowsUpdated));
-  const afterRow = scalar("SELECT cost_micros AS costMicros, sell_cost_micros AS sellCostMicros FROM run_usage WHERE run_id=?", usageRow.runId);
+  const afterRow = scalar<{ costMicros: number; sellCostMicros: number }>("SELECT cost_micros AS costMicros, sell_cost_micros AS sellCostMicros FROM run_usage WHERE run_id=?", usageRow.runId);
   check("5) harga pokok TIDAK berubah saat markup dinaikkan", Number(afterRow?.costMicros) === Number(usageRow.costMicros), JSON.stringify(afterRow));
   check("5) sell_cost_micros dihitung ulang = ROUND(cost_micros x 3)", Number(afterRow?.sellCostMicros) === Math.round(Number(usageRow.costMicros) * 3), `${afterRow?.sellCostMicros} vs ${Math.round(Number(usageRow.costMicros) * 3)}`);
   console.log(`INFO setelah markup 3: cost_micros=${afterRow?.costMicros} sell_cost_micros=${afterRow?.sellCostMicros} token=${usageRow.inputTokens}/${usageRow.outputTokens} model=${usageRow.model}`);
@@ -381,7 +384,7 @@ check("8) validatePrice menerima harga wajar", vNormal === null, String(vNormal)
 const setMarkup1 = await admin.call("PUT", "/api/v1/admin/pricing/settings", { markup: 1 });
 check("9) markup dikembalikan ke 1 -> 200 ok", setMarkup1.status === 200 && setMarkup1.json?.markup === 1, JSON.stringify(setMarkup1.json)?.slice(0, 200));
 if (usageRow) {
-  const finalRow = scalar("SELECT cost_micros AS costMicros, sell_cost_micros AS sellCostMicros FROM run_usage WHERE run_id=?", usageRow.runId);
+  const finalRow = scalar<{ costMicros: number; sellCostMicros: number }>("SELECT cost_micros AS costMicros, sell_cost_micros AS sellCostMicros FROM run_usage WHERE run_id=?", usageRow.runId);
   check("9) pada markup 1, harga jual = harga pokok pada baris nyata", Number(finalRow?.sellCostMicros) === Number(finalRow?.costMicros), JSON.stringify(finalRow));
   check("9) harga pokok tetap sama setelah seluruh perubahan markup", Number(finalRow?.costMicros) === Number(usageRow.costMicros), JSON.stringify(finalRow));
   console.log(`INFO setelah markup 1: cost_micros=${finalRow?.costMicros} sell_cost_micros=${finalRow?.sellCostMicros}`);

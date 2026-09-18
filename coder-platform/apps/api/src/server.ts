@@ -15,18 +15,22 @@ import { db } from "./db.js";
 import { currentSessionId, revokeOtherSessions, sessionIdForToken, touchSession } from "./auth.js";
 import { engine } from "./engine.js";
 import { createExecution, recordAudit, runExecution, scheduleNextRun } from "./workflow-engine.js";
-import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
+import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, deviceIdForSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
 import { checkRequestOrigin, constantTimeEquals, csrfCookieOptions, generateCsrfToken } from "./csrf.js";
 import { limiterFor, rateLimitStorage } from "./ratelimit.js";
 import {
-  API_KEY_PREFIX, MAX_API_KEYS_PER_USER, PUBLIC_API_ENDPOINTS, PUBLIC_API_LIMITS, apiKeyTokensToday, authenticateApiKey,
+  API_KEY_PREFIX, MAX_API_KEYS_PER_USER, PUBLIC_API_ENDPOINTS, PUBLIC_API_LIMITS, apiKeyInFlight, apiKeyQuotaSnapshot,
+  apiKeyReservedTokens, apiKeyTokensToday, authenticateApiKey,
   checkApiKeyDailyQuota, checkApiKeyRate, countActiveApiKeys, countApiKeyRequest,
-  createApiKey, getApiKey, hasScope, listApiKeys, parseScopes, revokeApiKey, touchApiKey, updateApiKey, type ApiKeyRow, type ApiScope,
+  createApiKey, estimateRunTokens, getApiKey, hasScope, listApiKeys, parseScopes, releaseRunTokens, reserveRunTokens,
+  revokeApiKey, touchApiKey, updateApiKey, type ApiKeyRow, type ApiScope,
 } from "./apikeys.js";
 /** Wave 6: outgoing webhooks. Events are queued through the Wave 5 job queue so a restart keeps them. */
 import {
-  createDeliveryRow, deleteWebhook, deliverWebhook, emitProjectEvent, getDelivery, getWebhook, listDeliveries, listWebhooks,
-  updateWebhook, validateWebhookUrl, webhookCatalogue, webhookStats, createWebhook, countWebhooks, parseEvents, type WebhookEvent,
+  blockingEarlierDelivery, cleanupWebhookDeliveries, createDeliveryRow, createWebhook, countWebhooks, deleteWebhook,
+  webhookRowById,
+  deliverWebhook, emitProjectEvent, getDelivery, getWebhook, listDeliveries, listWebhooks, parseEvents, resendDelivery,
+  updateWebhook, validateWebhookUrl, webhookCatalogue, webhookStats, type WebhookEvent,
 } from "./webhooks.js";
 import {
   deleteOutboxRow, deliverPending, emailEnabled, emailWorkerState, getOutboxRow,
@@ -39,7 +43,8 @@ import {
 } from "./jobs.js";
 /** Wave 7: growth measurement and the referral programme. */
 import {
-  GROWTH_EVENTS, eventCatalogue, growthOverview, isGrowthEvent, recordGrowthEvent, topEvents,
+  GROWTH_EVENTS, backfillGrowthEvents, eventCatalogue, growthEventSources, growthOverview, isGrowthEvent,
+  planGrowthBackfill, recordGrowthEvent, topEvents,
 } from "./growth.js";
 import {
   attachReferral, codeOwner, ensureReferralCode, listReferralsAdmin, listReferralsFor, qualifyReferralForRun,
@@ -55,6 +60,16 @@ import {
   recordPayment, rejectOrder, resetQuota, revenueSummary, saveBranding, savePaymentConfig, setCouponActive,
   setUsdToIdrRate, updatePlan, usdToIdrRate, userTier, validateCoupon,
 } from "./billing.js";
+/** Wave 10 (items 26, 29, 31): sign-in devices, the global search and browser push. */
+import {
+  blockDevice, checkDeviceGate, deleteDevice, deviceCount, deviceFor, deviceSummary, deviceVerifyRequired, getDevice,
+  DEVICE_LABEL_MAX, listDevices, markDeviceVerified, registerDevice, renameDevice, requestDeviceInfo, revokeDevice, setDeviceTrust, type DeviceRow,
+} from "./devices.js";
+import { SEARCH_KINDS, globalSearch, rebuildMessageIndex, searchStats, type SearchKind } from "./search.js";
+import {
+  countSubscriptions, listSubscriptions, publicPushKey, pushConfigured, pushStats, removeSubscription,
+  saveSubscription, sendPushToUser,
+} from "./push.js";
 
 // trustProxy is on because the API only listens on 127.0.0.1 behind nginx, which sets X-Forwarded-For.
 // Without it every request would look like it came from the proxy and rate limits would lump users together.
@@ -186,6 +201,11 @@ function notify(workspaceId: string | null, userId: string | null, kind: string,
   // Wave 4: the same event may also leave by email. It is queued, never sent here, and the person
   // can switch each kind off. Any failure is swallowed: email must not break the request itself.
   for (const target of targets) queueEventEmail(target, kind, title, body, link);
+  // Wave 10 (item 31): the same event may also ring the browser. Push is sent in the background so a
+  // slow push service can never slow down the request that produced the notification.
+  if (pushConfigured()) {
+    for (const target of targets) void sendPushToUser(target, { title, body: body ?? "", link: link ?? "/", kind }).catch(() => undefined);
+  }
 }
 
 /** Kinds that repeat often are collapsed into one email per day, so the inbox stays readable. */
@@ -202,7 +222,7 @@ function queueEventEmail(userId: string, kind: string, title: string, body?: str
 }
 
 /** Creates a single use token (only its hash is stored) and returns the raw value for the email link. */
-function createAuthToken(userId: string, kind: "password_reset" | "email_verify", ttlMinutes: number) {
+function createAuthToken(userId: string, kind: "password_reset" | "email_verify" | "device_verify", ttlMinutes: number) {
   const token = randomBytes(32).toString("base64url");
   const hash = createHash("sha256").update(token).digest("hex");
   const expiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
@@ -212,7 +232,7 @@ function createAuthToken(userId: string, kind: "password_reset" | "email_verify"
 }
 
 /** Consumes a token of the given kind and returns the user id, or null when invalid, used or expired. */
-function consumeAuthToken(rawToken: string, kind: "password_reset" | "email_verify"): string | null {
+function consumeAuthToken(rawToken: string, kind: "password_reset" | "email_verify" | "device_verify"): string | null {
   const hash = createHash("sha256").update(rawToken).digest("hex");
   const row = db.prepare("SELECT id, user_id AS userId, expires_at AS expiresAt, used_at AS usedAt FROM auth_tokens WHERE token_hash=? AND kind=?").get(hash, kind) as { id: string; userId: string; expiresAt: string; usedAt: string | null } | undefined;
   if (!row || row.usedAt || row.expiresAt < new Date().toISOString()) return null;
@@ -412,8 +432,29 @@ app.post<{ Body: { email?: string; password?: string; code?: string } }>("/api/v
     if (!code) return reply.code(401).send({ error: "MFA_REQUIRED" });
     if (!consumeSecondFactor(row, code)) return reply.code(401).send({ error: "MFA_INVALID_CODE" });
   }
-  const token = createSession(row.id, String(request.headers["user-agent"] ?? "")); setSessionCookie(reply, token, config.NODE_ENV === "production");
-  return { user: { id: row.id, email: row.email, displayName: row.displayName }, mfaEnabled: Boolean(row.mfaEnabled) };
+  // Wave 10 (item 26): the browser that signs in is recorded, and the session is bound to it so a
+  // revoked device also ends its own sessions. When the owner asked for the new-device gate, a device
+  // is trusted only after the account holder confirms it through the emailed link.
+  const deviceInfo = requestDeviceInfo(request);
+  let device: DeviceRow | null = null;
+  let newDevice = false;
+  if (config.DEVICE_TRACKING) {
+    const registered = registerDevice({ userId: row.id, fingerprint: deviceInfo.fingerprint, userAgent: deviceInfo.userAgent, ip: deviceInfo.ip });
+    device = registered.device;
+    newDevice = registered.isNew;
+    if (device.blockedAt) {
+      return reply.code(403).send({ error: "DEVICE_BLOCKED", message: device.blockedReason || "Perangkat ini diblokir oleh admin platform. Hubungi admin bila ini keliru." });
+    }
+    if (newDevice && !deviceVerifyRequired()) markDeviceVerified(row.id, device.id);
+  }
+  const token = createSession(row.id, deviceInfo.userAgent, device?.id ?? null); setSessionCookie(reply, token, config.NODE_ENV === "production");
+  if (newDevice && device && deviceVerifyRequired()) {
+    // The link is what turns an unknown browser into a known one, so it is sent after the session exists.
+    const issued = createAuthToken(row.id, "device_verify", 24 * 60);
+    const link = `${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/perangkat?token=${issued.token}`;
+    queueEventEmail(row.id, "device", "Perangkat baru masuk ke akun Anda", `Ada masuk dari ${device.label}${deviceInfo.ip ? ` (${deviceInfo.ip})` : ""}. Bila itu bukan Anda, cabut perangkat ini.`, link);
+  }
+  return { user: { id: row.id, email: row.email, displayName: row.displayName }, mfaEnabled: Boolean(row.mfaEnabled), device: device ? { id: device.id, label: device.label, newDevice, verified: Boolean(device.verifiedAt || device.trusted) } : null };
 });
 app.post("/api/v1/auth/logout", async (request, reply) => { deleteSession(request); clearSessionCookie(reply, config.NODE_ENV === "production"); return { ok: true }; });
 
@@ -934,6 +975,8 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
     }
     recordRunUsage(runId, projectId, prompt, text, usage);
     db.prepare("UPDATE runs SET status='completed', result=?, finished_at=? WHERE id=?").run(text || null, new Date().toISOString(), runId);
+    // Wave 10 (item 24): the run is finished, so its token reservation is returned to the day's budget.
+    releaseRunTokens(runId);
     publishRunEvent(runId, "completed", { result: text });
     // Wave 6: tell registered webhooks. The delivery is queued, so a slow receiver never delays the run.
     emitProjectEvent(projectId, "run.completed", { runId, conversationId: conversationId ?? null, model: model ?? null, answerChars: text.length });
@@ -954,6 +997,7 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
   } catch (error) {
     const message = error instanceof Error ? error.message : "RUN_FAILED";
     db.prepare("UPDATE runs SET status='failed', error_code=?, finished_at=? WHERE id=?").run(message, new Date().toISOString(), runId);
+    releaseRunTokens(runId);
     publishRunEvent(runId, "failed", { message });
     emitProjectEvent(projectId, "run.failed", { runId, conversationId: conversationId ?? null, model: model ?? null, error: message.slice(0, 300) });
     recordGrowthEvent("run_failed", { userId: userId ?? null, props: { runId, projectId, error: message.slice(0, 120) } });
@@ -1148,7 +1192,7 @@ app.post<{ Params: { projectId: string }; Body: { prompt?: string; model?: strin
   const project = db.prepare("SELECT p.id, p.workspace_id AS workspaceId, m.role AS role FROM projects p JOIN memberships m ON m.workspace_id=p.workspace_id WHERE p.id=? AND m.user_id=?").get(request.params.projectId, request.user!.id) as { id: string; workspaceId: string; role: string } | undefined;
   if (!project) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
   if (project.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
-  const gate = accountGate(request.user!.id);
+  const gate = usageGate(request);
   if (gate) return reply.code(gate.status).send({ error: gate.error, message: gate.message });
   // Cost and speed guards: a workspace can cap how much engine work it starts.
   const guard = guardWorkspaceUsage(project.workspaceId);
@@ -1361,7 +1405,7 @@ app.post<{ Params: { workflowId: string }; Body: { input?: string } }>("/api/v1/
   if (!access) return reply.code(404).send({ error: "WORKFLOW_NOT_FOUND" });
   if (access.role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
   if (access.status !== "published") return reply.code(409).send({ error: "WORKFLOW_NOT_PUBLISHED" });
-  const gate = accountGate(request.user!.id);
+  const gate = usageGate(request);
   if (gate) return reply.code(gate.status).send({ error: gate.error, message: gate.message });
   // Workflow prompt steps also cost money, so the same guard applies.
   const workspace = db.prepare("SELECT workspace_id AS workspaceId FROM projects WHERE id=?").get(access.projectId) as { workspaceId: string } | undefined;
@@ -2989,6 +3033,20 @@ app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) 
       referralLimits: referralLimits(),
       growthEvents: Number((db.prepare("SELECT COUNT(*) AS n FROM growth_events").get() as { n: number }).n),
       growthWindowDays: config.GROWTH_WINDOW_DAYS,
+      /** Wave 10 (item 25/32C): where the recorded events came from, so a backfill is visible here. */
+      growthSources: growthEventSources(),
+    },
+    /** Wave 10 (item 29): the state of the message index and the search limits. */
+    search: { ...searchStats(), kinds: SEARCH_KINDS.length, maxResults: config.SEARCH_MAX_RESULTS },
+    /** Wave 10 (item 31): browser push, next to the email channel that already exists. */
+    push: { ...pushStats(), enabled: config.PUSH_ENABLED, subject: config.PUSH_SUBJECT, maxPerUser: config.PUSH_MAX_PER_USER },
+    /** Wave 10 (item 26/32B): the sign-in devices and the optional gate. */
+    devices: { ...deviceSummary(), tracking: config.DEVICE_TRACKING, mode: config.DEVICE_VERIFY_NEW, verifyRequired: deviceVerifyRequired(), maxPerUser: config.DEVICE_MAX_PER_USER },
+    /** Wave 10 (items 23 and 27): what the scheduled clean-up would remove, and whether it really deletes. */
+    housekeeping: {
+      retentionDryRun: config.RETENTION_DRY_RUN, webhookDays: config.RETENTION_WEBHOOK_DAYS,
+      smokeCleanup: config.SMOKE_CLEANUP_ENABLED, smokeHours: config.SMOKE_CLEANUP_HOURS, smokeAccount: config.SMOKE_ACCOUNT_EMAIL,
+      reservedTokensWaiting: Number((db.prepare("SELECT COALESCE(SUM(COALESCE(reserved_tokens,0)),0) AS n FROM runs WHERE status IN ('queued','running')").get() as { n: number }).n),
     },
     /** Wave 5: the durable queue. These numbers say whether background work is keeping up. */
     backgroundWork: {
@@ -3193,7 +3251,14 @@ function apiConversationFor(auth: ApiAuth, conversationId: string) {
 app.get("/api/v1/api-keys", { preHandler: requireUser }, async (request: any) => {
   // Wave 6: every key reports what it spent today, so a per-key ceiling can be chosen with real numbers.
   const keys = listApiKeys(request.user!.id, request.query?.workspaceId ?? null)
-    .map((key) => ({ ...key, tokensToday: apiKeyTokensToday(key.id) }));
+    .map((key) => ({
+      ...key, tokensToday: apiKeyTokensToday(key.id),
+      // Wave 10 (item 24): runs that are still working already hold part of today's token ceiling, so
+      // the number a caller sees matches the number the quota check uses.
+      tokensReserved: apiKeyReservedTokens(key.id),
+      quota: apiKeyQuotaSnapshot(key),
+      inFlight: apiKeyInFlight(key.id),
+    }));
   return {
     keys,
     // The raw value is never returned again, only the visible prefix helps to identify a key.
@@ -3228,7 +3293,8 @@ app.get("/api/v1/api-keys/docs", { preHandler: requireUser }, async () => ({
 
 app.post<{ Body: { name?: string; scopes?: unknown; workspaceId?: string; dailyRequestLimit?: unknown; dailyTokenLimit?: unknown } }>("/api/v1/api-keys", { preHandler: requireUser }, async (request: any, reply) => {
   // Wave 8: a key can start AI work, so the same email verification rule applies here.
-  const keyGate = accountGate(request.user!.id);
+  // Wave 10 (item 26): and the same device rule.
+  const keyGate = usageGate(request);
   if (keyGate) return reply.code(keyGate.status).send({ error: keyGate.error, message: keyGate.message });
   const name = String(request.body?.name ?? "").trim();
   if (name.length < API_KEY_NAME_MIN || name.length > API_KEY_NAME_MAX) {
@@ -3390,11 +3456,14 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
     const runId = randomUUID(); const messageId = randomUUID();
     const now = new Date().toISOString();
     const knowledge = knowledgeFor(conversation.projectId, content);
+    // Wave 10 (item 24): a run that is still working already spends part of the day's ceiling. The
+    // reservation is an estimate, and it is cleared as soon as the run reaches a final state.
+    const reservedTokens = estimateRunTokens(content + (knowledge?.text ?? ""), config.API_KEY_INFLIGHT_OUTPUT_TOKENS);
     // Attachments are not part of the public write API: a key may send text only. That limit is stated
     // in the docs instead of being discovered by a 400.
     const transaction = db.transaction(() => {
-      db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,api_key_id,created_at) VALUES (?,?,?,?,?,?,?)")
-        .run(runId, conversation.projectId, "queued", content, model ?? config.PRIME_AGENT_MODEL, auth.key.id, now);
+      db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,api_key_id,created_at,reserved_tokens) VALUES (?,?,?,?,?,?,?,?)")
+        .run(runId, conversation.projectId, "queued", content, model ?? config.PRIME_AGENT_MODEL, auth.key.id, now, reservedTokens);
       db.prepare("INSERT INTO messages (id,conversation_id,role,content,run_id,created_at) VALUES (?,?,?,?,?,?)").run(messageId, conversation.id, "user", content, runId, now);
       db.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversation.id);
     });
@@ -3407,7 +3476,7 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
     })();
     return reply.code(202).send({
       message: { id: messageId, conversationId: conversation.id, role: "user", content, runId, createdAt: now },
-      run: { id: runId, status: "queued", model: model ?? config.PRIME_AGENT_MODEL, thinkingLevel: thinking || settings.thinking_level },
+      run: { id: runId, status: "queued", model: model ?? config.PRIME_AGENT_MODEL, thinkingLevel: thinking || settings.thinking_level, reservedTokens },
       read: { messages: `/api/v1/public/v1/conversations/${conversation.id}/messages` },
     });
   },
@@ -3468,7 +3537,7 @@ app.patch<{ Params: { id: string }; Body: { url?: string; events?: unknown; acti
   if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
   if (!mayManageWebhooks(workspace.role)) return reply.code(403).send({ error: "OWNER_REQUIRED", message: "Hanya owner atau admin workspace yang boleh mengubah webhook." });
   const current = getWebhook(workspace.workspaceId, request.params.id);
-  if (!current) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND" });
+  if (!current) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND", message: "Webhook itu tidak ditemukan di ruang kerja ini." });
   if (request.body?.url !== undefined) {
     const url = validateWebhookUrl(request.body.url);
     if (!url.ok) return reply.code(400).send({ error: url.error, message: url.message });
@@ -3485,7 +3554,7 @@ app.delete<{ Params: { id: string } }>("/api/v1/webhooks/:id", { preHandler: req
   if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
   if (!mayManageWebhooks(workspace.role)) return reply.code(403).send({ error: "OWNER_REQUIRED", message: "Hanya owner atau admin workspace yang boleh menghapus webhook." });
   const current = getWebhook(workspace.workspaceId, request.params.id);
-  if (!current) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND" });
+  if (!current) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND", message: "Webhook itu tidak ditemukan di ruang kerja ini." });
   deleteWebhook(workspace.workspaceId, request.params.id);
   recordAudit(workspace.workspaceId, request.user!.id, "webhook.deleted", { webhookId: current.id, url: current.url });
   // Riwayat pengiriman ikut terhapus karena barisnya menempel pada webhook (ON DELETE CASCADE).
@@ -3496,7 +3565,7 @@ app.get<{ Params: { id: string }; Querystring: { limit?: string; workspaceId?: s
   const workspace = sessionWorkspaceFor(request.user!.id, request.query?.workspaceId);
   if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
   const hook = getWebhook(workspace.workspaceId, request.params.id);
-  if (!hook) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND" });
+  if (!hook) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND", message: "Webhook itu tidak ditemukan di ruang kerja ini." });
   return { webhook: hook, deliveries: listDeliveries(hook.id, Number(request.query?.limit ?? 50) || 50) };
 });
 
@@ -3506,14 +3575,15 @@ app.post<{ Params: { id: string }; Querystring: { workspaceId?: string } }>("/ap
   if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
   if (!mayManageWebhooks(workspace.role)) return reply.code(403).send({ error: "OWNER_REQUIRED", message: "Hanya owner atau admin workspace yang boleh menguji webhook." });
   const hook = getWebhook(workspace.workspaceId, request.params.id);
-  if (!hook) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND" });
+  if (!hook) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND", message: "Webhook itu tidak ditemukan di ruang kerja ini." });
   const delivery = createDeliveryRow({
     webhookId: hook.id, event: "webhook.test",
     payload: { message: "Pesan uji dari COBLAI Coder.", url: hook.url, triggeredBy: request.user!.id },
   });
   let report: { status: string; responseStatus: number | null; error: string | null; durationMs: number } = { status: "failed", responseStatus: null, error: "Uji gagal.", durationMs: 0 };
   try {
-    const result = await deliverWebhook(delivery.id);
+    // A manual test skips the order gate: the person clicking wants the answer now.
+    const result = await deliverWebhook(delivery.id, { force: true });
     report = { status: result.status, responseStatus: result.responseStatus, error: result.error, durationMs: result.durationMs };
   } catch (error) {
     // Kegagalan penerima bukan kegagalan server ini: jawabannya tetap 200 dengan laporan jujur.
@@ -3830,6 +3900,345 @@ function projectAuditWorkspace(projectId: string): string | null {
  * by the durable queue: each pass is a row in `jobs`, so a restart does not lose the pass and two
  * processes cannot run the same pass at once.
  */
+/** Wave 10 (item 26): the device gate sits next to the email gate before any AI work starts. */
+function deviceGate(request: any): { status: number; error: string; message: string } | null {
+  if (!config.DEVICE_TRACKING) return null;
+  const gate = checkDeviceGate(request.user!.id, deviceIdForSession(currentSessionId(request)));
+  if (gate.allowed) return null;
+  return { status: 403, error: gate.error ?? "DEVICE_NOT_VERIFIED", message: gate.message ?? "Perangkat ini belum diverifikasi." };
+}
+
+/** Both account gates in one call, so every AI entry point checks the same two things. */
+function usageGate(request: any): { status: number; error: string; message: string } | null {
+  return accountGate(request.user!.id) ?? deviceGate(request);
+}
+
+/** Wave 10 (item 26): the platform view of sign-in devices, newest first. */
+function adminDeviceList(limit: number): Array<Record<string, unknown>> {
+  const size = Math.min(200, Math.max(1, limit));
+  return db.prepare(`SELECT d.id, d.user_id AS userId, u.email, d.label, d.platform, d.last_ip AS lastIp,
+      d.first_seen_at AS firstSeenAt, d.last_seen_at AS lastSeenAt, d.seen_count AS seenCount,
+      d.trusted, d.verified_at AS verifiedAt, d.blocked_at AS blockedAt, d.blocked_reason AS blockedReason,
+      (SELECT COUNT(*) FROM auth_sessions s WHERE s.device_id = d.id AND s.expires_at > datetime('now')) AS sessions
+    FROM user_devices d LEFT JOIN users u ON u.id = d.user_id
+    ORDER BY d.last_seen_at DESC LIMIT ?`).all(size) as Array<Record<string, unknown>>;
+}
+
+/**
+ * Wave 10 (item 27): the safe removal of leftover smoke data. Only data inside workspaces where the
+ * smoke account is the ONLY member is touched, the account itself stays, and a platform admin account
+ * is refused outright. `dryRun` counts the rows without deleting anything.
+ */
+async function cleanupSmokeData(input: { dryRun: boolean; email: string }) {
+  const email = String(input.email ?? "").trim().toLowerCase();
+  const empty = { email, userId: null as string | null, userFound: false, workspaces: [] as string[], projects: [] as string[], rows: {} as Record<string, number>, artifactsRemoved: 0, messagesRemoved: 0, filesRemoved: 0, dryRun: input.dryRun, skipped: null as string | null };
+  const user = db.prepare("SELECT id, email, is_admin AS isAdmin FROM users WHERE lower(email)=?").get(email) as { id: string; email: string; isAdmin: number } | undefined;
+  if (!user) return { ...empty };
+  if (isPlatformAdmin({ id: user.id, email: user.email })) return { ...empty, userId: user.id, userFound: true, skipped: "SMOKE_ACCOUNT_IS_ADMIN" };
+  // A workspace is smoking ground only when this account is its single member and its owner.
+  const workspaces = db.prepare(`SELECT w.id AS id FROM workspaces w JOIN memberships m ON m.workspace_id=w.id
+    WHERE m.user_id=? AND m.role='owner'
+    AND (SELECT COUNT(*) FROM memberships other WHERE other.workspace_id=w.id)=1`).all(user.id) as { id: string }[];
+  const workspaceIds = workspaces.map((row) => row.id);
+  const emptyReport = (skipped: string | null) => ({ ...empty, userId: user.id, userFound: true, skipped });
+  if (workspaceIds.length === 0) return emptyReport("NO_SMOKE_WORKSPACE");
+  const marks = workspaceIds.map(() => "?").join(",");
+  const projects = db.prepare(`SELECT id FROM projects WHERE workspace_id IN (${marks})`).all(...workspaceIds) as { id: string }[];
+  const projectIds = projects.map((row) => row.id);
+  const count = (sql: string, ...args: unknown[]) => Number((db.prepare(sql).get(...args) as { n: number }).n);
+  const runs = projectIds.length ? count(`SELECT COUNT(*) AS n FROM runs WHERE project_id IN (${projectIds.map(() => "?").join(",")})`, ...projectIds) : 0;
+  const messages = projectIds.length ? count(`SELECT COUNT(*) AS n FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE project_id IN (${projectIds.map(() => "?").join(",")}))`, ...projectIds) : 0;
+  const artifacts = projectIds.length ? count(`SELECT COUNT(*) AS n FROM artifacts WHERE project_id IN (${projectIds.map(() => "?").join(",")})`, ...projectIds) : 0;
+  const outbox = count("SELECT COUNT(*) AS n FROM email_outbox WHERE lower(to_email)=? AND status='pending'", email);
+  const notifications = count(`SELECT COUNT(*) AS n FROM notifications WHERE workspace_id IN (${marks})`, ...workspaceIds);
+  const report = {
+    ...empty, userId: user.id, userFound: true, workspaces: workspaceIds, projects: projectIds,
+    rows: { runs, messages, artifacts, outbox, notifications },
+    artifactsRemoved: artifacts, messagesRemoved: messages, skipped: null as string | null,
+  };
+  if (input.dryRun) return report;
+  for (const projectId of projectIds) await deleteProjectFully(projectId);
+  db.transaction(() => {
+    db.prepare("DELETE FROM workspace_invitations WHERE workspace_id IN (" + marks + ")").run(...workspaceIds);
+    db.prepare("DELETE FROM notifications WHERE workspace_id IN (" + marks + ")").run(...workspaceIds);
+    db.prepare("DELETE FROM api_keys WHERE user_id=?").run(user.id);
+    db.prepare("DELETE FROM email_outbox WHERE lower(to_email)=? AND status='pending'").run(email);
+  })();
+  recordAudit(null, null, "smoke.cleanup.ran", { userId: user.id, email, projects: projectIds.length, runs, messages, artifacts });
+  return { ...report, filesRemoved: projectIds.length };
+}
+
+/** The shape the database currently has; the number comes from the migration table, not a constant. */
+function schemaVersion(): number {
+  const row = db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number | null } | undefined;
+  return Number(row?.version ?? 0);
+}
+
+/** Wave 10 (item 28): the numbers a monitoring agent reads, as plain text. */
+function metricsNumbers(): Record<string, number> {
+  const one = (sql: string, ...args: unknown[]) => Number((db.prepare(sql).get(...args) as { n: number } | undefined)?.n ?? 0);
+  const jobs = jobStats();
+  const usage = db.prepare(`SELECT COALESCE(SUM(cost_micros),0) AS cost, COALESCE(SUM(COALESCE(sell_cost_micros, cost_micros)),0) AS billed,
+      COALESCE(SUM(total_tokens),0) AS tokens FROM run_usage`).get() as { cost: number; billed: number; tokens: number };
+  return {
+    users_total: one("SELECT COUNT(*) AS n FROM users WHERE deleted_at IS NULL"),
+    users_closed: one("SELECT COUNT(*) AS n FROM users WHERE deleted_at IS NOT NULL"),
+    users_verified: one("SELECT COUNT(*) AS n FROM users WHERE email_verified=1"),
+    workspaces_total: one("SELECT COUNT(*) AS n FROM workspaces"),
+    projects_total: one("SELECT COUNT(*) AS n FROM projects"),
+    conversations_total: one("SELECT COUNT(*) AS n FROM conversations"),
+    messages_total: one("SELECT COUNT(*) AS n FROM messages"),
+    runs_total: one("SELECT COUNT(*) AS n FROM runs"),
+    runs_active: one("SELECT COUNT(*) AS n FROM runs WHERE status IN ('queued','running')"),
+    runs_completed: one("SELECT COUNT(*) AS n FROM runs WHERE status='completed'"),
+    runs_failed: one("SELECT COUNT(*) AS n FROM runs WHERE status='failed'"),
+    tokens_total: usage.tokens,
+    cost_micros_total: usage.cost,
+    billed_micros_total: usage.billed,
+    jobs_queued: jobs.queued, jobs_running: jobs.running, jobs_failed: jobs.failed,
+    jobs_oldest_queued_seconds: jobs.oldestQueuedAt ? Math.max(0, Math.round((Date.now() - Date.parse(jobs.oldestQueuedAt)) / 1000)) : 0,
+    webhooks_total: one("SELECT COUNT(*) AS n FROM webhooks WHERE active=1"),
+    webhook_deliveries_queued: one("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE status='queued'"),
+    webhook_deliveries_deferred: one("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE COALESCE(deferrals,0) > 0"),
+    webhook_deliveries_failed: one("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE status='failed'"),
+    devices_total: one("SELECT COUNT(*) AS n FROM user_devices"),
+    devices_blocked: one("SELECT COUNT(*) AS n FROM user_devices WHERE blocked_at IS NOT NULL"),
+    push_subscriptions_active: one("SELECT COUNT(*) AS n FROM push_subscriptions WHERE active=1"),
+    messages_indexed: one("SELECT COUNT(*) AS n FROM message_search"),
+    search_terms: one("SELECT COUNT(*) AS n FROM knowledge_documents"),
+    email_pending: one("SELECT COUNT(*) AS n FROM email_outbox WHERE status='pending'"),
+    email_failed: one("SELECT COUNT(*) AS n FROM email_outbox WHERE status='failed'"),
+    api_keys_active: one("SELECT COUNT(*) AS n FROM api_keys WHERE revoked_at IS NULL"),
+    audit_events_total: one("SELECT COUNT(*) AS n FROM audit_events"),
+  };
+}
+
+/** Wave 10 (item 28): the plain text face, with one line per number so any scraper can read it. */
+function metricsText(): string {
+  const numbers = metricsNumbers();
+  const lines = [
+    "# COBLAI Coder metrics. Token terpisah: kirim Authorization: Bearer <METRICS_TOKEN>.",
+    `coblai_info{version="${process.env.APP_VERSION ?? "dev"}",schema="${schemaVersion()}"} 1`,
+    // Baris polos memudahkan alat pengumpul yang tidak membaca label, misalnya pemeriksa versi skema.
+    `coblai_schema_version ${schemaVersion()}`,
+    `coblai_uptime_seconds ${Math.round(process.uptime())}`,
+  ];
+  for (const [key, value] of Object.entries(numbers)) lines.push(`coblai_${key} ${value}`);
+  lines.push("");
+  return lines.join("\n");
+}
+
+/** Wave 10 (item 28): the same numbers as JSON for the dashboard page. */
+function metricsSnapshot() {
+  const createdAt = db.prepare("SELECT value FROM platform_settings WHERE key='server_started_at'").get() as { value: string } | undefined;
+  return {
+    generatedAt: new Date().toISOString(), version: process.env.APP_VERSION ?? "dev", schemaVersion: schemaVersion(),
+    uptimeSeconds: Math.round(process.uptime()), startedAt: createdAt?.value ?? null,
+    numbers: metricsNumbers(), jobs: jobStats(), worker: jobWorkerState(),
+    search: searchStats(), push: pushStats(), devices: deviceSummary(), health: { database: "ok", dataDir: config.DATA_DIR },
+    tokenConfigured: Boolean(config.METRICS_TOKEN),
+    retention: { dryRun: config.RETENTION_DRY_RUN, webhookDays: config.RETENTION_WEBHOOK_DAYS, smokeCleanup: config.SMOKE_CLEANUP_ENABLED, smokeHours: config.SMOKE_CLEANUP_HOURS },
+  };
+}
+
+// ---------------------------------------------------------------- Wave 10 (items 21 to 32D)
+
+/**
+ * Item 29: one search box over everything the caller is allowed to read. Access follows the
+ * memberships of the caller, so a hit can never come from a workspace the caller cannot open.
+ */
+app.get<{ Querystring: { q?: string; limit?: string; kinds?: string } }>("/api/v1/search", { preHandler: requireUser }, async (request: any, reply) => {
+  const query = String(request.query?.q ?? "").trim();
+  if (query.length > 200) return reply.code(400).send({ error: "SEARCH_QUERY_TOO_LONG", message: "Kata kunci maksimal 200 karakter." });
+  // One letter matches half the database and shows nothing useful, so the caller is told plainly
+  // instead of being handed a huge, meaningless list.
+  if (query.length < 2) return reply.code(400).send({ error: "SEARCH_QUERY_TOO_SHORT", message: "Ketik minimal 2 huruf untuk mencari." });
+  const requested = String(request.query?.kinds ?? "").split(",").map((part) => part.trim()).filter(Boolean);
+  const kinds = requested.filter((kind) => (SEARCH_KINDS as readonly string[]).includes(kind)) as SearchKind[];
+  const limit = Number(request.query?.limit ?? config.SEARCH_MAX_RESULTS) || config.SEARCH_MAX_RESULTS;
+  return globalSearch({ userId: request.user!.id, query, limit, kinds: kinds.length ? kinds : undefined });
+});
+
+app.get("/api/v1/search/status", { preHandler: requireUser }, async () => ({
+  index: searchStats(), kinds: SEARCH_KINDS, maxResults: config.SEARCH_MAX_RESULTS,
+  note: "Indeks pesan diisi otomatis sejak skema 18. Jalankan ulang bila pesan lama belum muncul.",
+}));
+
+app.post("/api/v1/admin/search/reindex", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh membangun ulang indeks pencarian." });
+  const before = searchStats();
+  const indexed = rebuildMessageIndex();
+  return { before, indexed, after: searchStats() };
+});
+
+/** Item 31: the browser push channel. Email stays as it is; push is a second, faster channel. */
+app.get("/api/v1/account/push", { preHandler: requireUser }, async (request: any) => ({
+  ...publicPushKey(), subscriptions: listSubscriptions(request.user!.id, false), max: config.PUSH_MAX_PER_USER,
+  stats: pushStats(request.user!.id),
+  note: "Simpan langganan dari peramban dengan izin notifikasi. Bila push dimatikan admin, halaman ini tidak mengirim apa pun.",
+}));
+
+app.post<{ Body: { endpoint?: string; keys?: { p256dh?: string; auth?: string } } }>("/api/v1/account/push/subscribe", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!config.PUSH_ENABLED) return reply.code(409).send({ error: "PUSH_DISABLED", message: "Notifikasi peramban sedang dimatikan admin platform." });
+  if (!pushConfigured()) return reply.code(503).send({ error: "PUSH_UNAVAILABLE", message: "Kunci push belum siap di server. Coba lagi nanti." });
+  const endpoint = String(request.body?.endpoint ?? "");
+  const p256dh = String(request.body?.keys?.p256dh ?? "");
+  const auth = String(request.body?.keys?.auth ?? "");
+  if (!endpoint.startsWith("https://") || !p256dh || !auth) {
+    return reply.code(400).send({ error: "INVALID_SUBSCRIPTION", message: "Data langganan push tidak lengkap." });
+  }
+  if (countSubscriptions(request.user!.id) >= config.PUSH_MAX_PER_USER) {
+    return reply.code(409).send({ error: "TOO_MANY_SUBSCRIPTIONS", message: `Maksimal ${config.PUSH_MAX_PER_USER} peramban per akun. Hapus salah satu dulu.` });
+  }
+  const saved = saveSubscription({ userId: request.user!.id, endpoint, p256dh, auth, userAgent: String(request.headers["user-agent"] ?? "").slice(0, 200) });
+  return reply.code(201).send({ subscription: saved, note: "Peramban ini akan menerima pemberitahuan yang sama dengan notifikasi dalam aplikasi." });
+});
+
+app.delete<{ Params: { id: string } }>("/api/v1/account/push/subscriptions/:id", { preHandler: requireUser }, async (request: any, reply) => {
+  const removed = removeSubscription(request.user!.id, request.params.id);
+  if (!removed) return reply.code(404).send({ error: "SUBSCRIPTION_NOT_FOUND", message: "Langganan push itu tidak ditemukan." });
+  return { removed: true };
+});
+
+app.post("/api/v1/account/push/test", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!pushConfigured()) return reply.code(503).send({ error: "PUSH_UNAVAILABLE", message: "Kunci push belum siap di server. Coba lagi nanti." });
+  const report = await sendPushToUser(request.user!.id, {
+    title: "Uji notifikasi COBLAI Coder", body: "Bila pesan ini muncul, notifikasi peramban sudah aktif.", link: "/", kind: "system",
+  });
+  return { report, note: "Peramban yang menolak akan dinonaktifkan otomatis." };
+});
+
+/** Item 26 / 32B: the devices an account signs in from. Advisory plus revocable. */
+app.get("/api/v1/account/devices", { preHandler: requireUser }, async (request: any) => ({
+  devices: listDevices(request.user!.id, deviceIdForSession(currentSessionId(request))),
+  verifyRequired: deviceVerifyRequired(), tracking: config.DEVICE_TRACKING, mode: config.DEVICE_VERIFY_NEW,
+  limit: config.DEVICE_MAX_PER_USER,
+  note: "Cabut perangkat yang tidak Anda kenali. Sesi yang terikat perangkat itu ikut berakhir.",
+}));
+
+app.patch<{ Params: { deviceId: string }; Body: { label?: string; trusted?: boolean } }>("/api/v1/account/devices/:deviceId", { preHandler: requireUser }, async (request: any, reply) => {
+  const device = getDevice(request.user!.id, request.params.deviceId);
+  if (!device) return reply.code(404).send({ error: "DEVICE_NOT_FOUND", message: "Perangkat itu tidak ada di akun Anda." });
+  let updated: DeviceRow | null = device;
+  if (typeof request.body?.label === "string") {
+    // Nama perangkat dipakai di daftar dan notifikasi, jadi panjangnya dibatasi dan pelanggarannya
+    // diberitahukan apa adanya alih-alih dipotong diam-diam.
+    if (request.body.label.trim().length > DEVICE_LABEL_MAX) {
+      return reply.code(400).send({ error: "DEVICE_LABEL_TOO_LONG", message: `Nama perangkat maksimal ${DEVICE_LABEL_MAX} karakter.` });
+    }
+    const renamed = renameDevice(request.user!.id, device.id, request.body.label);
+    if (!renamed) return reply.code(400).send({ error: "INVALID_LABEL", message: "Nama perangkat tidak boleh kosong." });
+    updated = renamed;
+  }
+  if (typeof request.body?.trusted === "boolean") updated = setDeviceTrust(request.user!.id, device.id, request.body.trusted) ?? updated;
+  return { device: updated };
+});
+
+/** The emailed link. The token is single use and expires in 24 hours. */
+app.post<{ Body: { token?: string } }>("/api/v1/account/devices/verify", { preHandler: requireUser }, async (request: any, reply) => {
+  const userId = consumeAuthToken(String(request.body?.token ?? ""), "device_verify");
+  if (!userId) return reply.code(400).send({ error: "INVALID_TOKEN", message: "Tautan verifikasi perangkat sudah kedaluwarsa atau sudah dipakai. Masuk ulang untuk meminta tautan baru." });
+  if (userId !== request.user!.id) return reply.code(403).send({ error: "TOKEN_OTHER_ACCOUNT", message: "Tautan itu milik akun lain. Masuk dengan akun yang benar." });
+  const info = requestDeviceInfo(request);
+  const registered = registerDevice({ userId, fingerprint: info.fingerprint, userAgent: info.userAgent, ip: info.ip });
+  markDeviceVerified(userId, registered.device.id);
+  return { verified: true, device: getDevice(userId, registered.device.id) };
+});
+
+app.delete<{ Params: { deviceId: string } }>("/api/v1/account/devices/:deviceId", { preHandler: requireUser }, async (request: any, reply) => {
+  const device = getDevice(request.user!.id, request.params.deviceId);
+  if (!device) return reply.code(404).send({ error: "DEVICE_NOT_FOUND", message: "Perangkat itu tidak ada di akun Anda." });
+  const revoked = revokeDevice(request.user!.id, device.id);
+  deleteDevice(request.user!.id, device.id);
+  recordAudit(null, request.user!.id, "device.revoked", { deviceId: device.id, label: device.label, sessionsRemoved: revoked?.sessionsRemoved ?? 0 });
+  return { removed: true, sessionsRemoved: revoked?.sessionsRemoved ?? 0, note: "Perangkat dicabut dan sesinya diakhiri. Bila perangkat itu masih terbuka, pengguna harus masuk ulang." };
+});
+
+app.get("/api/v1/admin/devices", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat daftar perangkat." });
+  return { summary: deviceSummary(), devices: adminDeviceList(Number(request.query?.limit ?? 50) || 50), gate: { tracking: config.DEVICE_TRACKING, mode: config.DEVICE_VERIFY_NEW } };
+});
+
+app.post<{ Params: { deviceId: string }; Body: { reason?: string } }>("/api/v1/admin/devices/:deviceId/block", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh memblokir perangkat." });
+  const row = db.prepare("SELECT id, user_id AS userId FROM user_devices WHERE id=?").get(request.params.deviceId) as { id: string; userId: string } | undefined;
+  if (!row) return reply.code(404).send({ error: "DEVICE_NOT_FOUND", message: "Perangkat itu tidak ditemukan." });
+  const blocked = blockDevice(row.userId, row.id, String(request.body?.reason ?? "Diblokir admin platform."));
+  const revoked = revokeDevice(row.userId, row.id);
+  recordAudit(null, request.user!.id, "device.blocked", { deviceId: row.id, userId: row.userId, reason: String(request.body?.reason ?? "").slice(0, 120) });
+  return { device: blocked, sessionsRemoved: revoked?.sessionsRemoved ?? 0 };
+});
+
+/** Item 23: a fresh delivery row for one earlier delivery, so the order history stays readable. */
+app.post<{ Params: { id: string; deliveryId: string } }>("/api/v1/webhooks/:id/deliveries/:deliveryId/resend", { preHandler: requireUser }, async (request: any, reply) => {
+  const workspace = sessionWorkspaceFor(request.user!.id, request.query?.workspaceId ?? request.body?.workspaceId);
+  if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (!mayManageWebhooks(workspace.role)) return reply.code(403).send({ error: "OWNER_REQUIRED", message: "Hanya owner atau admin workspace yang boleh mengirim ulang peristiwa webhook." });
+  const hook = getWebhook(workspace.workspaceId, request.params.id);
+  if (!hook) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND", message: "Webhook itu tidak ditemukan di ruang kerja ini." });
+  const delivery = getDelivery(request.params.deliveryId);
+  if (!delivery || delivery.webhookId !== hook.id) return reply.code(404).send({ error: "WEBHOOK_DELIVERY_NOT_FOUND", message: "Riwayat pengiriman itu tidak ditemukan pada webhook ini." });
+  const result = resendDelivery(delivery.id);
+  if ("error" in result) {
+    const status = result.error === "WEBHOOK_DELIVERY_PENDING" ? 409 : 404;
+    return reply.code(status).send({ error: result.error, message: result.message });
+  }
+  recordAudit(workspace.workspaceId, request.user!.id, "webhook.resent", { webhookId: hook.id, deliveryId: result.delivery.id, resendOf: delivery.id, jobId: result.jobId });
+  return reply.code(201).send({ delivery: result.delivery, jobId: result.jobId, note: "Peristiwa dikirim sebagai baris baru, jadi riwayat lama tetap utuh." });
+});
+
+/** Item 23: the delivery log is trimmed by choice, and queued rows are never touched. */
+app.delete<{ Params: { id: string }; Querystring: { days?: string; dryRun?: string; workspaceId?: string } }>("/api/v1/webhooks/:id/deliveries", { preHandler: requireUser }, async (request: any, reply) => {
+  const workspace = sessionWorkspaceFor(request.user!.id, request.query?.workspaceId);
+  if (!workspace) return reply.code(404).send({ error: "WORKSPACE_NOT_FOUND" });
+  if (!mayManageWebhooks(workspace.role)) return reply.code(403).send({ error: "OWNER_REQUIRED", message: "Hanya owner atau admin workspace yang boleh membersihkan riwayat pengiriman." });
+  const hook = getWebhook(workspace.workspaceId, request.params.id);
+  if (!hook) return reply.code(404).send({ error: "WEBHOOK_NOT_FOUND", message: "Webhook itu tidak ditemukan di ruang kerja ini." });
+  const dryRun = String(request.query?.dryRun ?? "") === "1" || String(request.query?.dryRun ?? "") === "true";
+  const days = Number(request.query?.days ?? config.RETENTION_WEBHOOK_DAYS) || config.RETENTION_WEBHOOK_DAYS;
+  const report = cleanupWebhookDeliveries({ days, dryRun, webhookId: hook.id });
+  if (!dryRun) recordAudit(workspace.workspaceId, request.user!.id, "webhook.deliveries.cleaned", { webhookId: hook.id, days, removed: report.removed });
+  return { report, note: dryRun ? "Mode kering: tidak ada baris yang dihapus." : "Baris yang masih menunggu atau sedang dicoba ulang tidak dihapus." };
+});
+
+/** Item 27: removes exactly the rows a smoke run leaves behind, on an explicit request. */
+app.post<{ Body: { dryRun?: boolean; email?: string } }>("/api/v1/admin/smoke/cleanup", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh membersihkan data uji." });
+  const dryRun = request.body?.dryRun === undefined ? true : Boolean(request.body.dryRun);
+  const email = String(request.body?.email ?? config.SMOKE_ACCOUNT_EMAIL).trim().toLowerCase();
+  const report = await cleanupSmokeData({ dryRun, email });
+  recordAudit(null, request.user!.id, "smoke.cleanup", { dryRun, email, projects: report.projects.length, artifacts: report.artifactsRemoved, messages: report.messagesRemoved });
+  return { report, note: dryRun ? "Mode kering: tidak ada data yang dihapus." : "Hanya data akun uji yang dihapus; akun dan workspace-nya tetap ada." };
+});
+
+/** Item 25 / 32C: what a backfill would add, and then the backfill itself. */
+app.get("/api/v1/admin/growth/backfill", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat rencana backfill pertumbuhan." });
+  return { plan: planGrowthBackfill(), sources: growthEventSources(), recorded: growthOverview(Number(request.query?.days ?? 30) || 30) };
+});
+
+app.post<{ Body: { apply?: boolean } }>("/api/v1/admin/growth/backfill", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh menjalankan backfill pertumbuhan." });
+  const apply = Boolean(request.body?.apply);
+  const report = backfillGrowthEvents({ apply });
+  if (apply) recordAudit(null, request.user!.id, "growth.backfilled", { inserted: report.inserted, candidates: report.totalCandidates });
+  return { report, sources: growthEventSources(), note: apply ? "Baris yang sudah ada tidak digandakan." : "Mode kering: kirim { \"apply\": true } untuk menyimpan." };
+});
+
+/** Item 28: the plain text face for a monitoring agent. The token is required, or the route hides. */
+app.get("/api/v1/metrics", async (request: any, reply) => {
+  const token = String(config.METRICS_TOKEN ?? "");
+  const supplied = String(request.headers["authorization"] ?? "").replace(/^Bearer\s+/i, "") || String(request.query?.token ?? "");
+  if (!token || supplied !== token) return reply.code(404).send({ error: "NOT_FOUND", message: "Halaman ini tidak tersedia." });
+  reply.header("content-type", "text/plain; charset=utf-8");
+  return metricsText();
+});
+
+app.get("/api/v1/admin/metrics", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat angka operasional." });
+  return metricsSnapshot();
+});
+
 function registerBackgroundHandlers() {
   // The safety net for a run whose dispatch never happened because the process stopped.
   registerJobHandler("run.execute", async (payload: any) => {
@@ -3902,8 +4311,35 @@ function registerBackgroundHandlers() {
   // that is down for a while still gets the event once it comes back (up to WEBHOOK_MAX_ATTEMPTS).
   registerJobHandler("webhook.deliver", async (payload: any) => {
     const deliveryId = String(payload?.deliveryId ?? "");
-    const report = await deliverWebhook(deliveryId);
+    let report: { status: string; responseStatus: number | null; durationMs: number };
+    try {
+      report = await deliverWebhook(deliveryId);
+    } catch (error) {
+      // Wave 10 (item 31): the last attempt tells the workspace owner, so a broken receiver is not
+      // discovered days later. The queue still owns the retry itself.
+      const delivery = getDelivery(deliveryId);
+      if (delivery && delivery.attempts >= config.WEBHOOK_MAX_ATTEMPTS) {
+        const hook = webhookRowById(delivery.webhookId);
+        notify(hook?.workspaceId ?? null, null, "webhook", "Webhook gagal berkali-kali",
+          `Pengiriman ${delivery.event} ke ${hook?.url ?? "alamat webhook"} gagal ${delivery.attempts} kali. Periksa alamat dan penerimanya.`, "/webhooks");
+      }
+      throw error;
+    }
+    if (report.status === "deferred") {
+      // The row waits for an earlier event; the deferral enqueued its own next attempt.
+      return { deliveryId, status: report.status, deferred: true, responseStatus: null, durationMs: 0 };
+    }
     return { deliveryId, status: report.status, responseStatus: report.responseStatus, durationMs: report.durationMs };
+  });
+
+  /** Wave 10 (items 23 and 27): the scheduled trim of delivery history and smoke data. */
+  registerJobHandler("smoke.cleanup", async () => {
+    const report = await cleanupSmokeData({ dryRun: config.RETENTION_DRY_RUN, email: config.SMOKE_ACCOUNT_EMAIL });
+    const trimmed = cleanupWebhookDeliveries({ days: config.RETENTION_WEBHOOK_DAYS, dryRun: config.RETENTION_DRY_RUN });
+    return {
+      smoke: { dryRun: report.dryRun, skipped: report.skipped, projects: report.projects.length, rows: report.rows },
+      webhooks: { cutoff: trimmed.cutoff, days: config.RETENTION_WEBHOOK_DAYS, candidates: trimmed.candidates, removed: trimmed.removed, dryRun: trimmed.dryRun },
+    };
   });
 }
 

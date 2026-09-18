@@ -107,10 +107,11 @@ try {
 
   // --- 2) pekerjaan menunggu selama hanya API yang hidup ---------------------------------------
   const job = enqueueJob({ kind: "email.deliver" });
+  const jobId = String(job.id);
   const stayedQueued = await waitFor(async () => false, 24, 250); // 6 detik, lebih dari tiga interval antrean
   void stayedQueued;
-  check("2) pekerjaan tetap 'queued' setelah 6 detik walau API hidup", jobStatus(job.id) === "queued",
-    `status=${jobStatus(job.id)}`);
+  check("2) pekerjaan tetap 'queued' setelah 6 detik walau API hidup", jobStatus(jobId) === "queued",
+    `status=${jobStatus(jobId)}`);
 
   // --- 3) proses pekerja mengambil pekerjaan itu ----------------------------------------------
   worker = start("apps/api/src/worker.ts", { ...sharedEnv, PORT: String(portUnused), JOB_WORKER_IN_WEB: "false" });
@@ -119,8 +120,8 @@ try {
   check("3) proses pekerja tidak menempati PORT yang diberikan",
     !(await responds(`http://127.0.0.1:${portUnused}/ready`)) && !(await responds(`http://127.0.0.1:${portUnused}/health`)));
 
-  const done = await waitFor(() => jobStatus(job.id) === "done", 120, 250);
-  check("3) pekerjaan diselesaikan oleh proses pekerja (status 'done')", done, `status=${jobStatus(job.id)}`);
+  const done = await waitFor(() => jobStatus(jobId) === "done", 120, 250);
+  check("3) pekerjaan diselesaikan oleh proses pekerja (status 'done')", done, `status=${jobStatus(jobId)}`);
   const log = worker.log();
   check("3) log pekerja menyebut putaran antrean", log.includes("[worker] proses antrean siap"), log.slice(-400));
 

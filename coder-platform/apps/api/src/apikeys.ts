@@ -170,6 +170,49 @@ export function apiKeyTokensToday(keyId: string): number {
  * The account tier limit is checked separately by the caller, so an owner ceiling can never be bypassed
  * by handing out a key with a high per-key ceiling.
  */
+/**
+ * Wave 10 (item 24): the tokens a key has already put in flight.
+ *
+ * Counting only finished runs means a script that fires ten calls at once can spend ten times its daily
+ * ceiling, because every call is checked before any of them is billed. The amount a running call is
+ * expected to spend is therefore held aside the moment the call is accepted, and it is released on its
+ * own when the run leaves the queue: only runs still `queued` or `running` are counted here, so a run
+ * that finished, failed or was reaped stops counting even if the row is never touched again.
+ */
+export function apiKeyReservedTokens(keyId: string): number {
+  const row = db.prepare(`SELECT COALESCE(SUM(COALESCE(r.reserved_tokens, ?)),0) AS tokens FROM runs r
+      WHERE r.api_key_id=? AND r.status IN ('queued','running')`).get(config.API_KEY_INFLIGHT_OUTPUT_TOKENS, keyId) as { tokens: number };
+  return Number(row?.tokens ?? 0);
+}
+
+/** The amount of one call that is held aside: the prompt that was sent plus the expected answer. */
+export function estimateRunTokens(prompt: string, outputAllowance = config.API_KEY_INFLIGHT_OUTPUT_TOKENS): number {
+  const promptTokens = Math.ceil(String(prompt ?? "").length / 4);
+  return Math.max(1, promptTokens + Math.max(0, Math.round(outputAllowance)));
+}
+
+/** Writes the reserved amount onto the run. The row is the place a reservation can survive a restart. */
+export function reserveRunTokens(runId: string, tokens: number): void {
+  db.prepare("UPDATE runs SET reserved_tokens=? WHERE id=?").run(Math.max(0, Math.round(tokens)), runId);
+}
+
+/** Releases the reservation early. Called when the run is known to be over. */
+export function releaseRunTokens(runId: string): void {
+  db.prepare("UPDATE runs SET reserved_tokens=0 WHERE id=? AND reserved_tokens IS NOT NULL").run(runId);
+}
+
+/** Lists what one key is holding aside right now, per run. Used by the keys page and the smoke test. */
+export function apiKeyInFlight(keyId: string): Array<{ runId: string; tokens: number; status: string; createdAt: string }> {
+  return db.prepare(`SELECT r.id AS runId, COALESCE(r.reserved_tokens, ?) AS tokens, r.status AS status, r.created_at AS createdAt
+      FROM runs r WHERE r.api_key_id=? AND r.status IN ('queued','running') ORDER BY r.created_at ASC`)
+    .all(config.API_KEY_INFLIGHT_OUTPUT_TOKENS, keyId) as Array<{ runId: string; tokens: number; status: string; createdAt: string }>;
+}
+
+/**
+ * Checks the daily ceilings of one key before the work is done. Returns null when the call may go on.
+ * The account tier limit is checked separately by the caller, so an owner ceiling can never be bypassed
+ * by handing out a key with a high per-key ceiling.
+ */
 export function checkApiKeyDailyQuota(row: ApiKeyRow): { status: number; error: string; detail: Record<string, unknown> } | null {
   const usedRequests = refreshApiKeyDay(row);
   if (row.dailyRequestLimit > 0 && usedRequests >= row.dailyRequestLimit) {
@@ -177,11 +220,41 @@ export function checkApiKeyDailyQuota(row: ApiKeyRow): { status: number; error: 
   }
   if (row.dailyTokenLimit > 0) {
     const usedTokens = apiKeyTokensToday(row.id);
-    if (usedTokens >= row.dailyTokenLimit) {
-      return { status: 429, error: "API_KEY_DAILY_TOKEN_LIMIT", detail: { limit: row.dailyTokenLimit, used: usedTokens, message: `Kunci ini sudah memakai ${usedTokens} dari ${row.dailyTokenLimit} token hari ini.` } };
+    const reserved = apiKeyReservedTokens(row.id);
+    const total = usedTokens + reserved;
+    if (total >= row.dailyTokenLimit) {
+      return {
+        status: 429,
+        error: "API_KEY_DAILY_TOKEN_LIMIT",
+        detail: {
+          limit: row.dailyTokenLimit, used: usedTokens, reserved, total,
+          message: reserved > 0
+            ? `Kunci ini sudah memakai ${usedTokens} token dan menahan ${reserved} token untuk permintaan yang masih berjalan, dari batas ${row.dailyTokenLimit} token hari ini.`
+            : `Kunci ini sudah memakai ${usedTokens} dari ${row.dailyTokenLimit} token hari ini.`,
+        },
+      };
     }
   }
   return null;
+}
+
+/**
+ * Wave 10 (item 24): what a key may still spend today, in one place so the page and the route agree.
+ * `remaining` is negative when the ceiling is already passed, and null when there is no ceiling.
+ */
+export function apiKeyQuotaSnapshot(row: ApiKeyRow): { requestLimit: number; requestsUsed: number; tokenLimit: number; tokensUsed: number; tokensReserved: number; tokensRemaining: number | null; requestsRemaining: number | null } {
+  const requestsUsed = refreshApiKeyDay(row);
+  const tokensUsed = apiKeyTokensToday(row.id);
+  const tokensReserved = apiKeyReservedTokens(row.id);
+  return {
+    requestLimit: row.dailyRequestLimit,
+    requestsUsed,
+    tokenLimit: row.dailyTokenLimit,
+    tokensUsed,
+    tokensReserved,
+    tokensRemaining: row.dailyTokenLimit > 0 ? row.dailyTokenLimit - tokensUsed - tokensReserved : null,
+    requestsRemaining: row.dailyRequestLimit > 0 ? row.dailyRequestLimit - requestsUsed : null,
+  };
 }
 
 /** Simple in-memory limiter per key. It protects the engine from a runaway script; a restart clears it. */

@@ -502,9 +502,87 @@ CREATE TABLE IF NOT EXISTS model_price_overrides (
 CREATE INDEX IF NOT EXISTS idx_model_price_overrides_updated ON model_price_overrides(updated_at DESC);
 `);
 
+/**
+ * Wave 10 (items 23, 24, 25, 26, 29, 31): a strict order for webhook deliveries, a token
+ * reservation for runs that are still in flight, the origin of every growth event, the devices an
+ * account signs in from, a full text index over chat messages, and browser push subscriptions.
+ */
+try { db.exec("ALTER TABLE webhook_deliveries ADD COLUMN sequence INTEGER"); } catch {}
+try { db.exec("ALTER TABLE webhook_deliveries ADD COLUMN resend_of TEXT"); } catch {}
+// Wave 10 (item 23): how many times this row stepped aside for an earlier event. After the limit the
+// row is sent anyway, out of order, and the reason is recorded on the row.
+try { db.exec("ALTER TABLE webhook_deliveries ADD COLUMN deferrals INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN reserved_tokens INTEGER"); } catch {}
+try { db.exec("ALTER TABLE growth_events ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"); } catch {}
+try { db.exec("ALTER TABLE auth_sessions ADD COLUMN device_id TEXT"); } catch {}
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_order ON webhook_deliveries(webhook_id, sequence);
+CREATE TABLE IF NOT EXISTS user_devices (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  fingerprint TEXT NOT NULL, label TEXT NOT NULL DEFAULT '', platform TEXT, user_agent TEXT,
+  first_ip TEXT, last_ip TEXT, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+  seen_count INTEGER NOT NULL DEFAULT 1, trusted INTEGER NOT NULL DEFAULT 0,
+  verified_at TEXT, blocked_at TEXT, blocked_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_fingerprint ON user_devices(user_id, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_user_devices_seen ON user_devices(user_id, last_seen_at DESC);
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, user_agent TEXT,
+  created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, last_success_at TEXT, last_error TEXT,
+  failures INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id, active);
+`);
+// Wave 10 item 29: chat messages get a full text index, so the global search can rank its hits.
+// Triggers keep the index in step with the table; other writers need no change.
+db.exec(`
+CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(content, message_id UNINDEXED, conversation_id UNINDEXED, project_id UNINDEXED, tokenize='unicode61');
+CREATE TRIGGER IF NOT EXISTS message_search_insert AFTER INSERT ON messages BEGIN
+  INSERT INTO message_search(content, message_id, conversation_id, project_id)
+  VALUES (new.content, new.id, new.conversation_id, (SELECT project_id FROM conversations WHERE id = new.conversation_id));
+END;
+CREATE TRIGGER IF NOT EXISTS message_search_delete AFTER DELETE ON messages BEGIN
+  DELETE FROM message_search WHERE message_id = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS message_search_update AFTER UPDATE OF content ON messages BEGIN
+  DELETE FROM message_search WHERE message_id = old.id;
+  INSERT INTO message_search(content, message_id, conversation_id, project_id)
+  VALUES (new.content, new.id, new.conversation_id, (SELECT project_id FROM conversations WHERE id = new.conversation_id));
+END;
+`);
+// One pass over the rows that existed before the index; later rows arrive through the triggers.
+const indexedMessages = Number((db.prepare("SELECT COUNT(*) AS n FROM message_search").get() as { n: number }).n);
+if (indexedMessages === 0) {
+  const rows = db.prepare("SELECT m.id AS id, m.content AS content, m.conversation_id AS conversationId, c.project_id AS projectId FROM messages m JOIN conversations c ON c.id = m.conversation_id").all() as { id: string; content: string; conversationId: string; projectId: string }[];
+  const insertIndex = db.prepare("INSERT INTO message_search(content, message_id, conversation_id, project_id) VALUES (?,?,?,?)");
+  db.transaction(() => { for (const row of rows) insertIndex.run(row.content, row.id, row.conversationId, row.projectId); })();
+}
+
+/**
+ * Wave 10 (item 26): the email link that confirms a new device needs its own token kind, and SQLite
+ * cannot widen a CHECK constraint in place, so the token table is rebuilt once. The rows are copied
+ * over unchanged, and the rebuild happens only while the old constraint is still in the schema.
+ */
+const authTokenDdl = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='auth_tokens'").get() as { sql: string } | undefined)?.sql ?? "";
+if (authTokenDdl && !authTokenDdl.includes("device_verify")) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS auth_tokens_new (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('password_reset','email_verify','device_verify')),
+      token_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL
+    );
+    INSERT OR IGNORE INTO auth_tokens_new (id,user_id,kind,token_hash,expires_at,used_at,created_at)
+      SELECT id,user_id,kind,token_hash,expires_at,used_at,created_at FROM auth_tokens;
+    DROP TABLE auth_tokens;
+    ALTER TABLE auth_tokens_new RENAME TO auth_tokens;
+    CREATE INDEX IF NOT EXISTS idx_auth_tokens_hash ON auth_tokens(token_hash);
+  `);
+}
+
 /** Records the applied schema version so operators can see which shape the database has. */
-export const SCHEMA_VERSION = 17;
-export const SCHEMA_VERSION_NOTE = "Owner priced AI models: real upstream price per million tokens plus a markup for the billed amount";
+export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION_NOTE = "Ordered webhook deliveries, in-flight token reservations, backfillable growth events, sign-in devices, message search index, browser push subscriptions";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

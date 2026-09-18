@@ -733,7 +733,7 @@ if (quotaAfterPlayground === quotaBeforePlayground) {
   skip("[K] token playground masuk ke kuota harian (quotaState.usedToday naik)",
     `kuota harian TIDAK berubah walau playground melaporkan tokens=${playground.json?.tokens} (usedToday sebelum=${quotaBeforePlayground}, sesudah=${quotaAfterPlayground}). Sebabnya: quotaState() menghitung pemakaian dari tabel run_usage, sedangkan /api/v1/playground/run hanya memanggil chargeQuota(userId, tokens) di server.ts:2610 tanpa menulis baris run_usage. Jadi tidak ada endpoint GET yang bisa membuktikan token playground masuk kuota — ini TEMUAN, bukan kegagalan suite.`);
 } else {
-  check("[K] token playground masuk ke kuota harian (quotaState.usedToday naik)", quotaAfterPlayground > quotaBeforePlayground, short({ sebelum: quotaBeforePlayground, sesudah: quotaAfterPlayground }));
+  check("[K] token playground masuk ke kuota harian (quotaState.usedToday naik)", Number(quotaAfterPlayground) > Number(quotaBeforePlayground), short({ sebelum: quotaBeforePlayground, sesudah: quotaAfterPlayground }));
 }
 // Pembanding: jalur run percakapan memang menulis run_usage dan menaikkan kuota.
 const quotaBeforeRun = await usedToday(agent);

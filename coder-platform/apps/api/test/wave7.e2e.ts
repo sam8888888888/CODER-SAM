@@ -18,6 +18,8 @@
  * Jalankan: cd /workspace/coblai-dinda/coder-platform && npx tsx apps/api/test/wave7.e2e.ts
  */
 
+import { createHash } from "node:crypto";
+
 const port = 6900 + Math.floor(Math.random() * 90); // rentang khusus 6900-6990
 const dataDir = `/tmp/coder-wave7-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 const stamp = Date.now();
@@ -43,6 +45,9 @@ process.env.RATE_LIMIT_API_PER_MINUTE = "100000";
 process.env.RATE_LIMIT_REFERRAL_PER_HOUR = "3"; // cukup kecil supaya batasnya benar-benar teruji
 process.env.REFERRAL_MAX_REWARDED_PER_USER = "1"; // supaya batas hadiah (CEILING) teruji
 process.env.NOTIFY_EMAIL_ENABLED = "false";
+// Wave 10 (butir 26): syarat hadiah dipertegas di sini supaya uji ini menguji perilaku bawaan
+// produksi (bawaan kode juga true), bukan perilaku yang dilonggarkan hanya untuk uji.
+process.env.REFERRAL_REQUIRE_VERIFIED_EMAIL = "true";
 process.env.RETENTION_ENABLED = "false";
 process.env.WEBHOOK_ALLOW_LOCAL = "true";
 process.env.JOB_WORKER_INTERVAL_MS = "3600000";
@@ -201,6 +206,21 @@ check("hadiah belum dibayar sebelum run pertama selesai",
   Number(inviteePending.json?.counters?.rewarded) === 0 && Number((db.prepare("SELECT COUNT(*) AS n FROM credit_ledger WHERE user_id=?").get(ownerId) as any)?.n) === 0 && Number(inviteePending.json?.tokensEarned) === 0,
   short(inviteePending.json?.counters));
 
+// Wave 10 (butir 26): hadiah hanya dibayar ke akun yang benar-benar memverifikasi emailnya, supaya
+// alamat sekali pakai tidak bisa memanen program undangan. Token dibuat seperti uji Wave 8 (baris
+// auth_tokens dengan aturan sha256 yang sama), jadi alurnya tetap alur sungguhan, bukan pintasan.
+const inviteeVerifyToken = `w7-verify-${stamp}-token`;
+db.prepare("INSERT INTO auth_tokens (id,user_id,kind,token_hash,expires_at,created_at) VALUES (?,?,?,?,?,?)")
+  .run(`tok-invitee-${stamp}`, inviteeId, "email_verify", createHash("sha256").update(inviteeVerifyToken).digest("hex"), new Date(Date.now() + 3600_000).toISOString(), new Date().toISOString());
+const inviteeVerified = await invitee.call("POST", "/api/v1/auth/email/verify", { token: inviteeVerifyToken });
+check("email orang yang diundang terverifikasi (syarat hadiah sejak Wave 10)",
+  inviteeVerified.status === 200
+  && Number((db.prepare("SELECT COUNT(*) AS n FROM users WHERE id=? AND email_verified=1").get(inviteeId) as any)?.n) === 1,
+  short(inviteeVerified.json));
+const stillPending = db.prepare("SELECT status FROM referrals WHERE invitee_user_id=?").get(inviteeId) as any;
+check("verifikasi email saja belum membayar hadiah (menunggu run pertama)",
+  stillPending?.status === "pending", short(stillPending));
+
 /* ------------------------------- 5) hadiah setelah run pertama ------------------------------- */
 
 const inviteeWorkspaces = await invitee.call("GET", "/api/v1/workspaces");
@@ -248,6 +268,13 @@ const thirdReg = await third.call("POST", "/api/v1/auth/register", { email: thir
 const thirdId = String(thirdReg.json?.user?.id ?? "");
 const thirdAttached = db.prepare("SELECT status FROM referrals WHERE invitee_user_id=?").get(thirdId) as any;
 check("undangan ketiga tercatat menunggu sebelum batasnya diuji", thirdReg.json?.referral?.accepted === true && thirdAttached?.status === "pending", short(thirdAttached));
+// Syarat verifikasi email (Wave 10) diperiksa lebih dulu daripada batas hadiah, jadi undangan ketiga
+// diverifikasi seperti pengguna sungguhan supaya yang teruji di sini benar-benar batas CEILING.
+const thirdVerifyToken = `w7-verify3-${stamp}-token`;
+db.prepare("INSERT INTO auth_tokens (id,user_id,kind,token_hash,expires_at,created_at) VALUES (?,?,?,?,?,?)")
+  .run(`tok-third-${stamp}`, thirdId, "email_verify", createHash("sha256").update(thirdVerifyToken).digest("hex"), new Date(Date.now() + 3600_000).toISOString(), new Date().toISOString());
+const thirdVerified = await third.call("POST", "/api/v1/auth/email/verify", { token: thirdVerifyToken });
+check("email undangan ketiga terverifikasi sebelum batas diuji", thirdVerified.status === 200, short(thirdVerified.json));
 const ceiling = refMod.qualifyReferralForRun(thirdId);
 const thirdAfter = db.prepare("SELECT status, blocked_reason AS reason FROM referrals WHERE invitee_user_id=?").get(thirdId) as any;
 check("batas hadiah per pengundang dihormati (CEILING)",
@@ -305,8 +332,12 @@ check("retensi melaporkan angka dan keterbatasannya secara jujur",
 check("daftar peristiwa teratas berisi nama dan jumlah",
   Array.isArray(growth.json?.events) && growth.json.events.length >= 1 && String(growth.json.events[0]?.name ?? "").length > 0 && Number(growth.json.events[0]?.count) >= 1,
   short(growth.json?.events?.slice(0, 3)));
-check("katalog peristiwa memuat 16 nama yang dikenal",
-  Array.isArray(growth.json?.catalogue) && growth.json.catalogue.length === 16 && growth.json.catalogue.includes("referral_rewarded"),
+// Panjang katalog dibaca dari modul, bukan angka mati, supaya uji ini tidak basi setiap Wave
+// menambah nama peristiwa. Isinya tetap diperiksa: semua nama modul muncul dan hadiah ada di situ.
+const catalogueModul = growthMod.GROWTH_EVENTS as string[];
+check(`katalog peristiwa memuat ${catalogueModul.length} nama yang dikenal`,
+  Array.isArray(growth.json?.catalogue) && growth.json.catalogue.length === catalogueModul.length
+  && catalogueModul.every((name) => growth.json.catalogue.includes(name)) && growth.json.catalogue.includes("referral_rewarded"),
   short(growth.json?.catalogue?.length));
 check("total umum pertumbuhan tersedia",
   Number(growth.json?.totals?.users) >= 6 && Number(growth.json?.totals?.projects) >= 1 && Number(growth.json?.totals?.runsCompleted) >= 1,
@@ -346,8 +377,10 @@ check("kemajuan langkah awal dihitung wajar", Number(onboarding.json?.total) ===
 check("langkah berikutnya menunjuk langkah yang belum selesai",
   stepKeys.includes(String(onboarding.json?.nextStep)) && onboarding.json?.complete === false,
   short(onboarding.json?.nextStep));
+// Sejak Wave 10 (butir 26) alamat orang yang diundang memang sudah diverifikasi sebelum hadiahnya
+// cair, jadi angka pendukung ini harus jujur menyebut true — bukan false seperti sebelum Wave 10.
 check("angka pendukung langkah awal masuk akal",
-  Number(onboarding.json?.counts?.projects) >= 1 && Number(onboarding.json?.counts?.runsDone) >= 1 && onboarding.json?.counts?.emailVerified === false,
+  Number(onboarding.json?.counts?.projects) >= 1 && Number(onboarding.json?.counts?.runsDone) >= 1 && onboarding.json?.counts?.emailVerified === true,
   short(onboarding.json?.counts));
 const dismissed = await invitee.call("POST", "/api/v1/onboarding/dismiss");
 check("langkah awal bisa disembunyikan dan keadaannya dikembalikan",

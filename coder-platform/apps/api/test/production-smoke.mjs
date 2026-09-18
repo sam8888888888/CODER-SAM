@@ -591,5 +591,82 @@ check("wave9 the web process no longer owns the queue",
   JSON.stringify({ running: workerW9?.running, cyclesRun: workerW9?.cyclesRun }));
 console.log(`INFO wave9 markup=${aiPricing?.markup} cost30=${cost30} billed30=${billed30} margin30=${margin30} overrides=${aiPricing?.overrideCount} catalog=${aiPricing?.catalogSize} workerInWeb=${workerW9?.running} handlers=${workerW9?.handlers?.length}`);
 
+// ------------------------------------------------------------------ Wave 10 (v0.20.0)
+// Pencarian global, perangkat, notifikasi peramban, metrik, pembersihan, dan kuota berjalan.
+const lockSearchStatus = await call("GET", "/api/v1/search/status");
+check("wave10 the message index reports its own state", lockSearchStatus.status === 200
+  && Number.isFinite(Number(lockSearchStatus.json?.messages)) && Number.isFinite(Number(lockSearchStatus.json?.indexedMessages)),
+  JSON.stringify(lockSearchStatus.json));
+const lockSearch = await call("GET", `/api/v1/search?q=${encodeURIComponent("coblai")}`);
+check("wave10 global search spans projects, conversations, messages, artifacts, knowledge and workflows",
+  lockSearch.status === 200 && Array.isArray(lockSearch.json?.groups) && typeof lockSearch.json?.total === "number"
+  && Number.isFinite(Number(lockSearch.json?.tookMs)),
+  JSON.stringify(lockSearch.json)?.slice(0, 220));
+const lockSearchShort = await call("GET", "/api/v1/search?q=a");
+check("wave10 a one letter search is refused with a clear reason", lockSearchShort.status === 400 && typeof lockSearchShort.json?.error === "string", JSON.stringify(lockSearchShort.json));
+const lockReindex = await call("POST", "/api/v1/admin/search/reindex");
+check("wave10 rebuilding the search index stays behind the admin gate", lockReindex.status === 403 && lockReindex.json?.error === "ADMIN_REQUIRED", JSON.stringify(lockReindex.json));
+
+const lockDevices = await call("GET", "/api/v1/account/devices");
+check("wave10 the account lists the signed in devices with the current one marked",
+  lockDevices.status === 200 && Array.isArray(lockDevices.json?.devices) && typeof lockDevices.json?.mode === "string"
+  && typeof lockDevices.json?.verifyRequired === "boolean",
+  JSON.stringify(lockDevices.json)?.slice(0, 220));
+check("wave10 the smoke session itself is a tracked device", (lockDevices.json?.devices ?? []).some((d) => d?.current === true), JSON.stringify((lockDevices.json?.devices ?? []).slice(0, 2)));
+const lockAdminDevices = await call("GET", "/api/v1/admin/devices");
+check("wave10 the admin device list is closed to a normal account", lockAdminDevices.status === 403 && lockAdminDevices.json?.error === "ADMIN_REQUIRED", JSON.stringify(lockAdminDevices.json));
+const lockDeviceBlock = await call("POST", "/api/v1/admin/devices/tidak-ada/block", { reason: "uji" });
+check("wave10 blocking a device is closed to a normal account", lockDeviceBlock.status === 403, String(lockDeviceBlock.status));
+
+const lockPush = await call("GET", "/api/v1/account/push");
+check("wave10 the browser push settings publish a usable public key",
+  lockPush.status === 200 && typeof lockPush.json?.publicKey === "string" && String(lockPush.json.publicKey).length > 80
+  && Array.isArray(lockPush.json?.subscriptions) && Number(lockPush.json?.max) >= 1,
+  JSON.stringify({ len: String(lockPush.json?.publicKey ?? "").length, max: lockPush.json?.max, subs: lockPush.json?.subscriptions?.length }));
+check("wave10 the private push key is never part of the answer", !/private|vapidPrivate/i.test(lockPush.text), lockPush.text.slice(0, 160));
+const lockPushBad = await call("POST", "/api/v1/account/push/subscribe", { endpoint: "http://bukan-https.example.test", keys: { p256dh: "x", auth: "y" } });
+check("wave10 a push subscription without https is refused", lockPushBad.status === 400 && typeof lockPushBad.json?.error === "string", JSON.stringify(lockPushBad.json));
+
+const lockKeys = await call("GET", "/api/v1/api-keys");
+const lockKeyRows = Array.isArray(lockKeys.json?.keys) ? lockKeys.json.keys : [];
+check("wave10 the api key list shows the reserved tokens of runs that are still going on",
+  lockKeys.status === 200 && Number.isFinite(Number(lockKeys.json?.reservedTokens))
+  && lockKeyRows.every((k) => Number.isFinite(Number(k?.tokensReserved)) && k?.inFlight !== undefined && k?.quota !== undefined),
+  JSON.stringify(lockKeys.json)?.slice(0, 260));
+
+const lockMetrics = await call("GET", "/api/v1/metrics");
+check("wave10 the metrics endpoint refuses a request without the token", lockMetrics.status === 404, String(lockMetrics.status));
+const lockMetricsWrong = await fetch(`${BASE}/api/v1/metrics?token=salah`, { headers: { authorization: "Bearer salah" } });
+check("wave10 the metrics endpoint refuses a wrong token", lockMetricsWrong.status === 404, String(lockMetricsWrong.status));
+const lockAdminMetrics = await call("GET", "/api/v1/admin/metrics");
+check("wave10 the metrics screen stays behind the admin gate", lockAdminMetrics.status === 403 && lockAdminMetrics.json?.error === "ADMIN_REQUIRED", JSON.stringify(lockAdminMetrics.json));
+
+const lockBackfill = await call("GET", "/api/v1/admin/growth/backfill");
+check("wave10 the growth backfill preview stays behind the admin gate", lockBackfill.status === 403 && lockBackfill.json?.error === "ADMIN_REQUIRED", JSON.stringify(lockBackfill.json));
+const lockBackfillRun = await call("POST", "/api/v1/admin/growth/backfill", { apply: true });
+check("wave10 running the growth backfill stays behind the admin gate", lockBackfillRun.status === 403, String(lockBackfillRun.status));
+const lockSmokeCleanup = await call("POST", "/api/v1/admin/smoke/cleanup", { dryRun: true });
+check("wave10 the smoke data clean-up stays behind the admin gate", lockSmokeCleanup.status === 403, String(lockSmokeCleanup.status));
+const lockDeliveries = await call("GET", "/api/v1/webhooks/tidak-ada/deliveries");
+check("wave10 the webhook delivery history route exists and hides unknown webhooks", lockDeliveries.status === 404, String(lockDeliveries.status));
+const lockTrim = await call("DELETE", "/api/v1/webhooks/tidak-ada/deliveries?dryRun=true");
+check("wave10 trimming the webhook history also hides unknown webhooks", lockTrim.status === 404, String(lockTrim.status));
+
+const hub10 = await call("GET", "/api/v1/status-hub");
+check("wave10 the status hub reports search, push, devices and housekeeping",
+  hub10.status === 200 && hub10.json?.search?.kinds >= 5 && typeof hub10.json?.search?.indexedMessages === "number"
+  && typeof hub10.json?.push?.configured === "boolean" && Number(hub10.json?.push?.maxPerUser) >= 1
+  && typeof hub10.json?.devices?.tracking === "boolean" && typeof hub10.json?.devices?.verifyRequired === "boolean"
+  && Number.isFinite(Number(hub10.json?.housekeeping?.reservedTokensWaiting)),
+  JSON.stringify(hub10.json?.search)?.slice(0, 200));
+check("wave10 the status hub shows where the growth events came from",
+  Array.isArray(hub10.json?.openPlatform?.growthSources) && hub10.json.openPlatform.growthSources.length >= 1,
+  JSON.stringify(hub10.json?.openPlatform?.growthSources)?.slice(0, 200));
+check("wave10 the status hub says how long the clean up keeps webhook history",
+  Number(hub10.json?.housekeeping?.webhookDays) >= 1 && typeof hub10.json?.housekeeping?.retentionDryRun === "boolean"
+  && typeof hub10.json?.housekeeping?.smokeCleanup === "boolean",
+  JSON.stringify(hub10.json?.housekeeping));
+console.log(`INFO wave10 searchIndexed=${hub10.json?.search?.indexedMessages}/${hub10.json?.search?.messages} pushConfigured=${hub10.json?.push?.configured} pushSubs=${hub10.json?.push?.activeSubscriptions} devices=${hub10.json?.devices?.total} verifyMode=${hub10.json?.devices?.mode} reservedTokens=${hub10.json?.housekeeping?.reservedTokensWaiting} growthSources=${JSON.stringify(hub10.json?.openPlatform?.growthSources)}`);
+
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

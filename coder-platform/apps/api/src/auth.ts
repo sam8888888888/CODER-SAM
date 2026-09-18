@@ -36,10 +36,21 @@ export function setSessionCookie(reply: FastifyReply, token: string, production:
 export function clearSessionCookie(reply: FastifyReply, production: boolean) {
   reply.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: "lax", secure: production, path: "/" });
 }
-export function createSession(userId: string, userAgent?: string) {
+/**
+ * Starts a session. Wave 10 (item 26) adds the device: the session points at the browser row, so
+ * revoking a device can end exactly the sessions that belong to it.
+ */
+export function createSession(userId: string, userAgent?: string, deviceId?: string | null) {
   const token = randomBytes(32).toString("base64url"); const now = new Date(); const expires = new Date(now.getTime() + SESSION_DAYS * 86400000);
-  db.prepare("INSERT INTO auth_sessions (id,user_id,token_hash,expires_at,created_at,last_seen_at,user_agent) VALUES (?,?,?,?,?,?,?)").run(randomUUID(), userId, tokenDigest(token), expires.toISOString(), now.toISOString(), now.toISOString(), (userAgent ?? "").slice(0, 200));
+  db.prepare("INSERT INTO auth_sessions (id,user_id,token_hash,expires_at,created_at,last_seen_at,user_agent,device_id) VALUES (?,?,?,?,?,?,?,?)").run(randomUUID(), userId, tokenDigest(token), expires.toISOString(), now.toISOString(), now.toISOString(), (userAgent ?? "").slice(0, 200), deviceId ?? null);
   return token;
+}
+
+/** The device a session belongs to, or null for sessions from before devices were recorded. */
+export function deviceIdForSession(sessionId: string | null): string | null {
+  if (!sessionId) return null;
+  const row = db.prepare("SELECT device_id AS deviceId FROM auth_sessions WHERE id=?").get(sessionId) as { deviceId: string | null } | undefined;
+  return row?.deviceId ?? null;
 }
 export function sessionIdForToken(token: string): string | null {
   const row = db.prepare("SELECT id FROM auth_sessions WHERE token_hash=?").get(tokenDigest(token)) as { id: string } | undefined;

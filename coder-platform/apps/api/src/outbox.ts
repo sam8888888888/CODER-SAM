@@ -7,7 +7,7 @@ import { mailerConfigured, sendMail } from "./mailer.js";
  *  Nothing is delivered until NOTIFY_EMAIL_ENABLED is on, and every attempt is recorded, so an operator
  *  can see exactly what would be sent. In-app notifications are not affected by this file. */
 
-export type EmailKind = "run" | "quota" | "cost" | "billing" | "team" | "invitation" | "security" | "account" | "system";
+export type EmailKind = "run" | "quota" | "cost" | "billing" | "team" | "invitation" | "security" | "account" | "system" | "device" | "webhook";
 
 export type NotificationPrefs = {
   userId: string; emailQuota: number; emailRuns: number; emailBilling: number;
@@ -24,6 +24,10 @@ export const PREF_COLUMN: Record<string, keyof NotificationPrefs | null> = {
   invitation: "emailTeam",
   security: "emailSecurity",
   account: "emailSecurity",
+  // Wave 10 (item 31): a sign-in from an unknown browser is a security message, so it follows the
+  // security switch. A webhook that keeps failing is operational news and always leaves the server.
+  device: "emailSecurity",
+  webhook: null,
   system: null,
 };
 

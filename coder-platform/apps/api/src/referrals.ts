@@ -2,6 +2,7 @@ import { randomUUID, randomBytes } from "node:crypto";
 import { db } from "./db.js";
 import { config } from "./config.js";
 import { grantCredit } from "./billing.js";
+import { shareDevice } from "./devices.js";
 
 /** Wave 7: the referral programme.
  *
@@ -107,7 +108,10 @@ export function attachReferral(input: {
 
   const sameEmail = inviter.email.toLowerCase() === input.inviteeEmail.toLowerCase();
   const sameIp = Boolean(inviter.signupIp && input.inviteeIp && inviter.signupIp === input.inviteeIp);
-  const blockedReason = sameEmail ? "SAME_EMAIL" : sameIp ? "SAME_IP" : null;
+  // Wave 10 (item 26): the same browser is the strongest sign that one person made both accounts, so
+  // it blocks the reward even when the email address and the IP address differ.
+  const sameDevice = shareDevice(owner.userId, input.inviteeUserId);
+  const blockedReason = sameEmail ? "SAME_EMAIL" : sameIp ? "SAME_IP" : sameDevice ? "SAME_DEVICE" : null;
   const id = randomUUID();
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO referrals (id, code, inviter_user_id, invitee_user_id, invitee_email, invitee_ip, inviter_ip,
@@ -130,6 +134,13 @@ export function qualifyReferralForRun(inviteeUserId: string): {
   const referral = rowToReferral(row);
   if (referral.status === "blocked") return { status: "blocked", referralId: referral.id, reason: referral.blockedReason ?? "BLOCKED" };
   if (referral.status === "rewarded") return { status: "none" };
+  // Wave 10 (item 26): a reward is only paid to an account that really proved its email address, so a
+  // throwaway address cannot farm the programme. The row stays `pending`, so the reward is paid by a
+  // later completed run once the invitee verifies the address.
+  const invitee = db.prepare("SELECT email_verified AS emailVerified FROM users WHERE id=?").get(inviteeUserId) as { emailVerified: number } | undefined;
+  if (config.REFERRAL_REQUIRE_VERIFIED_EMAIL && Number(invitee?.emailVerified ?? 0) !== 1) {
+    return { status: "none", referralId: referral.id, reason: "EMAIL_NOT_VERIFIED" };
+  }
   if (!referralProgrammeEnabled()) return { status: "none" };
 
   const ceiling = config.REFERRAL_MAX_REWARDED_PER_USER;

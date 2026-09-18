@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { db } from "./db.js";
 
 /** Wave 7: growth measurement.
@@ -16,6 +16,9 @@ export const GROWTH_EVENTS = [
   "api_key_created", "webhook_created",
   "order_created", "order_paid",
   "referral_joined", "referral_rewarded", "onboarding_completed",
+  // Wave 10 (item 25/32C): artefak dan alur kerja ikut dihitung. Peristiwa ini hanya muncul dari
+  // pelengkapan data, karena tidak ada jalur yang mencatatnya saat kejadian berlangsung.
+  "artifact_created", "workflow_created",
   "quota_warning_shown", "upgrade_viewed",
 ] as const;
 
@@ -130,6 +133,164 @@ export function retentionReport(): {
     newUsers7d: newUsers(7), newUsers30d: newUsers(30), payingUsers: paying,
     note: "Pengguna aktif dihitung dari tabel growth_events yang baru ada sejak Wave 7; angka sebelum itu tidak tersedia.",
   };
+}
+
+/**
+ * Wave 10 (item 25 + 32c): rebuild the event log from the real tables.
+ *
+ * `growth_events` only exists from Wave 7, so the daily activity chart and the active user numbers
+ * were blind before that date. This pass reads the real tables (`users`, `projects`, `conversations`,
+ * `runs`, `api_keys`, `webhooks`, `orders`, `referrals`) and writes the events that were never
+ * recorded, each one stamped with the real time of the row it came from.
+ *
+ * Three rules make it safe to run at every start-up:
+ *  1. A row is written only when the same real entity is not already in the log. Live rows are matched
+ *     through the id stored in `props`, account-based events through the user id, and rebuilt rows
+ *     through their deterministic id (`bf-<hash of event + entity>`).
+ *  2. Rebuilt rows carry `source='backfill'`, so a reader can always separate rebuilt history from what
+ *     the platform recorded live.
+ *  3. Events that were never stored anywhere (a dismissed upgrade banner, a warning toast, an
+ *     onboarding step whose time is not kept) are NOT invented. They stay missing, and the report says
+ *     so instead of quietly producing numbers.
+ */
+
+export type GrowthBackfillPlanRow = { event: GrowthEventName; source: string; candidates: number; alreadyRecorded: number; toInsert: number };
+
+export type GrowthBackfillReport = {
+  dryRun: boolean;
+  generatedAt: string;
+  rows: GrowthBackfillPlanRow[];
+  inserted: number;
+  skipped: number;
+  totalCandidates: number;
+  excluded: Array<{ event: string; reason: string }>;
+  note: string;
+};
+
+/** One rebuilt event: the real table, the real time, and the account it belongs to. */
+type SourceQuery = {
+  event: GrowthEventName;
+  table: string;
+  /** The id of the real row, as the caller reads it. */
+  entityId: string;
+  /** The property that holds the same id when the event was recorded live (null: match by account). */
+  propsKey: string | null;
+  sql: string;
+};
+
+const EXCLUDED: Array<{ event: string; reason: string }> = [
+  { event: "quota_warning_shown", reason: "hanya tampil di layar; tidak ada baris tersimpan yang menyebut waktunya" },
+  { event: "upgrade_viewed", reason: "hanya tampil di layar; tidak ada baris tersimpan yang menyebut waktunya" },
+  { event: "onboarding_completed", reason: "onboarding_state tidak menyimpan waktu selesai" },
+];
+
+/** The owner of a workspace is the account that represents it in reports. */
+const owner = (column: string) => `(SELECT m.user_id FROM memberships m WHERE m.workspace_id = ${column} AND m.role='owner' ORDER BY m.created_at ASC LIMIT 1)`;
+
+const SOURCES: SourceQuery[] = [
+  { event: "signup", table: "users", entityId: "id", propsKey: null, sql: "SELECT id AS entityId, created_at AS at, id AS userId, NULL AS workspaceId FROM users" },
+  { event: "email_verified", table: "users (email_verified=1)", entityId: "id", propsKey: null, sql: "SELECT id AS entityId, created_at AS at, id AS userId, NULL AS workspaceId FROM users WHERE email_verified=1" },
+  { event: "project_created", table: "projects", entityId: "id", propsKey: "projectId", sql: `SELECT p.id AS entityId, p.created_at AS at, ${owner("p.workspace_id")} AS userId, p.workspace_id AS workspaceId FROM projects p` },
+  { event: "conversation_created", table: "conversations", entityId: "id", propsKey: "conversationId", sql: `SELECT c.id AS entityId, c.created_at AS at, ${owner("p.workspace_id")} AS userId, p.workspace_id AS workspaceId FROM conversations c JOIN projects p ON p.id = c.project_id` },
+  { event: "run_started", table: "runs", entityId: "id", propsKey: "runId", sql: `SELECT r.id AS entityId, r.created_at AS at, ${owner("p.workspace_id")} AS userId, p.workspace_id AS workspaceId FROM runs r JOIN projects p ON p.id = r.project_id` },
+  { event: "run_completed", table: "runs (completed)", entityId: "id", propsKey: "runId", sql: `SELECT r.id AS entityId, COALESCE(r.finished_at, r.created_at) AS at, ${owner("p.workspace_id")} AS userId, p.workspace_id AS workspaceId FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.status='completed'` },
+  { event: "run_failed", table: "runs (failed)", entityId: "id", propsKey: "runId", sql: `SELECT r.id AS entityId, COALESCE(r.finished_at, r.created_at) AS at, ${owner("p.workspace_id")} AS userId, p.workspace_id AS workspaceId FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.status='failed'` },
+  // The live row for a new key only carries the scopes, so this one is matched per account.
+  { event: "api_key_created", table: "api_keys", entityId: "id", propsKey: null, sql: "SELECT k.id AS entityId, k.created_at AS at, k.user_id AS userId, k.workspace_id AS workspaceId FROM api_keys k" },
+  { event: "webhook_created", table: "webhooks", entityId: "id", propsKey: "webhookId", sql: "SELECT w.id AS entityId, w.created_at AS at, w.user_id AS userId, w.workspace_id AS workspaceId FROM webhooks w" },
+  { event: "artifact_created", table: "artifacts", entityId: "id", propsKey: "artifactId", sql: `SELECT a.id AS entityId, a.created_at AS at, ${owner("p.workspace_id")} AS userId, p.workspace_id AS workspaceId FROM artifacts a JOIN projects p ON p.id = a.project_id` },
+  { event: "workflow_created", table: "workflows", entityId: "id", propsKey: "workflowId", sql: `SELECT wf.id AS entityId, wf.created_at AS at, ${owner("p.workspace_id")} AS userId, p.workspace_id AS workspaceId FROM workflows wf JOIN projects p ON p.id = wf.project_id` },
+  { event: "order_created", table: "orders", entityId: "id", propsKey: "orderId", sql: "SELECT o.id AS entityId, o.created_at AS at, o.user_id AS userId, NULL AS workspaceId FROM orders o" },
+  { event: "order_paid", table: "orders (paid)", entityId: "id", propsKey: "orderId", sql: "SELECT o.id AS entityId, COALESCE(o.decided_at, o.updated_at) AS at, o.user_id AS userId, NULL AS workspaceId FROM orders o WHERE o.status='paid'" },
+  { event: "referral_joined", table: "referrals", entityId: "id", propsKey: "referralId", sql: "SELECT r.id AS entityId, r.created_at AS at, r.invitee_user_id AS userId, NULL AS workspaceId FROM referrals r" },
+  { event: "referral_rewarded", table: "referrals (rewarded)", entityId: "id", propsKey: "referralId", sql: "SELECT r.id AS entityId, COALESCE(r.rewarded_at, r.qualified_at, r.created_at) AS at, r.inviter_user_id AS userId, NULL AS workspaceId FROM referrals r WHERE r.status='rewarded'" },
+];
+
+function backfillId(event: string, entityId: string): string {
+  return `bf-${createHash("sha256").update(`${event}:${entityId}`).digest("hex").slice(0, 32)}`;
+}
+
+type Candidate = { entityId: string; at: string | null; userId: string | null; workspaceId: string | null };
+
+function candidatesOf(source: SourceQuery): Candidate[] {
+  return db.prepare(source.sql).all() as Candidate[];
+}
+
+/** The real entities that the log already knows about for one event, live or rebuilt. */
+function recordedEntities(source: SourceQuery): Set<string> {
+  const keys = new Set<string>();
+  if (source.propsKey) {
+    // A live row keeps the id under the property name of its event; a rebuilt row (source='backfill')
+    // keeps it under `entityId`. Both must count as "already there", otherwise the plan keeps promising
+    // rows that the apply step will refuse to write.
+    const rows = db.prepare(`SELECT json_extract(props, '$.${source.propsKey}') AS key, json_extract(props, '$.entityId') AS rebuilt FROM growth_events WHERE name=?`).all(source.event) as Array<{ key: string | null; rebuilt: string | null }>;
+    for (const row of rows) {
+      if (row.key) keys.add(row.key);
+      if (row.rebuilt) keys.add(row.rebuilt);
+    }
+    return keys;
+  }
+  const rows = db.prepare("SELECT user_id AS userId FROM growth_events WHERE name=?").all(source.event) as Array<{ userId: string | null }>;
+  for (const row of rows) if (row.userId) keys.add(`user:${row.userId}`);
+  return keys;
+}
+
+/** Counts what each source table holds, and how much of it is already in the event log. */
+export function planGrowthBackfill(): { rows: GrowthBackfillPlanRow[]; excluded: Array<{ event: string; reason: string }>; totalCandidates: number } {
+  const rows: GrowthBackfillPlanRow[] = [];
+  let totalCandidates = 0;
+  for (const source of SOURCES) {
+    const candidates = candidatesOf(source);
+    const recorded = recordedEntities(source);
+    const already = candidates.filter((row) => recorded.has(source.propsKey ? row.entityId : `user:${row.userId ?? ""}`)).length;
+    totalCandidates += candidates.length;
+    rows.push({ event: source.event, source: source.table, candidates: candidates.length, alreadyRecorded: already, toInsert: candidates.length - already });
+  }
+  return { rows, excluded: EXCLUDED, totalCandidates };
+}
+
+/** Runs the pass. Without `apply` it only reports, which is the safe default for an admin call. */
+export function backfillGrowthEvents(options: { apply?: boolean; now?: Date } = {}): GrowthBackfillReport {
+  const generatedAt = (options.now ?? new Date()).toISOString();
+  const apply = Boolean(options.apply);
+  const plan = planGrowthBackfill();
+  const insert = db.prepare("INSERT OR IGNORE INTO growth_events (id, name, user_id, workspace_id, props, created_at, source) VALUES (?,?,?,?,?,?, 'backfill')");
+  let inserted = 0;
+  let skipped = 0;
+  for (const source of SOURCES) {
+    const recorded = recordedEntities(source);
+    for (const row of candidatesOf(source)) {
+      if (!row.entityId) continue;
+      const matchKey = source.propsKey ? row.entityId : `user:${row.userId ?? ""}`;
+      if (recorded.has(matchKey)) { skipped += 1; continue; }
+      if (!apply) continue;
+      const props = JSON.stringify({ backfill: true, entityId: row.entityId, table: source.table });
+      try {
+        const result = insert.run(backfillId(source.event, row.entityId), source.event, row.userId ?? null, row.workspaceId ?? null, props, row.at ?? generatedAt);
+        if (result.changes) inserted += 1; else skipped += 1;
+      } catch {
+        skipped += 1;
+      }
+    }
+  }
+  if (!apply) {
+    return {
+      dryRun: true, generatedAt, rows: plan.rows, inserted: 0,
+      skipped: plan.rows.reduce((sum, row) => sum + row.alreadyRecorded, 0),
+      totalCandidates: plan.totalCandidates, excluded: plan.excluded,
+      note: "Pratinjau: tidak ada baris yang ditulis. Panggil ulang dengan { apply: true } untuk menerapkan.",
+    };
+  }
+  return {
+    dryRun: false, generatedAt, rows: plan.rows, inserted, skipped,
+    totalCandidates: plan.totalCandidates, excluded: plan.excluded,
+    note: "Baris hasil pelengkapan ditandai source='backfill' dan memakai waktu asli dari tabel sumber. Peristiwa yang tidak pernah tersimpan tidak dibuat.",
+  };
+}
+
+/** How many rows in the log come from the real tables and how many were recorded live. */
+export function growthEventSources(): Array<{ source: string; events: number; first: string | null; last: string | null }> {
+  return db.prepare("SELECT COALESCE(source,'live') AS source, COUNT(*) AS events, MIN(created_at) AS first, MAX(created_at) AS last FROM growth_events GROUP BY COALESCE(source,'live') ORDER BY events DESC").all() as Array<{ source: string; events: number; first: string | null; last: string | null }>;
 }
 
 /** The most frequent recorded events in the window. */
