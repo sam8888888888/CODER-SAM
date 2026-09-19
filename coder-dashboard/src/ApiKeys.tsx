@@ -146,6 +146,21 @@ function statusLabel(row: ApiKeyRow): string {
   return isRevoked(row) ? 'Dicabut' : 'Aktif';
 }
 
+/** Wave 10 (butir 24): banyaknya run yang masih berjalan dan sudah memegang token cadangan. */
+function runBerjalan(row: ApiKeyRow): number {
+  return Array.isArray(row.inFlight) ? row.inFlight.length : 0;
+}
+
+/**
+ * Wave 10 (butir 24): sisa kuota token hari ini setelah dikurangi token yang dipakai dan yang
+ * dicadangkan run berjalan. Kosong bila kunci tidak punya batas token harian.
+ */
+function sisaToken(row: ApiKeyRow): string {
+  const kuota = row.quota;
+  if (!kuota || num(kuota.tokenLimit) <= 0) return '';
+  return 'sisa hari ini ' + numberText(kuota.tokensRemaining) + ' dari ' + numberText(kuota.tokenLimit) + ' token';
+}
+
 /** Satu baris keterangan "label: nilai" untuk kartu ringkas. */
 function Row({ label, value }: { label: string; value: string }) {
   return (
@@ -749,6 +764,9 @@ export function ApiKeys({ onError }: Props) {
                     Jumlah permintaan
                   </th>
                   <th scope="col" className={TH}>
+                    Token run berjalan
+                  </th>
+                  <th scope="col" className={TH}>
                     Batas harian
                   </th>
                   <th scope="col" className={TH}>
@@ -807,9 +825,20 @@ export function ApiKeys({ onError }: Props) {
                       <td className={TD}>{dateTimeText(row.createdAt)}</td>
                       <td className={TD}>
                         {dateTimeText(row.lastUsedAt)}
-                        {row.lastUsedIp ? <span className="ml-1 text-xs text-slate-400">({row.lastUsedIp})</span> : null}
+                        {row.lastIp ? <span className="ml-1 text-xs text-slate-400">({row.lastIp})</span> : null}
                       </td>
                       <td className={TD}>{numberText(row.requestCount)}</td>
+                      <td className={TD}>
+                        <span className="text-slate-300">{numberText(row.tokensReserved)} token</span>
+                        <span className="ml-1 block text-xs text-slate-400">
+                          {runBerjalan(row) === 0
+                            ? 'tidak ada run berjalan'
+                            : numberText(runBerjalan(row)) + ' run sedang berjalan'}
+                        </span>
+                        {sisaToken(row) ? (
+                          <span className="ml-1 block text-xs text-slate-400">{sisaToken(row)}</span>
+                        ) : null}
+                      </td>
                       <td className={TD}>
                         {limitId === row.id ? (
                           <div className="flex flex-col gap-1">
@@ -921,7 +950,8 @@ export function ApiKeys({ onError }: Props) {
         ) : null}
         <p className="settings-hint">
           Kunci yang dicabut tetap tercatat untuk jejak audit, tetapi tidak bisa dipakai lagi. Jumlah permintaan dan
-          waktu pakai terakhir diisi server setiap kali kunci dipakai.
+          waktu pakai terakhir diisi server setiap kali kunci dipakai. Kolom token run berjalan menunjukkan token
+          yang sudah dipegang run yang belum selesai, jadi angka itu ikut mengurangi batas token harian.
         </p>
       </div>
 

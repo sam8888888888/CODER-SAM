@@ -193,6 +193,36 @@ try {
   check("halaman riwayat webhook menjelaskan aturan urutan pengiriman",
     /urutan|webhook|kirim ulang/i.test(webhookText), webhookText.slice(0, 200));
 
+  // ----- 3b) Halaman Kunci API (butir 41 + butir 24): kolom IP terakhir dan token run berjalan.
+  // Kunci uji dibuat lewat API DI DALAM halaman, supaya sesi peramban yang dipakai. Kunci itu lalu
+  // dipakai sekali ke endpoint publik supaya server mencatat IP-nya. Inilah yang dulu tidak pernah
+  // muncul di tabel, karena antarmuka membaca nama bidang `lastUsedIp` yang tidak pernah dikirim server.
+  const kunciUji = await page.evaluate(async () => {
+    const buat = await fetch("/api/v1/api-keys", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Uji kolom kunci " + Date.now() }),
+    });
+    const data = await buat.json().catch(() => ({}));
+    if (!data.secret) return { buat: buat.status, pakai: 0, ip: "" };
+    const pakai = await fetch("/api/v1/public/v1/me", { headers: { authorization: `Bearer ${data.secret}` } });
+    const daftar = await (await fetch("/api/v1/api-keys")).json().catch(() => ({ keys: [] }));
+    const ip = (daftar.keys || []).map((row) => row.lastIp).filter((nilai) => typeof nilai === "string" && nilai)[0] || "";
+    return { buat: buat.status, pakai: pakai.status, ip };
+  });
+  check("kunci API uji dibuat dan dipakai sekali lewat API",
+    kunciUji.buat === 201 && kunciUji.pakai === 200,
+    JSON.stringify({ buat: kunciUji.buat, pakai: kunciUji.pakai }));
+  check("server mencatat IP pemakaian kunci", String(kunciUji.ip).length > 0, String(kunciUji.ip));
+  await openPage("Kunci API");
+  // Tabel hanya muncul sesudah jawaban daftar kunci tiba, jadi barisnya ditunggu lebih dulu.
+  await page.waitForSelector("main.main table tbody tr", { timeout: 15000 }).catch(() => {});
+  const kunciText = (await page.locator("main.main").innerText()).replace(/\n+/g, " | ");
+  check("halaman Kunci API menampilkan IP terakhir yang dicatat server",
+    Boolean(kunciUji.ip) && kunciText.includes(kunciUji.ip), kunciText.slice(0, 240));
+  check("halaman Kunci API menampilkan kolom token run berjalan",
+    /token run berjalan/i.test(kunciText), kunciText.slice(0, 240));
+
   const adminCalls = apiCalls.filter((line) => line.startsWith("403"));
   check("tidak ada halaman yang ditolak server karena peran (akun uji adalah admin platform)",
     adminCalls.length === 0, adminCalls.join(" | "));

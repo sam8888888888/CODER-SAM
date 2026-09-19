@@ -142,9 +142,12 @@ export type PublicApiDocs = { product: string; baseUrl: string; version: string 
   errors: { code: string; meaning: string }[]; page: string };
 
 // --- Wave 4: platform terbuka, notifikasi email dan kepatuhan data -----------
-export type ApiKeyRow = { id: string; name: string; prefix: string; scopes: string; workspaceId: string; createdAt: string; lastUsedAt: string | null; lastUsedIp?: string | null; requestCount: number; revokedAt: string | null;
+export type ApiKeyRow = { id: string; name: string; prefix: string; scopes: string; workspaceId: string; createdAt: string; lastUsedAt: string | null; lastIp?: string | null; requestCount: number; revokedAt: string | null;
   /** Wave 6: batas harian per kunci dan pemakaian hari ini. 0 berarti tanpa batas khusus. */
-  dailyRequestLimit?: number; dailyTokenLimit?: number; requestsToday?: number; tokensToday?: number };
+  dailyRequestLimit?: number; dailyTokenLimit?: number; requestsToday?: number; tokensToday?: number;
+  /** Wave 10 (butir 24): token yang sudah dipegang run yang masih berjalan, plus daftar run-nya. */
+  tokensReserved?: number; inFlight?: Array<{ runId: string; tokens: number; status: string; createdAt: string }>;
+  quota?: { requestLimit: number; requestsUsed: number; tokenLimit: number; tokensUsed: number; tokensReserved: number; tokensRemaining: number | null; requestsRemaining: number | null } };
 export type PublicEndpoint = { method: string; path: string; scope: string; description: string; available?: boolean };
 export type ApiKeyDocs = { prefix: string; scopes: string[]; phase: string; rateLimitPerMinute: number; endpoints: PublicEndpoint[]; plannedEndpoints?: PublicEndpoint[]; example: { curl: string; note: string } };
 export type NotificationPrefs = { userId: string; emailQuota: number; emailRuns: number; emailBilling: number; emailTeam: number; emailSecurity: number; updatedAt: string };
