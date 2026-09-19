@@ -15,6 +15,7 @@
  */
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
+import { createServer } from "node:net";
 import { existsSync, mkdirSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 
@@ -29,7 +30,23 @@ if (!existsSync(`${distDir}/index.html`)) {
 }
 mkdirSync(shots, { recursive: true });
 
-const port = 7290 + Math.floor(Math.random() * 9);
+// Port dipilih dengan mencoba mengikatnya lebih dahulu. Sebelumnya port acak tetap bisa bertabrakan
+// dengan server uji lain yang tertinggal; peramban lalu bicara ke server LAIN dan pemeriksaan admin
+// gagal tanpa sebab yang jelas (gejala nyata 18 Sep 2026).
+async function freePort() {
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    const candidate = 7300 + Math.floor(Math.random() * 200);
+    const free = await new Promise((resolve) => {
+      const probe = createServer();
+      probe.once("error", () => resolve(false));
+      probe.once("listening", () => probe.close(() => resolve(true)));
+      probe.listen(candidate, "127.0.0.1");
+    });
+    if (free) return candidate;
+  }
+  throw new Error("tidak ada port bebas untuk server uji");
+}
+const port = await freePort();
 const dataDir = `/tmp/coder-ui-wave10-${Date.now()}`;
 const stamp = Date.now();
 const adminEmail = `w10ui-admin-${stamp}@example.test`;
@@ -74,6 +91,11 @@ async function waitForHealth() {
 }
 
 const healthy = await waitForHealth();
+// Server uji wajib benar-benar proses ini: bila prosesnya mati (misalnya port dipakai proses lain),
+// pemeriksaan di bawah tidak boleh berjalan dan menyalahkan antarmuka.
+const childAlive = child.exitCode === null && !child.killed;
+check("server uji yang menjawab adalah proses yang baru dijalankan", healthy && childAlive,
+  `exit=${child.exitCode} port=${port} log=${serverLog.join("").slice(-200)}`);
 check("server uji hidup dan menyajikan SPA hasil build", healthy, serverLog.join("").slice(-400));
 if (!healthy) { child.kill("SIGKILL"); console.log("UI_E2E_FAILED"); process.exit(1); }
 
