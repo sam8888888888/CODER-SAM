@@ -595,7 +595,7 @@ console.log(`INFO wave9 markup=${aiPricing?.markup} cost30=${cost30} billed30=${
 // Pencarian global, perangkat, notifikasi peramban, metrik, pembersihan, dan kuota berjalan.
 const lockSearchStatus = await call("GET", "/api/v1/search/status");
 check("wave10 the message index reports its own state", lockSearchStatus.status === 200
-  && Number.isFinite(Number(lockSearchStatus.json?.messages)) && Number.isFinite(Number(lockSearchStatus.json?.indexedMessages)),
+  && Number.isFinite(Number(lockSearchStatus.json?.index?.messages)) && Number.isFinite(Number(lockSearchStatus.json?.index?.indexedMessages)),
   JSON.stringify(lockSearchStatus.json));
 const lockSearch = await call("GET", `/api/v1/search?q=${encodeURIComponent("coblai")}`);
 check("wave10 global search spans projects, conversations, messages, artifacts, knowledge and workflows",
@@ -623,15 +623,19 @@ check("wave10 the browser push settings publish a usable public key",
   lockPush.status === 200 && typeof lockPush.json?.publicKey === "string" && String(lockPush.json.publicKey).length > 80
   && Array.isArray(lockPush.json?.subscriptions) && Number(lockPush.json?.max) >= 1,
   JSON.stringify({ len: String(lockPush.json?.publicKey ?? "").length, max: lockPush.json?.max, subs: lockPush.json?.subscriptions?.length }));
-check("wave10 the private push key is never part of the answer", !/private|vapidPrivate/i.test(lockPush.text), lockPush.text.slice(0, 160));
+check("wave10 the private push key is never part of the answer", !/private|vapidPrivate/i.test(JSON.stringify(lockPush.json ?? {})), JSON.stringify(lockPush.json)?.slice(0, 160));
 const lockPushBad = await call("POST", "/api/v1/account/push/subscribe", { endpoint: "http://bukan-https.example.test", keys: { p256dh: "x", auth: "y" } });
 check("wave10 a push subscription without https is refused", lockPushBad.status === 400 && typeof lockPushBad.json?.error === "string", JSON.stringify(lockPushBad.json));
 
 const lockKeys = await call("GET", "/api/v1/api-keys");
 const lockKeyRows = Array.isArray(lockKeys.json?.keys) ? lockKeys.json.keys : [];
+// Bentuk jawaban nyata (diperiksa terhadap produksi 18 Sep 2026): rute ini mengembalikan
+// { keys, note, limits, scopesAvailable }. Cadangan token ada DI DALAM setiap kunci
+// (tokensReserved + quota.tokensReserved + inFlight[]), sedangkan total platform dilaporkan
+// oleh /api/v1/status-hub (housekeeping.reservedTokensWaiting, diperiksa di blok hub10).
 check("wave10 the api key list shows the reserved tokens of runs that are still going on",
-  lockKeys.status === 200 && Number.isFinite(Number(lockKeys.json?.reservedTokens))
-  && lockKeyRows.every((k) => Number.isFinite(Number(k?.tokensReserved)) && k?.inFlight !== undefined && k?.quota !== undefined),
+  lockKeys.status === 200 && lockKeyRows.length > 0
+  && lockKeyRows.every((k) => Number.isFinite(Number(k?.tokensReserved)) && Number.isFinite(Number(k?.quota?.tokensReserved)) && Array.isArray(k?.inFlight)),
   JSON.stringify(lockKeys.json)?.slice(0, 260));
 
 const lockMetrics = await call("GET", "/api/v1/metrics");
@@ -666,7 +670,7 @@ check("wave10 the status hub says how long the clean up keeps webhook history",
   Number(hub10.json?.housekeeping?.webhookDays) >= 1 && typeof hub10.json?.housekeeping?.retentionDryRun === "boolean"
   && typeof hub10.json?.housekeeping?.smokeCleanup === "boolean",
   JSON.stringify(hub10.json?.housekeeping));
-console.log(`INFO wave10 searchIndexed=${hub10.json?.search?.indexedMessages}/${hub10.json?.search?.messages} pushConfigured=${hub10.json?.push?.configured} pushSubs=${hub10.json?.push?.activeSubscriptions} devices=${hub10.json?.devices?.total} verifyMode=${hub10.json?.devices?.mode} reservedTokens=${hub10.json?.housekeeping?.reservedTokensWaiting} growthSources=${JSON.stringify(hub10.json?.openPlatform?.growthSources)}`);
+console.log(`INFO wave10 searchIndexed=${hub10.json?.search?.indexedMessages}/${hub10.json?.search?.messages} pushConfigured=${hub10.json?.push?.configured} pushSubs=${hub10.json?.push?.activeSubscriptions} devices=${hub10.json?.devices?.devices} verifyMode=${hub10.json?.devices?.mode} reservedTokens=${hub10.json?.housekeeping?.reservedTokensWaiting} growthSources=${JSON.stringify(hub10.json?.openPlatform?.growthSources)}`);
 
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

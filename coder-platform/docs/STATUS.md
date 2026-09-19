@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 18 Sep 2026 (versi 0.20.0 SELESAI dikerjakan dan paketnya siap — gerbang tipe uji, uji UI peramban, webhook berurutan, kuota run berjalan, backfill pertumbuhan, perangkat & sesi, pencarian global, push peramban, penyelarasan `.env`. PENTING: yang LIVE di server masih 0.19.0; deploy v0.20.0 dan smoke produksinya belum dijalankan)
+Terakhir diperbarui: 19 Sep 2026 (versi **0.20.0 LIVE** di server Austria sejak 18 Sep 2026 11:25 UTC — gerbang tipe uji, uji UI peramban, webhook berurutan, kuota run berjalan, backfill pertumbuhan, perangkat & sesi, pencarian global, push peramban, penyelarasan `.env`. Deploy dan smoke produksi sudah dijalankan: **smoke 199 lulus, 0 gagal**. Rinciannya di bagian "Deploy & operasi produksi v0.20.0".)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -16,8 +16,8 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
 
 Wave 10 (v0.20.0, 18 Sep 2026) — jawaban butir 21–32D, semuanya di kode dan diuji.
-Catatan jujur: **belum di-deploy**. Yang LIVE di server masih 0.19.0; deploy + smoke produksi
-menunggu izin Bapak.
+Status: **LIVE di server Austria** sejak 18 Sep 2026 11:25 UTC. Deploy dan smoke produksi sudah
+dijalankan atas izin Bapak; bukti lengkapnya di bagian "Deploy & operasi produksi v0.20.0 (18 Sep 2026)".
 
 - **Gerbang tipe untuk berkas uji (butir 21)**: `tsconfig.test.json` di akar `coder-platform` memuat
   `apps/api/test/**/*.ts`; `apps/api/test/run-all.cjs` menjalankannya dengan `npx tsc -p
@@ -42,8 +42,11 @@ menunggu izin Bapak.
   "Kirim ulang" di halaman Webhook; pembersihan riwayat lewat retensi (`RETENTION_WEBHOOK_DAYS`, bawaan
   30) plus tombol bersihkan-sekarang dengan mode kering.
 - **Kuota token termasuk run yang sedang berjalan (butir 24)**: `runs.reserved_tokens` diisi saat run
-  dari kunci API dimulai; `apiKeyUsageToday()` = token selesai + token cadangan run `queued`/`running`;
-  API dan UI menampilkan `inFlightTokens`/`tokensReserved`.
+  dari kunci API dimulai; `apiKeyUsageToday()` = token selesai + token cadangan run `queued`/`running`.
+  API menampilkan cadangan itu: setiap kunci membawa `tokensReserved`, `quota.tokensReserved`, dan
+  `inFlight[]`, sedangkan totalnya di `GET /api/v1/status-hub` (`housekeeping.reservedTokensWaiting`).
+  **Catatan jujur: dashboard belum menampilkan angka ini di halaman Kunci API** (butir 41 di
+  `docs/DAFTAR_MASALAH_TERTUNDA.md`).
 - **Backfill peristiwa pertumbuhan (butir 25 + 32c)**: `backfillGrowthEvents()` merekonstruksi peristiwa
   dari tabel nyata (`users`, `projects`, `conversations`, `runs`, `run_usage`, `api_keys`, `webhooks`,
   `orders`, `referrals`) memakai `created_at` asli, menandai baris `source='backfill'`, idempoten, punya
@@ -182,6 +185,41 @@ mengulang pekerjaan, dan memaksa satu putaran; 8 rute Wave 6 untuk dua rute tuli
 11 rute Wave 7 untuk undangan, langkah awal, peringatan kuota, laporan pertumbuhan, panel undangan admin,
 dokumentasi publik, robot, dan sitemap).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
+
+## Deploy & operasi produksi v0.20.0 (18 Sep 2026)
+
+- **Versi LIVE: `0.20.0`** — `coder-platform-app:0.20.0` (sehat, `/ready` menjawab
+  `{"status":"ready","database":"ok","engine":{"available":true}}`) dan `coder-platform-worker:0.20.0`
+  (antrean di proses sendiri; lognya `WORKER_ONLY=true` + `proses antrean siap`). Dijalankan
+  `bash deploy/deploy-austria.sh 0.20.0` → `DEPLOY_OK coder-platform-app:0.20.0`, skrip keluar 0.
+- **Paket**: `deploy/coder-sam-university-v0.20.0.tar.gz` (204 entri, 840.025 byte), SHA-256
+  `e787c7d57488e393f2c869a7f3ddeaf8eaa3bfe40642c2d1f8adc1ae2e4b04da`, diperiksa di server sebelum
+  ekstraksi (`coder-sam-university-v0.20.0.tar.gz: OK`).
+- **Celah skrip deploy yang baru tertangkap deploy ini**: `scp` ke direktori rilis yang belum ada
+  gagal (`dest open ... Failure`, tampil sebagai `scp: Connection closed`). `deploy-austria.sh`
+  sekarang membuat direktori rilis lebih dulu (`ssh "${SSH_TARGET}" "mkdir -p '${REMOTE_DIR}'"`).
+  Catatan lingkungan kerja: di kontainer ini `ssh coder` hanya bekerja bila `/workspace/.ssh/config`
+  ada sebagai `~/.ssh/config` (alias `coder` → user `dinda`, kunci `/workspace/.ssh/dinda_austria`).
+- **Penyelarasan `.env` (butir 32) benar-benar jalan di produksi**: mode `--check` lalu mode tulis,
+  `ENV_ADDED 20` kunci baru bernilai bawaan (perangkat, push, pencarian, retensi riwayat webhook,
+  pembersihan data smoke, batas laju), cadangan `/home/dinda/coder-app/.env.bak.1`.
+  `ENV_OBSOLETE_KEYS PLATFORM_WEBHOOK_URL` (memang tidak dibaca kode mana pun) dan
+  `ENV_UNKNOWN_KEYS DEEPSEEK_API_KEY` (kunci sah untuk mesin agen, tetapi belum masuk
+  `deploy/env.keys.txt` karena hanya dibaca di luar `apps/api/src`).
+- **Gerbang migrasi lulus** atas cadangan produksi terbaru `/app/backups/coder-2026-09-18T01-17-01.997Z.db`:
+  `SCHEMA_VERSION_AFTER_MIGRATION 18 EXPECTED 18`, `ROW_COUNTS_PRESERVED true`, `MIGRATION_REHEARSAL_OK`.
+- **Nol henti (butir 16)**: `ZERO_DOWNTIME_START hijau di 3403` → siap → nginx diarahkan ke 3403 →
+  biru dibuat ulang → nginx kembali ke 3402 → `ZERO_DOWNTIME_DONE hijau dihentikan, biru melayani 3402`.
+  Antrean (butir 17) dibuat ulang dan berjalan dari citra yang sama.
+- **Smoke produksi: 199 lulus, 0 gagal** (`PRODUCTION_SMOKE_PASSED`, skrip keluar 0), termasuk 23
+  pemeriksaan Wave 10 yang baru. Dua cacat pada skrip smoke sendiri baru terlihat saat dijalankan ke
+  produksi dan sudah diperbaiki: (1) `GET /api/v1/search/status` mengembalikan `{index:{...}}`, bukan
+  `messages`/`indexedMessages` di akar; (2) `lockPush.text` tidak ada pada nilai balikan `call()`
+  (bentuknya `{status, json}`) sehingga skrip berhenti `TypeError` di tengah jalan. Pemeriksaan butir 24
+  juga diselaraskan dengan bentuk jawaban nyata: cadangan token ada **per kunci**, totalnya di
+  `/api/v1/status-hub`.
+- **Yang belum diuji**: jalur push peramban dari peramban sungguhan dengan langganan nyata
+  (`pushSubs=0` di produksi) dan antrean pada beban tinggi. Keduanya di luar smoke ini.
 
 ## Deploy & operasi produksi v0.19.0 (16 Sep 2026)
 

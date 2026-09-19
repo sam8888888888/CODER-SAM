@@ -40,6 +40,10 @@ if [[ ! -f "deploy/${PACKAGE}" ]]; then
 fi
 ( cd deploy && sha256sum "${PACKAGE}" > "${PACKAGE}.sha256" )
 
+# Direktori rilis harus ada sebelum scp: scp menolak tujuan yang belum ada ("dest open ...
+# Failure"). Versi 0.20.0 adalah deploy pertama yang menemukan celah ini karena sebelumnya
+# direktori rilis dibuat manual.
+ssh "${SSH_TARGET}" "mkdir -p '${REMOTE_DIR}'"
 scp -q "deploy/${PACKAGE}" "deploy/${PACKAGE}.sha256" "${SSH_TARGET}:${REMOTE_DIR}/"
 
 ssh "${SSH_TARGET}" bash -s <<REMOTE

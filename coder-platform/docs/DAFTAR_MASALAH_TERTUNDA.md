@@ -3,7 +3,7 @@
 Dikumpulkan atas perintah Bapak: "SEMUA MASALAH DAN YANG BELUM BERES, DIKUMPULKAN,
 NANTI TERAKHIR KITA BERESKAN SATU PER SATU."
 
-Versi platform saat daftar ini diperbarui: **v0.20.0 (Wave 10 — gerbang tipe uji, uji UI peramban, webhook berurutan, kuota run berjalan, backfill pertumbuhan, perangkat & sesi, pencarian global, push peramban, penyelarasan `.env`)**. Paketnya sudah dibuat 18 Sep 2026; deploy ke server + smoke produksi belum dijalankan.
+Versi platform saat daftar ini diperbarui: **v0.20.0 (Wave 10 — gerbang tipe uji, uji UI peramban, webhook berurutan, kuota run berjalan, backfill pertumbuhan, perangkat & sesi, pencarian global, push peramban, penyelarasan `.env`)**. **Deploy 18 Sep 2026 sudah dijalankan dan LIVE di server Austria; smoke produksi 199 lulus, 0 gagal.** Rincian bukti: `docs/STATUS.md` bagian "Deploy & operasi produksi v0.20.0".
 Legenda status: [BAPAK] butuh keputusan/izin Bapak · [TEKNIS] pekerjaan teknis yang bisa saya kerjakan ·
 [FITUR] fitur yang belum ada · [RISIKO] temuan yang berpotensi berbahaya.
 
@@ -118,8 +118,12 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
     retensi (`RETENTION_WEBHOOK_DAYS`, bawaan 30) plus tombol bersihkan-sekarang dengan mode kering.
     Terbukti `webhook-order.e2e.ts` 64/64.
 24. [SELESAI] `runs.reserved_tokens` diisi saat run dari kunci API dimulai, dan `apiKeyUsageToday()`
-    menghitung token run `queued`/`running`; API serta UI menampilkan `inFlightTokens`. Terbukti
-    `wave10.e2e.ts` 137/137 dan `apikey-inflight.e2e.ts` 53/53.
+    menghitung token run `queued`/`running`. API menampilkan cadangan itu: setiap kunci pada
+    `GET /api/v1/api-keys` membawa `tokensReserved`, `quota.tokensReserved`, dan `inFlight[]`; totalnya
+    di `GET /api/v1/status-hub` (`housekeeping.reservedTokensWaiting`). Terbukti `wave10.e2e.ts`
+    137/137, `apikey-inflight.e2e.ts` 53/53, dan smoke produksi 18 Sep 2026.
+    Catatan jujur: klaim lama "UI menampilkan `inFlightTokens`" tidak terbukti — dashboard belum
+    menampilkan angka ini di halaman Kunci API (masuk butir 41).
 25. [SELESAI] `backfillGrowthEvents()` mengisi ulang `growth_events` dari tabel asli (`created_at`
     asli, `source='backfill'`), idempoten, punya mode kering dan mode terapkan, dan bisa dipicu admin
     (`GET`/`POST /api/v1/admin/growth/backfill`). Terbukti `growth-backfill.e2e.ts` 70/70.
@@ -171,6 +175,11 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
     privat belum diblokir; metadata `169.254.169.254` dan localhost sudah diblokir.
 40. [RISIKO] Disk server kerja sering penuh (pernah 99%) -> suite uji bisa gagal `SQLITE_FULL`.
     Perlu pembersihan berkala direktori uji di `/tmp`.
+41. [TEKNIS] Halaman "Kunci API" di dashboard membaca `row.lastUsedIp`, sedangkan
+    `GET /api/v1/api-keys` mengirim `lastIp`. Akibatnya kolom "IP terakhir" selalu kosong sejak Wave 4
+    (v0.14.1). Sekaligus: dashboard belum menampilkan cadangan token run berjalan (butir 24) —
+    `tokensReserved`/`inFlight` hanya ada di jawaban API. Perbaikan = satu baris di
+    `coder-dashboard/src/ApiKeys.tsx` + satu kolom baru, lalu build dan deploy ulang dashboard.
 
 ---
 
