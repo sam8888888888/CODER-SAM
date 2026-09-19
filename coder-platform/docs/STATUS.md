@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 19 Sep 2026 (versi **0.20.0 LIVE** di server Austria sejak 18 Sep 2026 11:25 UTC — gerbang tipe uji, uji UI peramban, webhook berurutan, kuota run berjalan, backfill pertumbuhan, perangkat & sesi, pencarian global, push peramban, penyelarasan `.env`. Deploy dan smoke produksi sudah dijalankan: **smoke 199 lulus, 0 gagal**. Rinciannya di bagian "Deploy & operasi produksi v0.20.0".)
+Terakhir diperbarui: 19 Sep 2026 (versi **0.20.1 LIVE** di server Austria sejak 19 Sep 2026 12:38 UTC — isi v0.20.0 plus perbaikan dashboard butir 41. Deploy dan smoke produksi sudah dijalankan: **smoke 199 lulus, 0 gagal**; uji UI peramban **33/33 lulus**. Rinciannya di bagian "Deploy & operasi produksi v0.20.1".)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -185,6 +185,40 @@ mengulang pekerjaan, dan memaksa satu putaran; 8 rute Wave 6 untuk dua rute tuli
 11 rute Wave 7 untuk undangan, langkah awal, peringatan kuota, laporan pertumbuhan, panel undangan admin,
 dokumentasi publik, robot, dan sitemap).
 Bila angka di kode berbeda, jalankan ulang Cara verifikasi.
+
+## Deploy & operasi produksi v0.20.1 (19 Sep 2026)
+
+Isi rilis ini hanya perbaikan dashboard butir 41 (cepat, tanpa perubahan API).
+
+- **Versi LIVE: `0.20.1`** (`coder-platform-app:0.20.1` sehat + worker `0.20.1`).
+  `bash deploy/deploy-austria.sh 0.20.1` → `DEPLOY_OK coder-platform-app:0.20.1`, skrip keluar 0.
+- **Paket**: `deploy/coder-sam-university-v0.20.1.tar.gz` (204 entri, 824K), SHA-256
+  `a10d965b092a7a9376557180a84bbeaf123fb617e3b2fefdf2cefea7d44f573d`, diperiksa di server (`OK`).
+  Paket dibangun dari commit `0301779`; commit dokumen sesudahnya tidak masuk paket, jadi berkasnya
+  sengaja TIDAK dibangun ulang supaya checksum yang diverifikasi server tetap sah.
+- **Gerbang deploy**: `ENV_MISSING_COUNT 0` dan `ENV_ADDED 0` (berkas `.env` produksi sudah selaras,
+  jadi tidak ada cadangan baru), `ENV_OBSOLETE_KEYS PLATFORM_WEBHOOK_URL`,
+  `ENV_UNKNOWN_KEYS DEEPSEEK_API_KEY`; rehearsal migrasi atas
+  `/app/backups/coder-2026-09-19T01-17-01.581Z.db` → `SCHEMA_VERSION_AFTER_MIGRATION 18 EXPECTED 18`,
+  `ROW_COUNTS_PRESERVED true`; nol henti (`ZERO_DOWNTIME_START hijau di 3403` →
+  `ZERO_DOWNTIME_DONE hijau dihentikan, biru melayani 3402`); antrean dibuat ulang
+  (`WORKER_ONLY=true`, denyut 30 detik).
+- **Dashboard dibangun di server** dari sumber (`npm ci` + `npm run build` di `src/coder-dashboard`),
+  dan bundelnya identik dengan hasil build lokal: `dist/assets/index-DHZFfOSk.js`. Artinya hasil uji
+  UI lokal memang bundel yang melayani pengunjung.
+- **Smoke produksi: 199 lulus, 0 gagal** (`PRODUCTION_SMOKE_PASSED`, skrip keluar 0). Label INFO
+  perangkat sekarang benar: `devices=3` (sebelumnya `devices=undefined`).
+- **Uji UI peramban: 33/33 lulus** (`UI_E2E_PASSED`, 0 gagal, 0 lewat) — 5 pemeriksaan baru, yaitu
+  halaman Kunci API dibuka di Chromium sungguhan, kunci uji dibuat lewat API di dalam halaman dan
+  dipakai sekali ke endpoint publik, lalu dipastikan **IP yang dicatat server muncul di tabel**
+  (inti butir 41) dan **kolom token run berjalan benar-benar dirender** (butir 24).
+- **Catatan lingkungan uji (jujur)**: cadangan peramban Playwright di kontainer ini hilang, dan paket
+  Debian yang dibutuhkan Chromium belum terpasang. Uji UI baru bisa dijalankan setelah
+  `chromium-headless-shell` diunduh ulang (±101 MB lewat 6 koneksi paralel) dan
+  `libglib2.0-0 libnss3 libasound2` dll. dipasang dengan apt. Ini murni kebutuhan alat uji lokal,
+  tidak menyentuh server produksi.
+- **Yang tetap belum diuji**: langganan push peramban sungguhan (produksi `pushSubs=0`) dan antrean
+  pada beban tinggi.
 
 ## Deploy & operasi produksi v0.20.0 (18 Sep 2026)
 

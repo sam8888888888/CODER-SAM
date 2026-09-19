@@ -3,7 +3,7 @@
 Dikumpulkan atas perintah Bapak: "SEMUA MASALAH DAN YANG BELUM BERES, DIKUMPULKAN,
 NANTI TERAKHIR KITA BERESKAN SATU PER SATU."
 
-Versi platform saat daftar ini diperbarui: **v0.20.0 (Wave 10 — gerbang tipe uji, uji UI peramban, webhook berurutan, kuota run berjalan, backfill pertumbuhan, perangkat & sesi, pencarian global, push peramban, penyelarasan `.env`)**. **Deploy 18 Sep 2026 sudah dijalankan dan LIVE di server Austria; smoke produksi 199 lulus, 0 gagal.** Rincian bukti: `docs/STATUS.md` bagian "Deploy & operasi produksi v0.20.0".
+Versi platform saat daftar ini diperbarui: **v0.20.1 (Wave 10 penuh + perbaikan dashboard butir 41)**. **LIVE di server Austria sejak 19 Sep 2026 12:38 UTC; smoke produksi 199 lulus, 0 gagal; uji UI peramban 33/33 lulus.** Rincian bukti: `docs/STATUS.md` bagian "Deploy & operasi produksi v0.20.1".
 Legenda status: [BAPAK] butuh keputusan/izin Bapak · [TEKNIS] pekerjaan teknis yang bisa saya kerjakan ·
 [FITUR] fitur yang belum ada · [RISIKO] temuan yang berpotensi berbahaya.
 
@@ -175,11 +175,12 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
     privat belum diblokir; metadata `169.254.169.254` dan localhost sudah diblokir.
 40. [RISIKO] Disk server kerja sering penuh (pernah 99%) -> suite uji bisa gagal `SQLITE_FULL`.
     Perlu pembersihan berkala direktori uji di `/tmp`.
-41. [TEKNIS] Halaman "Kunci API" di dashboard membaca `row.lastUsedIp`, sedangkan
-    `GET /api/v1/api-keys` mengirim `lastIp`. Akibatnya kolom "IP terakhir" selalu kosong sejak Wave 4
-    (v0.14.1). Sekaligus: dashboard belum menampilkan cadangan token run berjalan (butir 24) —
-    `tokensReserved`/`inFlight` hanya ada di jawaban API. Perbaikan = satu baris di
-    `coder-dashboard/src/ApiKeys.tsx` + satu kolom baru, lalu build dan deploy ulang dashboard.
+41. [SELESAI] Halaman "Kunci API" dulu membaca `row.lastUsedIp`, padahal `GET /api/v1/api-keys`
+    mengirim `lastIp`; kolom "IP terakhir" kosong sejak Wave 4 (v0.14.1). Sekarang dibaca `lastIp`,
+    dan tabel mendapat kolom baru "Token run berjalan" (`tokensReserved`, jumlah run berjalan, sisa
+    kuota token hari ini) untuk melengkapi butir 24. Bukti: uji UI peramban 33/33 `UI_E2E_PASSED`
+    (termasuk "halaman Kunci API menampilkan IP terakhir yang dicatat server"), produksi LIVE
+    `0.20.1`, smoke produksi 199 lulus / 0 gagal, dan bundel LIVE memuat label kolom barunya.
 
 ---
 
