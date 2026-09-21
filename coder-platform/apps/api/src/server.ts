@@ -6,7 +6,8 @@ import { extname, join, normalize, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { config } from "./config.js";
-import { backfillSellCosts, catalogPriceFor, clearPriceOverride, priceView, pricingSettings, pricingTable, quoteCosts, savePriceOverride, sellForBaseMicros, setPricingMarkup, validatePrice } from "./pricing.js";
+import { backfillSellCosts, catalogPriceFor, clearPriceOverride, priceView, pricingSettings, pricingTable, quoteCosts, reconcileUsage, savePriceOverride, sellForBaseMicros, setPricingMarkup, validatePrice } from "./pricing.js";
+import { vendorPriceCatalogue } from "./vendor-prices.js";
 import { buildKnowledgeContext, contentChecksum, deleteDocument, indexDocument, searchChunks } from "./knowledge.js";
 import { extractText } from "./text-extract.js";
 import { generateTotpSecret, otpAuthUrl, verifyTotp } from "./totp.js";
@@ -17,7 +18,7 @@ import { engine } from "./engine.js";
 import { createExecution, recordAudit, runExecution, scheduleNextRun } from "./workflow-engine.js";
 import { allowLoginAttempt, clearSessionCookie, createSession, deleteSession, deviceIdForSession, getSessionUser, hashPassword, requireUser, setSessionCookie, verifyPassword, type AuthRequest } from "./auth.js";
 import { checkRequestOrigin, constantTimeEquals, csrfCookieOptions, generateCsrfToken } from "./csrf.js";
-import { limiterFor, rateLimitStorage } from "./ratelimit.js";
+import { limiterFor, rateLimitStorage, sweepRateLimitHits } from "./ratelimit.js";
 import {
   API_KEY_PREFIX, MAX_API_KEYS_PER_USER, PUBLIC_API_ENDPOINTS, PUBLIC_API_LIMITS, apiKeyInFlight, apiKeyQuotaSnapshot,
   apiKeyReservedTokens, apiKeyTokensToday, authenticateApiKey,
@@ -3005,7 +3006,10 @@ app.get("/api/v1/status-hub", { preHandler: requireUser }, async (request: any) 
     aiPricing: (() => {
       const settings = pricingSettings();
       const table = pricingTable({ days: 30, limit: 1, only: "used" });
-      return { markup: settings.markup, currency: settings.currency, updatedAt: settings.updatedAt, overrideCount: table.overrideCount, catalogSize: table.catalogSize, costMicros30d: table.totals.baseMicros, billedMicros30d: table.totals.sellMicros, marginMicros30d: table.totals.marginMicros };
+      // Butir 19: jumlah harga resmi vendor yang menimpa katalog mesin, supaya bisa diperiksa dari luar.
+      const vendor = vendorPriceCatalogue();
+      const reconciled = reconcileUsage(30, 5);
+      return { reconciliation: reconciled.totals, reconciliationRows: reconciled.rows, markup: settings.markup, currency: settings.currency, updatedAt: settings.updatedAt, overrideCount: table.overrideCount, catalogSize: table.catalogSize, costMicros30d: table.totals.baseMicros, billedMicros30d: table.totals.sellMicros, marginMicros30d: table.totals.marginMicros, vendorPrices: vendor.length, vendorCheckedAt: vendor[0]?.price.checkedAt ?? null, vendorModels: vendor.map((row) => row.model) };
     })(),
     mail: { configured: mailerConfigured(), from: config.SMTP_FROM, host: config.SMTP_HOST ? `${config.SMTP_HOST}:${config.SMTP_PORT}` : null, secure: config.SMTP_SECURE },
     security: { csrfStrict: config.CSRF_STRICT, sessionCookie: "httpOnly", adminEmails: config.PLATFORM_ADMIN_EMAILS.split(",").map((item) => item.trim()).filter(Boolean).length, metricsEnabled: Boolean(config.METRICS_TOKEN),
@@ -3710,6 +3714,17 @@ app.get("/api/v1/admin/pricing", { preHandler: requireUser }, async (request: an
   };
 });
 
+/**
+ * Butir 19: rekonsiliasi biaya. Membandingkan biaya yang tercatat dengan biaya yang seharusnya
+ * menurut harga yang berlaku sekarang (termasuk tarif puncak vendor per jam). Read-only.
+ */
+app.get("/api/v1/admin/pricing/reconcile", { preHandler: requireUser }, async (request: any, reply) => {
+  if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh melihat rekonsiliasi biaya AI." });
+  const days = Number(request.query?.days ?? 30) || 30;
+  const limit = Number(request.query?.limit ?? 20) || 20;
+  return reconcileUsage(days, limit);
+});
+
 /** Sets the markup factor applied on top of every model price. 1 means selling at cost. */
 app.put<{ Body: { markup?: number | string } }>("/api/v1/admin/pricing/settings", { preHandler: requireUser }, async (request: any, reply) => {
   if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh mengubah markup." });
@@ -4340,6 +4355,16 @@ function registerBackgroundHandlers() {
       smoke: { dryRun: report.dryRun, skipped: report.skipped, projects: report.projects.length, rows: report.rows },
       webhooks: { cutoff: trimmed.cutoff, days: config.RETENTION_WEBHOOK_DAYS, candidates: trimmed.candidates, removed: trimmed.removed, dryRun: trimmed.dryRun },
     };
+  });
+
+  /**
+   * Butir 15b: sapuan tabel `rate_limit_hits` milik pekerja terjadwal. Di produksi
+   * (`JOB_WORKER_IN_WEB=false`) proses web tidak lagi menyapu, sehingga banyak replika web tidak
+   * mengerjakan hal yang sama berulang-ulang. Hasilnya dilaporkan apa adanya supaya bisa diperiksa.
+   */
+  registerJobHandler("ratelimit.sweep", async () => {
+    const swept = sweepRateLimitHits();
+    return { removed: swept.removed, cutoff: new Date(swept.cutoff).toISOString(), sweepInWeb: config.RATE_LIMIT_SWEEP_IN_WEB };
   });
 }
 

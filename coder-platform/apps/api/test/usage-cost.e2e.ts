@@ -5,6 +5,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { estimateCostMicros, priceForModel } from "../src/model-prices.js";
+import { vendorCostMicros } from "../src/vendor-prices.js";
 
 const port = 3444;
 process.env.NODE_ENV = "test";
@@ -41,6 +42,19 @@ check("price table has deepseek-v4-flash", Boolean(price && price.input > 0 && p
 check("cost for 1M input + 1M output tokens matches the price table", estimateCostMicros("deepseek-v4-flash", { inputTokens: 1_000_000, outputTokens: 1_000_000 }) === Math.round(((price?.input ?? 0) + (price?.output ?? 0)) * 1_000_000), String(estimateCostMicros("deepseek-v4-flash", { inputTokens: 1_000_000, outputTokens: 1_000_000 })));
 check("unknown model has no invented price", estimateCostMicros("model-that-does-not-exist", { inputTokens: 10 }) === null, String(estimateCostMicros("model-that-does-not-exist", { inputTokens: 10 })));
 
+// Butir 19: katalog mesin memuat harga DeepSeek yang sudah tidak berlaku (0,14 / 0,28). Yang dipakai
+// untuk membukukan biaya adalah harga resmi vendor: 0,15 / 0,60, dan dua kali lipat di jam puncak.
+const LUAR_PUNCAK = Date.parse("2026-09-22T12:00:00Z"); // Selasa 12:00 UTC
+const PUNCAK = Date.parse("2026-09-22T02:00:00Z"); // Selasa 02:00 UTC
+const satuJuta = { inputTokens: 1_000_000, outputTokens: 1_000_000 };
+const vendorOffPeak = vendorCostMicros("deepseek-v4-flash", satuJuta, LUAR_PUNCAK);
+const vendorPeak = vendorCostMicros("deepseek-v4-flash", satuJuta, PUNCAK);
+check("vendor price table has deepseek-v4-flash", Boolean(vendorOffPeak && vendorOffPeak.price.output === 0.6), JSON.stringify(vendorOffPeak?.price));
+check("vendor cost for 1M in + 1M out off-peak = 750000 micros", vendorOffPeak?.micros === 750_000, String(vendorOffPeak?.micros));
+check("vendor cost doubles during peak hours", vendorPeak?.micros === 1_500_000 && vendorPeak?.peak.peak === true, JSON.stringify(vendorPeak?.peak));
+check("vendor table also knows the official name deepseek-flash", vendorCostMicros("deepseek-flash", satuJuta, LUAR_PUNCAK)?.micros === 750_000, String(vendorCostMicros("deepseek-flash", satuJuta, LUAR_PUNCAK)?.micros));
+check("vendor table stays silent for models it does not know", vendorCostMicros("claude-haiku-4-5", satuJuta, LUAR_PUNCAK) === null, "");
+
 const email = `usage-${randomUUID().slice(0, 8)}@example.com`;
 const registered = await call("POST", "/api/v1/auth/register", { email, password: "Usage12345!", displayName: "Usage Tester" });
 check("registration creates a workspace", registered.status === 201 || registered.status === 200, JSON.stringify(registered.json).slice(0, 160));
@@ -66,8 +80,13 @@ check("engine tokens stored as measured", totals.runs === 1 && totals.estimatedR
 check("input tokens match the engine report", totals.inputTokens === 1_000_000, String(totals.inputTokens));
 check("output tokens match the engine report", totals.outputTokens === 1_000_000, String(totals.outputTokens));
 check("total tokens stored", totals.totalTokens === 2_000_000, String(totals.totalTokens));
-check("cost uses the price table", totals.costMicros === Math.round(((price?.input ?? 0) + (price?.output ?? 0)) * 1_000_000), `${totals.costMicros}`);
-check("cost in US dollars is exposed", typeof totals.costUsd === "number" && Math.abs(totals.costUsd - ((price?.input ?? 0) + (price?.output ?? 0))) < 1e-6, `${totals.costUsd}`);
+// Biaya yang dibukukan memakai harga resmi vendor, bukan harga katalog yang basi. Tarif puncak
+// bergantung jam saat pemakaian dicatat, jadi kedua angka yang sah diterima (750000 atau 1500000);
+// yang penting angka katalog yang basi (420000) TIDAK lagi dipakai.
+const hargaVendorSah = [750_000, 1_500_000];
+const hargaKatalogBasi = Math.round(((price?.input ?? 0) + (price?.output ?? 0)) * 1_000_000);
+check("cost uses the vendor price table, not the stale catalogue price", hargaVendorSah.includes(totals.costMicros) && totals.costMicros !== hargaKatalogBasi, `costMicros=${totals.costMicros} katalogBasi=${hargaKatalogBasi}`);
+check("cost in US dollars is exposed", typeof totals.costUsd === "number" && [0.75, 1.5].some((nilai) => Math.abs(totals.costUsd - nilai) < 1e-6), `${totals.costUsd}`);
 check("no unpriced runs for a priced model", totals.unpricedRuns === 0, String(totals.unpricedRuns));
 check("by model breakdown groups the run", usage.json.byModel.length === 1 && usage.json.byModel[0].model === "deepseek-v4-flash" && usage.json.byModel[0].provider === "deepseek", JSON.stringify(usage.json.byModel));
 check("by model breakdown carries cost", usage.json.byModel[0]?.costUsd === totals.costUsd, JSON.stringify(usage.json.byModel[0]));

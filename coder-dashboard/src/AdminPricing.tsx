@@ -15,7 +15,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { api } from './api';
-import type { PricingModel, PricingTable } from './api';
+import type { CostReconciliation, PricingModel, PricingTable } from './api';
 
 /** Properti halaman: status admin dan pelapor galat dari induk. */
 type Props = {
@@ -77,9 +77,10 @@ const TH = 'border-b border-slate-700 px-3 py-2';
 const TD = 'border-b border-slate-700/60 px-3 py-2';
 /** Kelas dasar lencana sumber harga. */
 const CHIP = 'inline-flex items-center rounded-full border px-2 py-0.5 text-xs';
-/** Warna lencana: harga sendiri=violet, daftar resmi=abu, belum ada harga=kuning. */
+/** Warna lencana: harga sendiri=violet, harga resmi vendor=biru, daftar resmi mesin=abu, belum ada harga=kuning. */
 const SOURCE_CHIP: Record<string, string> = {
   override: 'border-violet-500/40 bg-violet-500/15 text-violet-100',
+  vendor: 'border-sky-500/40 bg-sky-500/15 text-sky-100',
   catalog: 'border-slate-500/40 bg-slate-500/15 text-slate-200',
   none: 'border-amber-500/40 bg-amber-500/15 text-amber-100',
 };
@@ -175,6 +176,7 @@ function pricingErrorMessage(error: unknown): string {
 function sourceLabel(value: unknown): string {
   const code = text(value).toLowerCase();
   if (code === 'override') return 'Harga sendiri';
+  if (code === 'vendor') return 'Harga resmi vendor';
   if (code === 'catalog') return 'Daftar resmi';
   if (code === 'none') return 'Belum ada harga';
   return 'Sumber tidak dikenal';
@@ -190,6 +192,7 @@ function sourceChipClass(value: unknown): string {
 function sourceHint(value: unknown): string {
   const code = text(value).toLowerCase();
   if (code === 'override') return 'Harga ini Anda isi sendiri dan menimpa daftar resmi mesin.';
+  if (code === 'vendor') return 'Harga diambil dari daftar harga resmi vendor (diperiksa berkala, tarif puncak dihitung dua kali).';
   if (code === 'catalog') return 'Harga diambil dari daftar resmi mesin.';
   if (code === 'none') return 'Model ini belum punya harga, sehingga biayanya tidak dihitung.';
   return 'Sumber harga tidak dikenal.';
@@ -218,6 +221,11 @@ export function AdminPricing({ isAdmin, onError }: Props) {
 
   // Pesan sukses aksi terakhir.
   const [notice, setNotice] = useState('');
+
+  // Butir 19: rekonsiliasi biaya tercatat vs harga yang berlaku sekarang.
+  const [recon, setRecon] = useState<CostReconciliation | null>(null);
+  const [reconBusy, setReconBusy] = useState(false);
+  const [reconError, setReconError] = useState('');
 
   // Panel editor harga satu model.
   const [editingModel, setEditingModel] = useState<string | null>(null);
@@ -272,6 +280,26 @@ export function AdminPricing({ isAdmin, onError }: Props) {
     }
     void load();
   }, [isAdmin, load]);
+
+  /**
+   * Periksa selisih biaya: biaya yang tercatat dibandingkan dengan biaya yang seharusnya menurut
+   * harga yang berlaku sekarang. Hanya dijalankan saat tombol ditekan, bukan saat halaman dibuka.
+   */
+  const periksaRekonsiliasi = useCallback(async (): Promise<void> => {
+    setReconBusy(true);
+    setReconError('');
+    try {
+      const data = await api.adminPricingReconcile({ days, limit: 10 });
+      setRecon(data);
+    } catch (error) {
+      setRecon(null);
+      const message = pricingErrorMessage(error);
+      setReconError(message);
+      fail(message);
+    } finally {
+      setReconBusy(false);
+    }
+  }, [days, fail]);
 
   /** Bersihkan dan tutup panel editor harga. */
   function closeEditor(): void {
@@ -781,9 +809,81 @@ export function AdminPricing({ isAdmin, onError }: Props) {
         </div>
       ) : null}
 
+      {/* Butir 19: rekonsiliasi biaya tercatat vs harga yang berlaku sekarang. */}
+      <div className="mt-6 rounded-lg border border-slate-700 bg-slate-800/40 p-3">
+        <h3 className="mb-1 text-sm font-semibold text-slate-100">Rekonsiliasi biaya AI</h3>
+        <p className="mb-2 text-slate-400">
+          Periksa apakah biaya yang tercatat pada pemakaian sudah sesuai dengan harga yang berlaku sekarang. Selisih
+          positif berarti biaya yang tercatat lebih kecil daripada seharusnya (misalnya karena harga resmi vendor naik
+          setelah pemakaian terjadi).
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className={BTN}
+            disabled={reconBusy || !isAdmin}
+            aria-label="Periksa selisih biaya AI"
+            onClick={() => { void periksaRekonsiliasi(); }}
+          >
+            {reconBusy ? 'Memeriksa…' : `Periksa selisih ${days} hari`}
+          </button>
+          {recon ? (
+            <span className="text-xs text-slate-400">
+              Diperiksa {dateTimeText(recon.generatedAt)} · {numberText(recon.totals.runs)} pemakaian ·{' '}
+              tercatat {usdMicros(recon.totals.recordedMicros)} · seharusnya {usdMicros(recon.totals.correctedMicros)} ·
+              selisih {usdMicros(recon.totals.driftMicros)} ({num(recon.totals.driftPercent).toLocaleString('id-ID', { maximumFractionDigits: 1 })}%)
+            </span>
+          ) : null}
+        </div>
+        {reconError ? <p className={'mt-2 ' + ERROR_BOX}>{reconError}</p> : null}
+        {recon && recon.rows.length > 0 ? (
+          <div className="mt-3 overflow-x-auto rounded-lg border border-slate-700">
+            <table className="min-w-full text-left text-sm">
+              <thead className="bg-slate-800/80 text-slate-300">
+                <tr>
+                  <th className={TH}>Model</th>
+                  <th className={TH}>Sumber harga</th>
+                  <th className={TH}>Pemakaian</th>
+                  <th className={TH}>Tercatat</th>
+                  <th className={TH}>Seharusnya</th>
+                  <th className={TH}>Selisih</th>
+                  <th className={TH}>Jam puncak</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recon.rows.map((row) => (
+                  <tr key={row.model}>
+                    <td className={'font-mono ' + TD + ' text-slate-100'}>{row.model}</td>
+                    <td className={TD}>
+                      <span className={sourceChipClass(row.source)} title={sourceHint(row.source)}>
+                        {sourceLabel(row.source)}
+                      </span>
+                    </td>
+                    <td className={TD}>{numberText(row.runs)}</td>
+                    <td className={TD}>{usdMicros(row.recordedMicros)}</td>
+                    <td className={TD}>{usdMicros(row.correctedMicros)}</td>
+                    <td className={TD}>
+                      {usdMicros(row.driftMicros)}
+                      <span className="ml-2 text-xs text-slate-400">{num(row.driftPercent).toLocaleString('id-ID', { maximumFractionDigits: 1 })}%</span>
+                    </td>
+                    <td className={TD}>{numberText(row.peakBuckets)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+        {recon && recon.rows.length === 0 ? (
+          <p className="mt-3 text-xs text-slate-400">Belum ada pemakaian AI pada {recon.days} hari terakhir, jadi tidak ada yang bisa dibandingkan.</p>
+        ) : null}
+        {recon ? <p className="mt-2 text-xs text-slate-400">{recon.note}</p> : null}
+      </div>
+
       <p className="mt-4 text-xs text-slate-400">
         Sumber harga: "Harga sendiri" berarti harga yang Anda isi menimpa daftar resmi mesin. "Daftar resmi" berarti
-        harga bawaan mesin. "Belum ada harga" berarti model belum punya harga, sehingga biayanya tidak dihitung.
+        harga bawaan mesin. "Harga resmi vendor" berarti katalog mesin sudah tidak berlaku dan harga resmi penyedia AI
+        dipakai (tarif puncak dihitung dua kali). "Belum ada harga" berarti model belum punya harga, sehingga biayanya
+        tidak dihitung.
       </p>
     </section>
   );

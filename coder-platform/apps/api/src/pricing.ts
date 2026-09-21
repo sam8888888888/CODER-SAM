@@ -13,9 +13,14 @@
  */
 import { db } from "./db.js";
 import { MODEL_PRICES, priceForModel as catalogPrice, type ModelPrice } from "./model-prices.js";
+import { DEEPSEEK_PEAK_MULTIPLIER, deepSeekPeak, vendorPriceFor, type VendorPrice } from "./vendor-prices.js";
 
 export type PriceNumbers = { input: number; output: number; cacheRead: number; cacheWrite: number };
-export type PriceSource = "catalog" | "override" | "none";
+/**
+ * Dari mana harga pokok diambil: `override` = keputusan pemilik platform, `vendor` = harga resmi
+ * vendor (butir 19, lapisan koreksi `vendor-prices.ts`), `catalog` = katalog mesin, `none` = tidak ada.
+ */
+export type PriceSource = "catalog" | "override" | "vendor" | "none";
 export type PriceView = {
   model: string;
   provider: string | null;
@@ -24,6 +29,11 @@ export type PriceView = {
   sell: PriceNumbers;
   updatedAt: string | null;
   updatedBy: string | null;
+  /**
+   * Butir 19: keterangan harga resmi vendor untuk model ini, supaya halaman harga bisa menunjukkan
+   * asal angkanya. `null` bila model ini tidak punya koreksi vendor.
+   */
+  vendor: { checkedAt: string; source: string; note: string; replacedBy: string | null; peakMultiplier: number } | null;
 };
 export type PricingSettings = { markup: number; currency: string; updatedAt: string | null; updatedBy: string | null };
 
@@ -97,9 +107,16 @@ function overrides(): Map<string, PriceNumbers & { updatedAt: string; updatedBy:
 /** Drops the in-process cache. Called after every write so a second process sees the change quickly. */
 export function reloadPriceCache(): void { overrideCache = null; }
 
+/**
+ * Harga pokok berlapis: keputusan pemilik (`override`) menang, lalu harga resmi vendor
+ * (`vendor-prices.ts`), lalu katalog mesin. Harga vendor dipakai tanpa faktor puncak; faktor puncak
+ * baru diterapkan saat menghitung biaya satu pemakaian (`quoteCosts`), karena tarifnya bergantung jam.
+ */
 function basePriceFor(model: string): { base: PriceNumbers; source: PriceSource } {
   const override = overrides().get(model);
   if (override) return { base: { input: override.input, output: override.output, cacheRead: override.cacheRead, cacheWrite: override.cacheWrite }, source: "override" };
+  const vendor: VendorPrice | null = vendorPriceFor(model);
+  if (vendor) return { base: { input: vendor.input, output: vendor.output, cacheRead: vendor.cacheRead, cacheWrite: vendor.cacheWrite }, source: "vendor" };
   const catalog: ModelPrice | null = catalogPrice(model);
   if (catalog) return { base: { input: catalog.input, output: catalog.output, cacheRead: catalog.cacheRead, cacheWrite: catalog.cacheWrite }, source: "catalog" };
   return { base: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, source: "none" };
@@ -124,14 +141,16 @@ export function catalogPriceFor(model: string): PriceNumbers | null {
 export function priceView(model: string, markup = pricingSettings().markup): PriceView {
   const { base, source } = basePriceFor(model);
   const override = overrides().get(model);
+  const vendor = vendorPriceFor(model);
   return {
     model,
-    provider: catalogPrice(model)?.provider ?? null,
+    provider: vendor?.provider ?? catalogPrice(model)?.provider ?? null,
     source,
     base,
     sell: sellOf(base, markup),
     updatedAt: override?.updatedAt ?? null,
     updatedBy: override?.updatedBy ?? null,
+    vendor: vendor ? { checkedAt: vendor.checkedAt, source: vendor.source, note: vendor.note, replacedBy: vendor.replacedBy ?? null, peakMultiplier: DEEPSEEK_PEAK_MULTIPLIER } : null,
   };
 }
 
@@ -142,15 +161,29 @@ export type TokenCounts = { inputTokens?: number; outputTokens?: number; cacheRe
  * `sellMicros` is what the customer is charged. Both are null when the model has no price at all,
  * so an unknown model is reported as unpriced instead of being silently treated as free.
  */
-export function quoteCosts(model: string | undefined | null, counts: TokenCounts): { baseMicros: number | null; sellMicros: number | null; markup: number; source: PriceSource } {
+export type CostQuote = {
+  baseMicros: number | null;
+  sellMicros: number | null;
+  markup: number;
+  source: PriceSource;
+  /** Butir 19: apakah tarif puncak vendor dipakai untuk pemakaian ini. */
+  peak: boolean;
+  peakMultiplier: number;
+  peakReason: string;
+};
+
+export function quoteCosts(model: string | undefined | null, counts: TokenCounts, at: Date | number = Date.now()): CostQuote {
   const settings = pricingSettings();
-  if (!model) return { baseMicros: null, sellMicros: null, markup: settings.markup, source: "none" };
+  if (!model) return { baseMicros: null, sellMicros: null, markup: settings.markup, source: "none", peak: false, peakMultiplier: 1, peakReason: "model tidak disebut" };
   const { base, source } = basePriceFor(model);
-  if (source === "none") return { baseMicros: null, sellMicros: null, markup: settings.markup, source };
+  if (source === "none") return { baseMicros: null, sellMicros: null, markup: settings.markup, source, peak: false, peakMultiplier: 1, peakReason: "tanpa harga" };
+  // Faktor tarif puncak hanya berlaku untuk harga resmi vendor. Keputusan pemilik platform dan
+  // katalog mesin sudah berupa angka tetap, jadi tidak dikalikan lagi.
+  const peak = source === "vendor" ? deepSeekPeak(at, model) : { peak: false, multiplier: 1, hourUtc: 0, dayUtc: 0, reason: "bukan tarif vendor" };
   const per = (rate: number, tokens?: number) => ((tokens ?? 0) / 1e6) * rate;
-  const baseUsd = per(base.input, counts.inputTokens) + per(base.output, counts.outputTokens) + per(base.cacheRead, counts.cacheReadTokens) + per(base.cacheWrite, counts.cacheWriteTokens);
+  const baseUsd = (per(base.input, counts.inputTokens) + per(base.output, counts.outputTokens) + per(base.cacheRead, counts.cacheReadTokens) + per(base.cacheWrite, counts.cacheWriteTokens)) * peak.multiplier;
   const baseMicros = Math.round(baseUsd * 1e6);
-  return { baseMicros, sellMicros: Math.round(baseMicros * settings.markup), markup: settings.markup, source };
+  return { baseMicros, sellMicros: Math.round(baseMicros * settings.markup), markup: settings.markup, source, peak: peak.peak, peakMultiplier: peak.multiplier, peakReason: peak.reason };
 }
 
 /** Recomputes the billed amount for an already stored base cost (used when the markup changes). */
@@ -214,7 +247,102 @@ export function usageByModel(days = 30): UsageRow[] {
   return rows.map((row) => ({ ...row, model: row.model ?? null, runs: Number(row.runs) })) as UsageRow[];
 }
 
+/* ------------------------------------------------- butir 19: rekonsiliasi biaya */
+
+export type ReconciliationRow = {
+  model: string;
+  provider: string | null;
+  source: PriceSource;
+  runs: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /** Biaya yang benar-benar tercatat di basis data saat pemakaian terjadi. */
+  recordedMicros: number;
+  /** Biaya yang sama bila dihitung ulang dengan harga yang berlaku sekarang. */
+  correctedMicros: number;
+  /** Selisih dalam sepersejuta dolar AS dan dalam persen (dibulatkan 1 angka). */
+  driftMicros: number;
+  driftPercent: number;
+  /** Berapa baris pemakaian jatuh pada jam puncak vendor. */
+  peakBuckets: number;
+};
+
+export type Reconciliation = {
+  days: number;
+  generatedAt: string;
+  rows: ReconciliationRow[];
+  totals: { runs: number; recordedMicros: number; correctedMicros: number; driftMicros: number; driftPercent: number; unpricedRuns: number };
+  note: string;
+};
+
+/**
+ * Membandingkan biaya yang TERCATAT dengan biaya yang SEHARUSNYA menurut harga yang berlaku
+ * sekarang, per jam pemakaian. Pengelompokan per jam dipakai karena tarif puncak vendor bergantung
+ * pada jam. Jam pada `created_at` ditafsirkan sebagai UTC; baris dengan bentuk waktu yang tidak sah
+ * dihitung dengan waktu sekarang supaya tidak menebak jam lain. Semua angka dibaca dari basis data.
+ */
+export function reconcileUsage(days = 30, limit = 20): Reconciliation {
+  const window = Math.min(3650, Math.max(1, Math.round(days)));
+  const since = new Date(Date.now() - window * 86_400_000).toISOString();
+  const buckets = db.prepare(`SELECT substr(created_at,1,13) AS bucket, COALESCE(model,'') AS model, COUNT(*) AS runs,
+      COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens,
+      COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens, COALESCE(SUM(cache_write_tokens),0) AS cacheWriteTokens,
+      COALESCE(SUM(cost_micros),0) AS recordedMicros, COALESCE(SUM(sell_cost_micros),0) AS sellMicros,
+      SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END) AS unpricedRuns
+    FROM run_usage WHERE created_at >= ? GROUP BY bucket, COALESCE(model,'') ORDER BY bucket`).all(since) as any[];
+
+  const perModel = new Map<string, ReconciliationRow>();
+  let unpricedTotal = 0;
+  for (const bucket of buckets) {
+    const model = String(bucket.model || "");
+    const counts = { inputTokens: Number(bucket.inputTokens), outputTokens: Number(bucket.outputTokens), cacheReadTokens: Number(bucket.cacheReadTokens), cacheWriteTokens: Number(bucket.cacheWriteTokens) };
+    // Jam bucket ditafsirkan sebagai UTC; bila tidak sah, pakai waktu sekarang supaya tidak menebak jam lain.
+    const stamp = /^\d{4}-\d{2}-\d{2}T\d{2}$/.test(String(bucket.bucket)) ? Date.parse(`${bucket.bucket}:00:00Z`) : Date.now();
+    const quote = quoteCosts(model || null, counts, stamp);
+    const row: ReconciliationRow = perModel.get(model) ?? { model: model || "(tanpa model)", provider: null, source: "none", runs: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, recordedMicros: 0, correctedMicros: 0, driftMicros: 0, driftPercent: 0, peakBuckets: 0 };
+    const { base, source } = basePriceFor(model);
+    row.provider = vendorPriceFor(model)?.provider ?? catalogPrice(model)?.provider ?? null;
+    row.source = source;
+    row.runs += Number(bucket.runs);
+    row.inputTokens += counts.inputTokens;
+    row.outputTokens += counts.outputTokens;
+    row.cacheReadTokens += counts.cacheReadTokens;
+    row.cacheWriteTokens += counts.cacheWriteTokens;
+    row.recordedMicros += Number(bucket.recordedMicros);
+    row.correctedMicros += quote.baseMicros ?? 0;
+    if (quote.peak) row.peakBuckets += 1;
+    if (source === "none" || (base.input === 0 && base.output === 0)) unpricedTotal += Number(bucket.unpricedRuns);
+    perModel.set(model, row);
+  }
+
+  const rows = [...perModel.values()].map((row) => {
+    const driftMicros = row.correctedMicros - row.recordedMicros;
+    return { ...row, driftMicros, driftPercent: row.recordedMicros > 0 ? Math.round((driftMicros / row.recordedMicros) * 1000) / 10 : (driftMicros > 0 ? 100 : 0) };
+  }).sort((left, right) => Math.abs(right.driftMicros) - Math.abs(left.driftMicros));
+
+  const recordedMicros = rows.reduce((sum, row) => sum + row.recordedMicros, 0);
+  const correctedMicros = rows.reduce((sum, row) => sum + row.correctedMicros, 0);
+  const driftMicros = correctedMicros - recordedMicros;
+  return {
+    days: window,
+    generatedAt: new Date().toISOString(),
+    rows: rows.slice(0, Math.max(1, limit)),
+    totals: {
+      runs: rows.reduce((sum, row) => sum + row.runs, 0),
+      recordedMicros,
+      correctedMicros,
+      driftMicros,
+      driftPercent: recordedMicros > 0 ? Math.round((driftMicros / recordedMicros) * 1000) / 10 : 0,
+      unpricedRuns: unpricedTotal,
+    },
+    note: "correctedMicros dihitung ulang dengan harga yang berlaku sekarang (termasuk tarif puncak vendor per jam). Selisih positif berarti biaya yang tercatat lebih kecil daripada seharusnya.",
+  };
+}
+
 export type PricingTable = {
+
   markup: number; currency: string; updatedAt: string | null; updatedBy: string | null;
   catalogSize: number; overrideCount: number; days: number;
   models: (PriceView & { used: boolean; runs: number; baseMicros: number; sellMicros: number })[];

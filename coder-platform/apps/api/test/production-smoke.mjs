@@ -562,6 +562,22 @@ check("wave9 the billed amount follows the owner markup and the margin is the di
   JSON.stringify({ markup: aiPricing?.markup, cost30, billed30, margin30 }));
 check("wave9 the real upstream price is never overwritten by the markup", cost30 >= 0 && (cost30 === 0 || billed30 >= cost30),
   JSON.stringify({ cost30, billed30 }));
+// Butir 19 (v0.20.2): harga DeepSeek di katalog mesin sudah tidak berlaku, jadi biaya dibukukan
+// dengan lapisan harga resmi vendor. Bukti dari produksi: hub menyebut jumlah harga vendor.
+check("butir19 the status hub reports the vendor price layer",
+  Number(aiPricing?.vendorPrices) >= 4 && typeof aiPricing?.vendorCheckedAt === "string" && /^\d{4}-\d{2}-\d{2}$/.test(String(aiPricing?.vendorCheckedAt))
+  && Array.isArray(aiPricing?.vendorModels) && aiPricing.vendorModels.includes("deepseek-flash"),
+  JSON.stringify({ vendorPrices: aiPricing?.vendorPrices, vendorCheckedAt: aiPricing?.vendorCheckedAt, vendorModels: aiPricing?.vendorModels }));
+// Butir 19 (v0.20.2): rekonsiliasi biaya tercatat vs harga yang berlaku sekarang ada di hub.
+const reconciliation = aiPricing?.reconciliation;
+check("butir19 the status hub reports the recorded versus corrected AI cost",
+  typeof reconciliation?.recordedMicros === "number" && typeof reconciliation?.correctedMicros === "number"
+  && typeof reconciliation?.driftPercent === "number" && Number(reconciliation?.runs) >= 0
+  && reconciliation.correctedMicros >= reconciliation.recordedMicros,
+  JSON.stringify(reconciliation));
+const reconcileBlocked = await call("GET", "/api/v1/admin/pricing/reconcile");
+check("butir19 the cost reconciliation refuses a normal account",
+  reconcileBlocked.status === 403 && reconcileBlocked.json?.error === "ADMIN_REQUIRED", JSON.stringify(reconcileBlocked.json));
 const pricingBlocked = await call("GET", "/api/v1/admin/pricing");
 check("wave9 the price console refuses a normal account", pricingBlocked.status === 403 && pricingBlocked.json?.error === "ADMIN_REQUIRED", JSON.stringify(pricingBlocked.json));
 const markupBlocked = await call("PUT", "/api/v1/admin/pricing/settings", { markup: 2 });

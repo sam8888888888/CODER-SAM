@@ -26,7 +26,9 @@ const adminEmail = `w9pricing-admin-${stamp}@example.test`;
 const memberEmail = `w9pricing-member-${stamp}@example.test`;
 const password = "SandiUji2026!aman";
 /** Model katalog tanpa garis miring, jadi aman dipakai di dalam potongan URL. */
-const KATALOG_MODEL = "deepseek-v4-pro";
+// Butir 19: model katalog murni (tanpa koreksi harga vendor) supaya bagian "katalog" tetap
+// menguji jalur katalog. Model DeepSeek diuji terpisah di bagian 3b.
+const KATALOG_MODEL = "claude-haiku-4-5";
 /** Model katalog bergaris miring: diuji lewat modul, bukan lewat URL. */
 const SLASH_MODEL = "~openai/gpt-latest";
 /** Model yang dipakai run nyata (dipasang sebagai PRIME_AGENT_MODEL). */
@@ -55,7 +57,7 @@ const { MODEL_PRICES, priceForModel } = await import("../src/model-prices.js");
 const {
   pricingSettings, setPricingMarkup, priceView, quoteCosts, sellForBaseMicros,
   validatePrice, savePriceOverride, clearPriceOverride, overrideCount, usageByModel, pricingTable,
-  backfillSellCosts,
+  backfillSellCosts, reconcileUsage,
 } = await import("../src/pricing.js");
 
 await new Promise((resolve) => setTimeout(resolve, 1200));
@@ -180,6 +182,54 @@ const quoteZero = quoteCosts(KATALOG_MODEL, {});
 check("3) token nol: baseMicros = 0 tetapi source tetap catalog", quoteZero.baseMicros === 0 && quoteZero.source === "catalog", JSON.stringify(quoteZero));
 check("3) sellForBaseMicros(null) = null", sellForBaseMicros(null) === null, String(sellForBaseMicros(null)));
 check("3) sellForBaseMicros(1234, 2,5) = 3085", sellForBaseMicros(1234, 2.5) === 3085, String(sellForBaseMicros(1234, 2.5)));
+
+// ---------------------------------------------- 3b) harga resmi vendor (butir 19, v0.20.2)
+// Latar: katalog mesin memuat harga DeepSeek yang sudah tidak berlaku, sehingga `cost_micros`
+// lebih kecil daripada tagihan DeepSeek yang sebenarnya. Lapisan `vendor-prices.ts` menutup itu.
+const vendorFlash = priceView("deepseek-v4-flash");
+check("3b) harga resmi vendor menang atas katalog: source = vendor", vendorFlash.source === "vendor", JSON.stringify({ source: vendorFlash.source, base: vendorFlash.base }));
+check("3b) angka vendor = tarif resmi luar puncak (0,15 / 0,60 / 0,003)",
+  vendorFlash.base.input === 0.15 && vendorFlash.base.output === 0.6 && vendorFlash.base.cacheRead === 0.003,
+  JSON.stringify(vendorFlash.base));
+check("3b) katalog mesin tetap jujur melaporkan angka lamanya (0,14 / 0,28)",
+  priceForModel("deepseek-v4-flash")?.input === 0.14 && priceForModel("deepseek-v4-flash")?.output === 0.28,
+  JSON.stringify(priceForModel("deepseek-v4-flash")));
+check("3b) priceView memuat asal harga vendor (tanggal + alamat sumber)",
+  typeof vendorFlash.vendor?.checkedAt === "string" && String(vendorFlash.vendor?.source).includes("deepseek"),
+  JSON.stringify(vendorFlash.vendor));
+check("3b) faktor tarif puncak yang dilaporkan = 2", vendorFlash.vendor?.peakMultiplier === 2, String(vendorFlash.vendor?.peakMultiplier));
+// Nama resmi baru `deepseek-flash` tidak ada di katalog mesin; tanpa lapisan vendor, biaya tidak tercatat.
+check("3b) nama resmi deepseek-flash dikenali lapisan vendor", priceView("deepseek-flash").source === "vendor" && priceView("deepseek-flash").base.output === 0.6, JSON.stringify(priceView("deepseek-flash").base));
+check("3b) nama resmi deepseek-flash memang belum ada di katalog mesin", priceForModel("deepseek-flash") === null, JSON.stringify(priceForModel("deepseek-flash")));
+check("3b) deepseek-v4-pro juga memakai tarif resmi (0,66 / 1,98)", priceView("deepseek-v4-pro").base.input === 0.66 && priceView("deepseek-v4-pro").base.output === 1.98, JSON.stringify(priceView("deepseek-v4-pro").base));
+// Waktu uji dipatok, bukan "sekarang", supaya hasilnya sama setiap kali dijalankan.
+const LUAR_PUNCAK = Date.parse("2026-09-22T12:00:00Z"); // Selasa 12:00 UTC
+const PUNCAK = Date.parse("2026-09-22T02:00:00Z"); // Selasa 02:00 UTC (jendela 01:00-04:00)
+const AKHIR_PEKAN = Date.parse("2026-09-26T02:00:00Z"); // Sabtu 02:00 UTC
+const quoteLuarPuncak = quoteCosts("deepseek-flash", { inputTokens: 1_000_000, outputTokens: 1_000_000 }, LUAR_PUNCAK);
+check("3b) luar puncak: 1 juta masuk + 1 juta keluar = 750.000 mikrodolar (0,15 + 0,60)",
+  quoteLuarPuncak.baseMicros === 750_000 && quoteLuarPuncak.peak === false && quoteLuarPuncak.peakMultiplier === 1,
+  JSON.stringify(quoteLuarPuncak));
+const quotePuncak = quoteCosts("deepseek-flash", { inputTokens: 1_000_000, outputTokens: 1_000_000 }, PUNCAK);
+check("3b) jam puncak: biaya jadi dua kali (1.500.000 mikrodolar)",
+  quotePuncak.baseMicros === 1_500_000 && quotePuncak.peak === true && quotePuncak.peakMultiplier === 2,
+  JSON.stringify(quotePuncak));
+check("3b) jam puncak dijelaskan dengan jam UTC", typeof quotePuncak.peakReason === "string" && quotePuncak.peakReason.includes("puncak"), String(quotePuncak.peakReason));
+const quoteAkhirPekan = quoteCosts("deepseek-flash", { inputTokens: 1_000_000, outputTokens: 1_000_000 }, AKHIR_PEKAN);
+check("3b) akhir pekan tarif luar puncak walau jamnya masuk jendela", quoteAkhirPekan.baseMicros === 750_000 && quoteAkhirPekan.peak === false, JSON.stringify(quoteAkhirPekan));
+const quoteCache = quoteCosts("deepseek-flash", { inputTokens: 0, outputTokens: 0, cacheReadTokens: 1_000_000 }, LUAR_PUNCAK);
+check("3b) token cache-hit dihargai 3.000 mikrodolar per 1 juta", quoteCache.baseMicros === 3_000, JSON.stringify(quoteCache));
+const quotePro = quoteCosts("deepseek-v4-pro", { inputTokens: 1_000_000, outputTokens: 1_000_000 }, LUAR_PUNCAK);
+check("3b) deepseek-v4-pro luar puncak = 2.640.000 mikrodolar (0,66 + 1,98)", quotePro.baseMicros === 2_640_000, JSON.stringify(quotePro));
+const quoteBukanVendor = quoteCosts(KATALOG_MODEL, { inputTokens: 1_000_000, outputTokens: 1_000_000 });
+check("3b) model tanpa koreksi vendor tidak dikenai faktor puncak", quoteBukanVendor.peak === false && quoteBukanVendor.peakMultiplier === 1 && quoteBukanVendor.source === "catalog", JSON.stringify(quoteBukanVendor));
+check("3b) model tak dikenal tetap null (tidak ditebak)", quoteCosts("model-tak-ada-sama-sekali", { inputTokens: 1_000_000 }, PUNCAK).baseMicros === null, "");
+// Keputusan pemilik platform harus tetap menang atas harga vendor.
+const vendorOverride = savePriceOverride("deepseek-v4-flash", { input: 3, output: 6 });
+check("3b) harga pengganti pemilik menang atas harga vendor", vendorOverride.source === "override" && quoteCosts("deepseek-v4-flash", { inputTokens: 1_000_000 }, LUAR_PUNCAK).baseMicros === 3_000_000, JSON.stringify(vendorOverride.base));
+check("3b) harga pengganti tidak dikenai faktor puncak", quoteCosts("deepseek-v4-flash", { inputTokens: 1_000_000 }, PUNCAK).baseMicros === 3_000_000, JSON.stringify(quoteCosts("deepseek-v4-flash", { inputTokens: 1_000_000 }, PUNCAK)));
+check("3b) setelah pengganti dibersihkan, harga vendor kembali", clearPriceOverride("deepseek-v4-flash") === true && priceView("deepseek-v4-flash").source === "vendor", "");
+check("3b) pengganti uji tidak meninggalkan sisa", overrideCount() === 0, String(overrideCount()));
 
 // ------------------------------------------------------------------ 4) harga pengganti
 const viewAwal = priceView(KATALOG_MODEL);
@@ -412,6 +462,54 @@ if (usageRow) {
   db.prepare("DELETE FROM run_usage WHERE id=?").run(backfillId);
 } else {
   skip("10) pelengkapan baris lama tanpa harga jual", "baris run_usage nyata tidak tersedia");
+}
+
+// ----------------------------------------- 11) rekonsiliasi biaya (butir 19, v0.20.2)
+// Biaya tercatat harus bisa dibandingkan dengan harga yang berlaku sekarang. Jam 02:00 UTC hari kerja
+// adalah jam puncak DeepSeek (tarif dua kali), jam 12:00 UTC bukan. Tanggal dipilih dari hari kerja
+// yang sudah lewat supaya uji ini tidak bergantung pada hari saat dijalankan.
+function hariKerjaLalu(): string {
+  for (let mundur = 10; mundur < 25; mundur += 1) {
+    const hari = new Date(Date.now() - mundur * 86_400_000);
+    if (hari.getUTCDay() === 2) return hari.toISOString().slice(0, 10);
+  }
+  throw new Error("tidak menemukan hari Selasa dalam 25 hari terakhir");
+}
+if (usageRow) {
+  const VENDOR_MODEL = "deepseek-v4-flash";
+  const hariUji = hariKerjaLalu();
+  const sebelum = reconcileUsage(30, 50);
+  const barisSebelum = sebelum.rows.find((row) => row.model === VENDOR_MODEL);
+  // Dua baris: satu di jam puncak, satu di luar puncak. Harga pokok yang tercatat sengaja memakai
+  // angka katalog yang basi (0,14 USD per 1 juta token) untuk membuktikan selisihnya terdeteksi.
+  const idPuncak = `w11-peak-${stamp}`;
+  const idLuar = `w11-off-${stamp}`;
+  const simpan = db.prepare(`INSERT INTO run_usage (id, run_id, project_id, model, provider, input_tokens, output_tokens, total_tokens, cost_micros, estimated, created_at, sell_cost_micros)
+    VALUES (?,?,?,?,?,?,?,?,?,0,?,?)`);
+  simpan.run(idPuncak, usageRow.runId, projectId, VENDOR_MODEL, "deepseek", 1_000_000, 0, 1_000_000, 140_000, `${hariUji}T02:00:00.000Z`, 140_000);
+  simpan.run(idLuar, usageRow.runId, projectId, VENDOR_MODEL, "deepseek", 1_000_000, 0, 1_000_000, 140_000, `${hariUji}T12:00:00.000Z`, 140_000);
+
+  const sesudah = reconcileUsage(30, 50);
+  const barisSesudah = sesudah.rows.find((row) => row.model === VENDOR_MODEL);
+  const correctedDelta = Number(barisSesudah?.correctedMicros ?? 0) - Number(barisSebelum?.correctedMicros ?? 0);
+  const recordedDelta = Number(barisSesudah?.recordedMicros ?? 0) - Number(barisSebelum?.recordedMicros ?? 0);
+  check("11) rekonsiliasi membaca dua baris uji", recordedDelta === 280_000, `selisih tercatat=${recordedDelta}`);
+  check("11) jam puncak menaikkan biaya yang seharusnya (150.000 + 300.000 mikrodolar)", correctedDelta === 450_000, `selisih seharusnya=${correctedDelta}`);
+  check("11) selisih dilaporkan per model dan positif", Number(barisSesudah?.driftMicros ?? 0) - Number(barisSebelum?.driftMicros ?? 0) === 170_000, JSON.stringify({ sesudah: barisSesudah, sebelum: barisSebelum }));
+  check("11) baris puncak dihitung", Number(barisSesudah?.peakBuckets ?? 0) - Number(barisSebelum?.peakBuckets ?? 0) === 1, `peakBuckets=${barisSesudah?.peakBuckets}`);
+  check("11) sumber harga baris itu adalah vendor", barisSesudah?.source === "vendor", String(barisSesudah?.source));
+  check("11) total rekonsiliasi memuat catatan penjelasan", typeof sesudah.note === "string" && sesudah.note.includes("tarif puncak"), sesudah.note);
+
+  const reconcRoute = await admin.call("GET", "/api/v1/admin/pricing/reconcile?days=30&limit=5");
+  check("11) rute rekonsiliasi melayani admin -> 200", reconcRoute.status === 200 && Array.isArray(reconcRoute.json?.rows) && typeof reconcRoute.json?.totals?.driftPercent === "number", JSON.stringify(reconcRoute.json)?.slice(0, 200));
+  check("11) rute rekonsiliasi dibatasi limit yang diminta", (reconcRoute.json?.rows ?? []).length <= 5, String(reconcRoute.json?.rows?.length));
+  const reconcBlocked = await member.call("GET", "/api/v1/admin/pricing/reconcile");
+  check("11) rute rekonsiliasi menolak pengguna biasa 403", reconcBlocked.status === 403 && reconcBlocked.json?.error === "ADMIN_REQUIRED", JSON.stringify(reconcBlocked.json));
+
+  db.prepare("DELETE FROM run_usage WHERE id IN (?,?)").run(idPuncak, idLuar);
+  check("11) baris uji dibersihkan", tableCount("SELECT COUNT(*) AS n FROM run_usage WHERE id IN (?,?)", idPuncak, idLuar) === 0, "");
+} else {
+  skip("11) rekonsiliasi biaya", "baris run_usage nyata tidak tersedia");
 }
 
 // ------------------------------------------------------------------ ringkasan

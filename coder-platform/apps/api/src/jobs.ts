@@ -26,7 +26,7 @@ import { db } from "./db.js";
 export type JobStatus = "queued" | "running" | "done" | "failed";
 
 /** Jenis pekerjaan yang dikenal platform. Jenis lain tetap boleh (dipakai uji), tetapi bukan bawaan. */
-export const JOB_KINDS = ["run.execute", "email.deliver", "retention.run", "smoke.cleanup", "run.reap", "workflow.reap", "webhook.deliver"] as const;
+export const JOB_KINDS = ["run.execute", "email.deliver", "retention.run", "smoke.cleanup", "run.reap", "workflow.reap", "webhook.deliver", "ratelimit.sweep"] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 export type JobRow = {
@@ -67,6 +67,11 @@ const COLUMNS = `id, kind, status, payload, result, attempts AS attempts, max_at
 const RETRY_BASE_DELAY_MS = 5_000;
 /** Pekerjaan pemeriksa (reaper) dijalankan tiap sepuluh menit. */
 export const REAP_INTERVAL_MS = 10 * 60 * 1000;
+/**
+ * Butir 15b: sapuan tabel `rate_limit_hits` dijalankan pekerja terjadwal tiap lima menit. Jendela
+ * terpanjang hanya 20 menit, jadi jeda ini selalu membuang baris yang sudah mati sebelum menumpuk.
+ */
+export const RATE_LIMIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 const handlers = new Map<string, (payload: any, job: JobRow) => Promise<unknown> | unknown>();
 
@@ -228,6 +233,11 @@ export function ensureRecurringJobs(now: Date = new Date()): string[] {
     // Wave 10 (item 27): the production smoke test writes real rows so that every check is real. This
     // pass clears them again, and it only runs when the operator switched it on.
     { kind: "smoke.cleanup", intervalMs: Math.max(60_000, config.SMOKE_CLEANUP_HOURS * 60 * 60 * 1000), enabled: config.SMOKE_CLEANUP_ENABLED, maxAttempts: 2 },
+    // Butir 15b: sapuan tabel pembatas laju. Pekerjaan ini SELALU dijadwalkan supaya satu pemilik
+    // antrean selalu menyapu tabel; `RATE_LIMIT_SWEEP_IN_WEB` hanya menentukan apakah proses web
+    // ikut menyapu sendiri (lihat ratelimit.ts). Menghapus baris mati bersifat idempoten, jadi
+    // bentrok dua penyapu tidak berbahaya.
+    { kind: "ratelimit.sweep", intervalMs: RATE_LIMIT_SWEEP_INTERVAL_MS, enabled: true, maxAttempts: 1 },
     { kind: "run.reap", intervalMs: REAP_INTERVAL_MS, enabled: true, maxAttempts: 1 },
     { kind: "workflow.reap", intervalMs: REAP_INTERVAL_MS, enabled: true, maxAttempts: 1 },
   ];

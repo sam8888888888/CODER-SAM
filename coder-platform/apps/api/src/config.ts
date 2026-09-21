@@ -75,6 +75,14 @@ const Env = z.object({
    */
   JOB_WORKER_IN_WEB: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
   /**
+   * Butir 15b: sapuan berkala tabel `rate_limit_hits` di dalam proses web. Bawaannya `true` supaya
+   * instalasi satu wadah tetap bersih sendiri. Produksi menyetelnya `false`: sapuan dikerjakan
+   * pekerja terjadwal `ratelimit.sweep`, jadi banyak replika web tidak mengulang pekerjaan yang sama.
+   * Sengaja TIDAK diturunkan dari `JOB_WORKER_IN_WEB`, karena proses pekerja menyetel flag itu `true`
+   * untuk dirinya sendiri (worker.ts) - menurunkannya akan mematikan penjadwalan di dalam pekerja.
+   */
+  RATE_LIMIT_SWEEP_IN_WEB: z.preprocess((value) => (value === undefined || value === "" ? undefined : value === true || value === "true" || value === "1"), z.boolean().optional()),
+  /**
    * Wave 9 (item 17): the process that runs `dist/api/worker.js` sets this itself. It owns the queue
    * (leases, reaping, interval cycles) and does not open an HTTP listener, so the API container can
    * never claim the same work.
@@ -134,4 +142,7 @@ const Env = z.object({
   GROWTH_WINDOW_DAYS: z.coerce.number().int().min(1).max(365).default(30),
 });
 
-export const config = Env.parse(process.env);
+const parsedEnv = Env.parse(process.env);
+
+/** Lihat catatan `RATE_LIMIT_SWEEP_IN_WEB` di atas: bawaan `true` = sapuan di dalam proses web. */
+export const config = { ...parsedEnv, RATE_LIMIT_SWEEP_IN_WEB: parsedEnv.RATE_LIMIT_SWEEP_IN_WEB ?? true };

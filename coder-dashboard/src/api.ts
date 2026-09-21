@@ -173,7 +173,8 @@ export type AdminJobsResponse = { worker: JobWorkerInfo; stats: JobStats; jobs: 
 /** Wave 9 (butir 19): konsol harga AI. costMicros = yang dibayar platform, sellMicros = yang ditagihkan. */
 export type PricingNumbers = { input: number; output: number; cacheRead: number; cacheWrite: number };
 export type PricingModel = {
-  model: string; provider: string | null; source: 'catalog' | 'override' | 'none';
+  // Butir 19: 'vendor' = harga resmi vendor dipakai karena katalog mesin sudah tidak berlaku.
+  model: string; provider: string | null; source: 'catalog' | 'override' | 'vendor' | 'none';
   base: PricingNumbers; sell: PricingNumbers; updatedAt: string | null; updatedBy: string | null;
   used: boolean; runs: number; baseMicros: number; sellMicros: number; marginMicros: number;
 };
@@ -183,6 +184,18 @@ export type PricingTable = {
   catalogSize: number; overrideCount: number; days: number; models: PricingModel[]; totals: PricingTotals; note: string;
 };
 export type PricingSettingsResult = { ok: true; markup: number; updatedAt: string | null; rowsUpdated: number; totals: PricingTotals; message: string };
+
+/** Butir 19: satu baris rekonsiliasi biaya tercatat vs biaya menurut harga yang berlaku sekarang. */
+export type CostReconciliationRow = {
+  model: string; provider: string | null; source: 'catalog' | 'override' | 'vendor' | 'none';
+  runs: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number;
+  recordedMicros: number; correctedMicros: number; driftMicros: number; driftPercent: number; peakBuckets: number;
+};
+export type CostReconciliation = {
+  days: number; generatedAt: string; rows: CostReconciliationRow[];
+  totals: { runs: number; recordedMicros: number; correctedMicros: number; driftMicros: number; driftPercent: number; unpricedRuns: number };
+  note: string;
+};
 export type PricingModelResult = { ok: true; price: PricingModel; message: string };
 
 /** Properti halaman konsol harga. Sudah dipakai halaman AdminPricing.tsx. */
@@ -403,6 +416,13 @@ export const api = {
     if (query.days) params.set('days', String(query.days));
     const suffix = params.toString();
     return request<PricingTable>(`/v1/admin/pricing${suffix ? `?${suffix}` : ''}`);
+  },
+  adminPricingReconcile: (query: { days?: number; limit?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (query.days) params.set('days', String(query.days));
+    if (query.limit) params.set('limit', String(query.limit));
+    const suffix = params.toString();
+    return request<CostReconciliation>(`/v1/admin/pricing/reconcile${suffix ? `?${suffix}` : ''}`);
   },
   adminPricingSetMarkup: (markup: number) =>
     request<PricingSettingsResult>('/v1/admin/pricing/settings', { method: 'PUT', body: JSON.stringify({ markup }) }),

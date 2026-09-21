@@ -8,6 +8,7 @@
  * The table stays small because each call deletes the hits that already left the window, and a
  * sweep every minute drops the rows of inactive keys.
  */
+import { config } from "./config.js";
 import { db } from "./db.js";
 
 export type RateLimitRule = { windowMs: number; max: number };
@@ -20,9 +21,20 @@ export type RateLimiter = {
 };
 
 /** Longest window any rule uses, plus a margin, so a sweep never removes a live hit. */
-const SWEEP_AFTER_MS = 20 * 60 * 1000;
-/** How often the whole table is swept for rows that belong to no active window. */
-const SWEEP_INTERVAL_MS = 60 * 1000;
+export const SWEEP_AFTER_MS = 20 * 60 * 1000;
+/** How often the whole table is swept for rows that belong to no active window (butir 15b). */
+export const SWEEP_INTERVAL_MS = 60 * 1000;
+
+/**
+ * Butir 15b: membuang baris `rate_limit_hits` yang sudah keluar dari semua jendela aktif. Fungsi ini
+ * dipakai dua tempat: sapuan malas di dalam proses web (bila `RATE_LIMIT_SWEEP_IN_WEB`) dan pekerja
+ * terjadwal `ratelimit.sweep`. Hasilnya dilaporkan apa adanya supaya bisa diperiksa dari luar.
+ */
+export function sweepRateLimitHits(now: number = Date.now()): { cutoff: number; removed: number } {
+  const cutoff = now - SWEEP_AFTER_MS;
+  const removed = Number(db.prepare("DELETE FROM rate_limit_hits WHERE hit_at <= ?").run(cutoff).changes ?? 0);
+  return { cutoff, removed };
+}
 
 export function createRateLimiter(rule: RateLimitRule, namespace = "rate"): RateLimiter {
   let lastSweep = 0;
@@ -33,7 +45,7 @@ export function createRateLimiter(rule: RateLimitRule, namespace = "rate"): Rate
 
   /** Drops rows older than the longest window, whichever key they belong to. */
   function sweep(now: number): void {
-    db.prepare("DELETE FROM rate_limit_hits WHERE hit_at <= ?").run(now - SWEEP_AFTER_MS);
+    sweepRateLimitHits(now);
   }
 
   function hitsInWindow(key: string, cutoff: number): number {
@@ -47,7 +59,10 @@ export function createRateLimiter(rule: RateLimitRule, namespace = "rate"): Rate
       const total = hitsInWindow(key, now - rule.windowMs);
       if (total >= rule.max) return false;
       db.prepare("INSERT INTO rate_limit_hits (bucket, hit_at) VALUES (?,?)").run(bucketOf(key), now);
-      if (now - lastSweep > SWEEP_INTERVAL_MS) {
+      // Butir 15b: sapuan ini hanya dijalankan bila proses ini memang pemiliknya. Di produksi
+      // (`JOB_WORKER_IN_WEB=false`) sapuan pindah ke pekerja terjadwal `ratelimit.sweep`, jadi proses
+      // web tidak lagi menghapus baris tabel demi setiap replika.
+      if (config.RATE_LIMIT_SWEEP_IN_WEB && now - lastSweep > SWEEP_INTERVAL_MS) {
         lastSweep = now;
         sweep(now);
       }
@@ -105,7 +120,18 @@ export function limiterFor(name: LimiterName): RateLimiter {
   return created;
 }
 
-/** Honest report for the status hub: where the counters really live. */
+/**
+ * Honest report for the status hub: where the counters really live, and who owns the periodic sweep
+ * (butir 15b). `sweepOwner` menjawab pertanyaan "kalau ada banyak replika, siapa yang menyapu tabel?".
+ */
 export function rateLimitStorage() {
-  return { store: "database" as const, table: "rate_limit_hits", rules: Object.fromEntries(Object.entries(RULES).map(([name, rule]) => [name, rule.max])) };
+  return {
+    store: "database" as const,
+    table: "rate_limit_hits",
+    rules: Object.fromEntries(Object.entries(RULES).map(([name, rule]) => [name, rule.max])),
+    sweepInWeb: config.RATE_LIMIT_SWEEP_IN_WEB,
+    sweepOwner: config.RATE_LIMIT_SWEEP_IN_WEB ? "web" : "worker",
+    sweepIntervalMs: SWEEP_INTERVAL_MS,
+    sweepAfterMs: SWEEP_AFTER_MS,
+  };
 }

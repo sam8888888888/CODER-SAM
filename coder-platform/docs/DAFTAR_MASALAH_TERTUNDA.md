@@ -89,8 +89,10 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
 
 15. [SELESAI] Batas laju kini disimpan di tabel `rate_limit_hits` (Wave 8), jadi tahan restart
     dan aman untuk banyak replika. Cara lama (memori proses) sudah tidak dipakai.
-15b. [TEKNIS] Sapuan tabel `rate_limit_hits` masih dijalankan di dalam proses aplikasi (setiap
-    menit). Bila nanti ada banyak replika, sapuan sebaiknya dipindahkan ke pekerja terjadwal.
+15b. [SELESAI — v0.20.2] Sapuan tabel `rate_limit_hits` kini dijalankan pekerja terjadwal:
+    jenis pekerjaan `ratelimit.sweep` dijadwalkan tiap 5 menit di `jobs.ts`. Sapuan malas di proses
+    web dimatikan lewat `RATE_LIMIT_SWEEP_IN_WEB=false` (bawaan `true` untuk pemasangan satu proses;
+    produksi menyetel `false`). Uji: `apps/api/test/ratelimit-sweep.e2e.ts` 22/22 lulus.
 16. [SELESAI] Wave 9 memasang tukar hijau-biru: profil `green` di `coder-platform/docker-compose.austria.yml`
     plus `point_nginx`/`wait_ready` di `deploy/deploy-austria.sh` (hijau melayani port 3403 selagi biru
     dibuat ulang). Terbukti saat deploy v0.19.0 (smoke produksi 176 lulus).
@@ -100,8 +102,31 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
     butuh banyak pekerja.
 18. [SELESAI] `migration-check.ts` sekarang ikut runner suite sebagai gerbang migrasi (`runMigrationGate()`
     di `apps/api/test/run-all.cjs`), jadi pemeriksaan skema selalu ikut `npm run verify`.
-19. [TEKNIS] Angka biaya AI (`cost_micros`) belum dicocokkan dengan tagihan DeepSeek nyata.
-20. [TEKNIS] Timer pembaruan TLS certbot belum diverifikasi (sertifikat habis 11 Des 2026).
+19. [SELESAI — v0.20.2] Angka biaya AI kini mengikuti daftar harga RESMI DeepSeek. Katalog mesin
+    (`model-prices.ts`) adalah berkas generated yang memuat harga `deepseek-v4-flash` 0,14/0,28 dan
+    `deepseek-v4-pro` 0,435/0,87 per 1 juta token; harga resmi (21 Sep 2026) adalah 0,15/0,60 dan
+    0,66/1,98, dengan tarif puncak dua kali pada 01:00–04:00 dan 06:00–10:00 UTC hari kerja.
+    Berkas baru `apps/api/src/vendor-prices.ts` memuat harga resmi berstempel tanggal; urutan sumber
+    harga: harga sendiri (pemilik) → harga resmi vendor → katalog mesin.
+    Rekonsiliasi data produksi 13–19 Sep 2026 (baca saja): `run_usage` 29 pemakaian tercatat
+    5.152 mikrodolar, seharusnya 8.023 mikrodolar (selisih +2.871, +55,7%); `user_usage` (playground)
+    tercatat 11.501, seharusnya 15.979 (+38,9%); gabungan 16.653 → 24.002 mikrodolar (+44,1%).
+    Rute baru `GET /api/v1/admin/pricing/reconcile` dan kartu "Rekonsiliasi biaya AI" di halaman
+    Konsol Harga menampilkan selisih itu kapan saja. Saldo DeepSeek saat diperiksa: 71,13 USD.
+20. [SELESAI (diperiksa) — v0.20.2] Timer pembaruan TLS sudah diverifikasi tanpa mengubah server:
+    `certbot.timer` aktif + enabled, jalan 2x sehari (`OnCalendar=*-*-* 00,12:00:00`), dan 10 eksekusi
+    terakhir tercatat di jurnal. Sertifikat `coder.sam.university` berlaku sampai 11 Des 2026 dan
+    sertifikat yang disajikan nginx identik dengan yang ada di disk; uji kering untuk sertifikat ini
+    BERHASIL. Laporan lengkap: `/workspace/LAPORAN_BUTIR20_CERTBOT.md`.
+20b. [TEKNIS — butuh izin Bapak] Temuan dari pemeriksaan butir 20 (belum ada yang diubah):
+    (a) `certbot renew --dry-run` keluar dengan kode 1 karena 5 sertifikat proyek LAIN gagal
+    (cover, inventory, kampus, rena, sam.university — DNS NXDOMAIN / tantangan 404). Sertifikat itu
+    bukan milik platform ini, jadi kami tidak menyentuhnya; perlu diteruskan ke pemiliknya.
+    (b) Di `/etc/nginx/sites-enabled/` ada symlink sisa `coder.sam.university.conf.bak_20260920_091515`
+    yang menunjuk berkas yang SAMA, sehingga nginx mencatat "conflicting server name" dan memuat
+    blok server itu dua kali. Belum berbahaya (isinya identik), tetapi sebaiknya dihapus.
+    (c) Tidak ada hook pasca-pembaruan untuk memuat ulang nginx; sertifikat coder memakai installer
+    nginx sehingga reload dijalankan certbot sendiri saat benar-benar memperbarui.
 21. [SELESAI] Berkas uji sekarang diperiksa tipe: `tsconfig.test.json` (akar `coder-platform`, memuat
     `apps/api/test/**/*.ts`) dijalankan lewat `npx tsc -p tsconfig.test.json` sebagai gerbang PERTAMA
     `apps/api/test/run-all.cjs`; semua galat tipe suite lama sudah diperbaiki, bukan dimatikan.

@@ -4,6 +4,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentEngine, EngineEvent, EngineRunRequest, EngineUsage } from "./engine-adapter.js";
 import { estimateCostMicros } from "./model-prices.js";
+import { vendorCostMicros } from "./vendor-prices.js";
 
 type Active = { process: ChildProcessWithoutNullStreams; cancel: () => void };
 
@@ -89,7 +90,11 @@ function extractUsage(event: any, fallbackModel?: string): EngineUsage | null {
   const model = typeof lastAssistant?.model === "string" ? lastAssistant.model : (typeof reported.model === "string" ? reported.model : fallbackModel);
   const costFromUsage = typeof reported.cost === "object" && reported.cost !== null ? pick(reported.cost, ["total"]) : reported.cost;
   const reportedMicros = typeof reported.costMicros === "number" ? reported.costMicros : typeof costFromUsage === "number" && costFromUsage > 0 ? Math.round(costFromUsage * 1_000_000) : undefined;
-  const costMicros = reportedMicros ?? estimateCostMicros(model, { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }) ?? undefined;
+  // Butir 19: harga resmi vendor didahulukan atas katalog mesin, karena katalog itulah yang
+  // membuat `cost_micros` lebih kecil daripada tagihan DeepSeek yang sebenarnya. Katalog tetap
+  // dipakai untuk model yang tidak punya koreksi vendor.
+  const vendorCost = vendorCostMicros(model, { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens });
+  const costMicros = reportedMicros ?? vendorCost?.micros ?? estimateCostMicros(model, { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }) ?? undefined;
   return { raw: reported, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, costMicros, model, estimated: false };
 }
 

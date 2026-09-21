@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 19 Sep 2026 (versi **0.20.1 LIVE** di server Austria sejak 19 Sep 2026 12:38 UTC — isi v0.20.0 plus perbaikan dashboard butir 41. Deploy dan smoke produksi sudah dijalankan: **smoke 199 lulus, 0 gagal**; uji UI peramban **33/33 lulus**. Rinciannya di bagian "Deploy & operasi produksi v0.20.1".)
+Terakhir diperbarui: 21 Sep 2026 (versi **0.20.1 LIVE** di server Austria; **v0.20.2 sudah selesai dan teruji di lokal, belum di-deploy** karena deploy/restart produksi menunggu izin Bapak. Butir 15b, 19, dan 20 selesai di kode; rinciannya di bagian "v0.20.2" di bawah.)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -14,6 +14,27 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - DNS `coblai.com` belum dipasang (MX/SPF/DKIM); rinciannya di `docs/DNS_COBLAI_COM.md`.
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
+
+## v0.20.2 (21 Sep 2026) — butir 15b, 19, 20 — SELESAI DI KODE, BELUM DEPLOY
+
+- **Butir 15b — sapuan `rate_limit_hits` pindah ke pekerja terjadwal.** Jenis pekerjaan baru
+  `ratelimit.sweep` (`jobs.ts`) dijadwalkan tiap 5 menit; sapuan malas di proses web diatur
+  `RATE_LIMIT_SWEEP_IN_WEB` (bawaan `true`, produksi `false`). Uji `apps/api/test/ratelimit-sweep.e2e.ts`
+  → **22/22 lulus, 0 skip**.
+- **Butir 19 — harga resmi DeepSeek + rekonsiliasi biaya.** Berkas `apps/api/src/vendor-prices.ts`
+  memuat harga resmi berstempel tanggal (`deepseek-flash` 0,15/0,60/0,003 dan `deepseek-v4-pro`
+  0,66/1,98 per 1 juta token) plus tarif puncak dua kali pada 01:00–04:00 dan 06:00–10:00 UTC hari
+  kerja. Urutan sumber harga: harga sendiri → harga resmi vendor → katalog mesin. `prime-rpc-engine.ts`
+  dan `pricing.ts` memakai lapisan ini; `model-prices.ts` tidak diubah (berkas generated).
+  Rekonsiliasi produksi (baca saja, 13–19 Sep): `run_usage` tercatat 5.152 mikrodolar vs seharusnya
+  8.023 (+55,7%); `user_usage` 11.501 vs 15.979 (+38,9%); gabungan 16.653 vs 24.002 (+44,1%).
+  Rute baru `GET /api/v1/admin/pricing/reconcile` + kartu "Rekonsiliasi biaya AI" di halaman Konsol
+  Harga. Uji `pricing.e2e.ts` → **164/164 lulus, 0 skip**.
+- **Butir 20 — timer TLS certbot diperiksa (baca saja).** Timer aktif + enabled, 2x sehari; sertifikat
+  `coder.sam.university` sah sampai 11 Des 2026 dan yang disajikan nginx identik dengan yang di disk;
+  uji kering untuk sertifikat ini berhasil. Temuan yang butuh izin Bapak (5 sertifikat proyek lain
+  gagal uji kering; symlink sisa di `sites-enabled`) dicatat sebagai butir 20b di
+  `docs/DAFTAR_MASALAH_TERTUNDA.md`. Laporan lengkap: `/workspace/LAPORAN_BUTIR20_CERTBOT.md`.
 
 Wave 10 (v0.20.0, 18 Sep 2026) — jawaban butir 21–32D, semuanya di kode dan diuji.
 Status: **LIVE di server Austria** sejak 18 Sep 2026 11:25 UTC. Deploy dan smoke produksi sudah
