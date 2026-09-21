@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 21 Sep 2026 (versi **0.20.2 LIVE** di server Austria sejak 15:16 UTC; deploy dijalankan atas izin Bapak, smoke produksi 202 lulus / 0 gagal. Butir 15b, 19, dan 20 selesai; rincian dan bukti produksinya di bagian "v0.20.2" di bawah.)
+Terakhir diperbarui: 21 Sep 2026 malam (versi **0.20.2 LIVE** di server Austria sejak 15:16 UTC; deploy dijalankan atas izin Bapak, smoke produksi 202 lulus / 0 gagal. Butir 15b, 19, dan 20 selesai. Malam harinya, atas izin Bapak: beres-beres 5 sertifikat domain lain (24 dari 25 uji kering certbot hijau) dan sandi akun uji `smoke.bot` dirotasi. Rincian di bagian "v0.20.2" dan "Beres-beres sertifikat" di bawah.)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -15,7 +15,35 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
 
-## v0.20.2 (21 Sep 2026) — butir 15b, 19, 20 — SELESAI DI KODE, BELUM DEPLOY
+## Beres-beres sertifikat & rotasi sandi akun uji (21 Sep 2026 malam) — atas izin Bapak
+
+- **`cover.sam.university`** (DNS NXDOMAIN = domain mati) → vhost
+  `sites-enabled/cover.sam.university.conf` DIHAPUS dan sertifikatnya DIHAPUS.
+- **`kampus.sam.university`** (DNS NXDOMAIN = domain mati) → symlink sites-enabled +
+  `sites-available/kampus.sam.university.conf` (+ berkas `.bak_20260904_123144`) DIHAPUS; sertifikat DIHAPUS.
+- **`inventory.coblai.com`** → vhost DIHAPUS. Premis awal kami salah (kami kira vhost itu tidak aktif,
+  padahal `grep -r` tidak mengikuti symlink): vhost itu AKTIF dan mengalihkan 301 ke
+  `https://rena.coblai.com`. Akibatnya `https://inventory.coblai.com` kini gagal TLS (disajikan
+  sertifikat default `blog.crossbordermarketplace.com`). Pembaruan sertifikatnya justru kini BERHASIL.
+  Menunggu keputusan Bapak: hidupkan lagi 301-nya atau biarkan mati.
+- **`sam.university`** dan **`rena.coblai.com`** → DIPERBAIKI dengan menambahkan
+  `location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }` ke blok :443. `proxy_pass`
+  (`127.0.0.1:2369`), `root /www/wwwroot/rena.coblai.com`, dan aturan `try_files` TIDAK disentuh.
+  Kedua situs tetap menjawab 200.
+- Gerbang: `nginx -t` OK, `systemctl reload nginx` OK, `/health` 200, tidak ada rujukan sisa untuk nama
+  yang dihapus, `certbot renew --dry-run` → **24 berhasil / 1 gagal** (`geoauthorityengine.com`, proyek
+  lain, tidak disentuh). Sebelum perbaikan: 5 gagal.
+- Cadangan: `/root/backup-nginx-20260921/nginx-letsencrypt-backup.tar.gz` (432 entri, termasuk kunci
+  privat letsencrypt). Laporan rinci: `/workspace/LAPORAN_BUTIR20B_SERTIFIKAT_v2.md`.
+- **Rotasi sandi akun uji `smoke.bot`** (izin Bapak): sandi diganti lewat `POST /api/v1/auth/password`
+  di produksi; sandi lama ditolak 401 sesudahnya, sesi lain diputus (`otherSessionsRevoked=true`).
+  Sesudah rotasi, smoke produksi dijalankan ulang memakai kredensial DARI BERKAS `.env`
+  (`/root/.coblai/smoke.env`, mode 600): **202 lulus, 0 gagal, keluar 0**. Nilai sandi tidak pernah
+  dicetak. Catatan jujur: sandi hasil rotasi PERTAMA sempat tercetak karena skrip dijalankan dengan
+  `bash -x` (trace menampilkan variabel lingkungan); karena itu rotasi diulang sekali lagi dan skrip
+  ber-`-x` dihapus. Pelajaran: jangan pernah memakai `bash -x` pada skrip yang memuat rahasia.
+
+## v0.20.2 (21 Sep 2026) — butir 15b, 19, 20 — SELESAI DI KODE DAN SUDAH LIVE
 
 - **Butir 15b — sapuan `rate_limit_hits` pindah ke pekerja terjadwal.** Jenis pekerjaan baru
   `ratelimit.sweep` (`jobs.ts`) dijadwalkan tiap 5 menit; sapuan malas di proses web diatur

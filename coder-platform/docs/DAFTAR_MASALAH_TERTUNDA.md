@@ -118,25 +118,39 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
     terakhir tercatat di jurnal. Sertifikat `coder.sam.university` berlaku sampai 11 Des 2026 dan
     sertifikat yang disajikan nginx identik dengan yang ada di disk; uji kering untuk sertifikat ini
     BERHASIL. Laporan lengkap: `/workspace/LAPORAN_BUTIR20_CERTBOT.md`.
-20b. [SEBAGIAN SELESAI 21 Sep 2026 — sisanya menunggu keputusan Bapak] Temuan pemeriksaan butir 20:
-    (a) `certbot renew --dry-run` (21 Sep 2026 13:37-13:40 UTC) keluar kode 1 karena 5 sertifikat MILIK
-    PROYEK LAIN gagal. Kelimanya bukan milik platform ini dan tidak kami sentuh:
-        - `cover.sam.university` — sah s/d 7 Des 2026. Gagal: DNS NXDOMAIN (tidak ada catatan A/AAAA),
-          jadi tantangan HTTP-01 mustahil. Vhost-nya masih ada di sites-enabled; domain hidup yang
-          mirip: `mycover.sam.university`. Dugaan: sisa setelah domain diganti nama.
-        - `kampus.sam.university` — sah s/d 3 Des 2026. Gagal: DNS NXDOMAIN. Vhost masih ada dan
-          meneruskan ke `127.0.0.1:4110`; domain hidup yang mirip: `mycampus.sam.university`.
-        - `sam.university` — sah s/d 29 Nov 2026. DNS benar (152.53.67.115), tetapi tantangan ACME
-          dijawab **404** karena blok :443 tidak melayani `/.well-known/acme-challenge/` — lokasi itu
-          hanya ada di blok :80, sementara permintaan dialihkan 301 ke HTTPS lebih dulu.
-        - `inventory.coblai.com` — sah s/d 2 Des 2026. DNS benar, tetapi berkasnya hanya ada di
-          `sites-available` (tidak diaktifkan) dan isinya hanya 301 ke `https://rena.coblai.com`,
-          sehingga tantangan ACME tidak pernah dilayani.
-        - `rena.coblai.com` — sah s/d 2 Des 2026. DNS benar; gagal 404 dengan pola sama seperti
-          `sam.university` (lokasi acme-challenge hanya di blok :80, certbot mengikuti pengalihan ke HTTPS).
-      Catatan: sertifikat proyek ini (`coder.sam.university`) uji keringnya BERHASIL, jadi kegagalan
-      itu tidak menghambat pembaruan kita. Keputusan yang diminta: teruskan ke pemilik proyeknya, atau
-      kami perbaiki vhost-vhost itu (semuanya di luar platform ini, jadi menunggu perintah).
+20b. [SELESAI 21 Sep 2026 malam — 1 poin kecil menunggu keputusan Bapak] Beres-beres sertifikat:
+    (a) [SELESAI 21 Sep 2026 malam, atas izin Bapak] Kelima domain diperiksa ulang lalu dibereskan.
+    Bukti rinci: `/workspace/LAPORAN_BUTIR20B_SERTIFIKAT_v2.md`.
+        - `cover.sam.university` (DNS NXDOMAIN = sudah mati) → vhost
+          `/etc/nginx/sites-enabled/cover.sam.university.conf` DIHAPUS dan sertifikatnya DIHAPUS.
+        - `kampus.sam.university` (DNS NXDOMAIN = sudah mati) → symlink sites-enabled + berkas
+          `sites-available/kampus.sam.university.conf` (+ tambahan `.bak_20260904_123144`) DIHAPUS;
+          sertifikatnya DIHAPUS.
+        - `inventory.coblai.com` → vhost DIHAPUS (symlink sites-enabled + berkas sites-available).
+          CATATAN JUJUR: premis awal kami SALAH — kami kira vhost itu tidak aktif, karena `grep -r`
+          tidak mengikuti symlink. Nyatanya vhost itu AKTIF dan mengalihkan 301 ke
+          `https://rena.coblai.com`. Akibatnya sekarang `https://inventory.coblai.com` gagal TLS
+          (nginx menyajikan sertifikat default `blog.crossbordermarketplace.com` yang tidak cocok
+          dengan nama itu); lewat :80 dijawab server default. Pembaruan sertifikat domain itu justru
+          kini BERHASIL. Menunggu keputusan Bapak: hidupkan lagi 301-nya (dengan lokasi acme-challenge
+          ditambahkan) atau biarkan mati.
+        - `sam.university` → DIPERBAIKI. Lokasi `/.well-known/acme-challenge/` ditambahkan ke blok :443:
+          `location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }`. `proxy_pass` ke
+          `127.0.0.1:2369` tidak disentuh; situs tetap 200.
+        - `rena.coblai.com` → DIPERBAIKI dengan pola yang sama. `root /www/wwwroot/rena.coblai.com`
+          dan aturan `try_files` tidak disentuh; situs tetap 200.
+      Hasil `certbot renew --dry-run` sesudah perbaikan: **24 pembaruan simulasi BERHASIL** (termasuk
+      `coder.sam.university`, `sam.university`, `rena.coblai.com`, `inventory.coblai.com`) dan
+      **1 GAGAL**: `geoauthorityengine.com` (proyek lain) dengan galat `Unable to update challenge ::
+      authorization must be pending`. Domain itu bukan milik platform ini dan termasuk yang Bapak
+      larang disentuh, jadi dibiarkan dan diteruskan sebagai laporan. Sertifikat tersisa di server: 25.
+      Cadangan sebelum perubahan: `/root/backup-nginx-20260921/nginx-letsencrypt-backup.tar.gz`
+      (sites-enabled + sites-available + seluruh /etc/letsencrypt termasuk kunci privat; 432 entri).
+      `nginx -t` OK dan `systemctl reload nginx` OK sesudah semua perubahan; `/health` = 200.
+      Catatan bukti trafik: nginx ini tidak punya `log_format` khusus, jadi log akses tidak memuat
+      kolom nama domain — hitungan trafik per domain tidak bisa diberikan dan tidak kami karang.
+      Bukti sahih untuk cover/kampus adalah DNS NXDOMAIN: nama yang tidak bisa di-resolve mustahil
+      menerima trafik HTTP.
     (b) [SELESAI 21 Sep 2026, atas izin Bapak] Symlink sisa `coder.sam.university.conf.bak_20260920_091515`
     di `/etc/nginx/sites-enabled/` SUDAH DIHAPUS. Sebelum dihapus dibuktikan dulu bahwa symlink itu
     menunjuk berkas yang sama dengan `coder.sam.university.conf`, sehingga blok server itu dimuat dua kali.
