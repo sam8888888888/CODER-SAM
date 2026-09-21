@@ -118,15 +118,35 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
     terakhir tercatat di jurnal. Sertifikat `coder.sam.university` berlaku sampai 11 Des 2026 dan
     sertifikat yang disajikan nginx identik dengan yang ada di disk; uji kering untuk sertifikat ini
     BERHASIL. Laporan lengkap: `/workspace/LAPORAN_BUTIR20_CERTBOT.md`.
-20b. [TEKNIS — butuh izin Bapak] Temuan dari pemeriksaan butir 20 (belum ada yang diubah):
-    (a) `certbot renew --dry-run` keluar dengan kode 1 karena 5 sertifikat proyek LAIN gagal
-    (cover, inventory, kampus, rena, sam.university — DNS NXDOMAIN / tantangan 404). Sertifikat itu
-    bukan milik platform ini, jadi kami tidak menyentuhnya; perlu diteruskan ke pemiliknya.
-    (b) Di `/etc/nginx/sites-enabled/` ada symlink sisa `coder.sam.university.conf.bak_20260920_091515`
-    yang menunjuk berkas yang SAMA, sehingga nginx mencatat "conflicting server name" dan memuat
-    blok server itu dua kali. Belum berbahaya (isinya identik), tetapi sebaiknya dihapus.
-    (c) Tidak ada hook pasca-pembaruan untuk memuat ulang nginx; sertifikat coder memakai installer
-    nginx sehingga reload dijalankan certbot sendiri saat benar-benar memperbarui.
+20b. [SEBAGIAN SELESAI 21 Sep 2026 — sisanya menunggu keputusan Bapak] Temuan pemeriksaan butir 20:
+    (a) `certbot renew --dry-run` (21 Sep 2026 13:37-13:40 UTC) keluar kode 1 karena 5 sertifikat MILIK
+    PROYEK LAIN gagal. Kelimanya bukan milik platform ini dan tidak kami sentuh:
+        - `cover.sam.university` — sah s/d 7 Des 2026. Gagal: DNS NXDOMAIN (tidak ada catatan A/AAAA),
+          jadi tantangan HTTP-01 mustahil. Vhost-nya masih ada di sites-enabled; domain hidup yang
+          mirip: `mycover.sam.university`. Dugaan: sisa setelah domain diganti nama.
+        - `kampus.sam.university` — sah s/d 3 Des 2026. Gagal: DNS NXDOMAIN. Vhost masih ada dan
+          meneruskan ke `127.0.0.1:4110`; domain hidup yang mirip: `mycampus.sam.university`.
+        - `sam.university` — sah s/d 29 Nov 2026. DNS benar (152.53.67.115), tetapi tantangan ACME
+          dijawab **404** karena blok :443 tidak melayani `/.well-known/acme-challenge/` — lokasi itu
+          hanya ada di blok :80, sementara permintaan dialihkan 301 ke HTTPS lebih dulu.
+        - `inventory.coblai.com` — sah s/d 2 Des 2026. DNS benar, tetapi berkasnya hanya ada di
+          `sites-available` (tidak diaktifkan) dan isinya hanya 301 ke `https://rena.coblai.com`,
+          sehingga tantangan ACME tidak pernah dilayani.
+        - `rena.coblai.com` — sah s/d 2 Des 2026. DNS benar; gagal 404 dengan pola sama seperti
+          `sam.university` (lokasi acme-challenge hanya di blok :80, certbot mengikuti pengalihan ke HTTPS).
+      Catatan: sertifikat proyek ini (`coder.sam.university`) uji keringnya BERHASIL, jadi kegagalan
+      itu tidak menghambat pembaruan kita. Keputusan yang diminta: teruskan ke pemilik proyeknya, atau
+      kami perbaiki vhost-vhost itu (semuanya di luar platform ini, jadi menunggu perintah).
+    (b) [SELESAI 21 Sep 2026, atas izin Bapak] Symlink sisa `coder.sam.university.conf.bak_20260920_091515`
+    di `/etc/nginx/sites-enabled/` SUDAH DIHAPUS. Sebelum dihapus dibuktikan dulu bahwa symlink itu
+    menunjuk berkas yang sama dengan `coder.sam.university.conf`, sehingga blok server itu dimuat dua kali.
+    Sesudah dihapus: `nginx -t` OK, `systemctl reload nginx` OK, jumlah `server_name coder.sam.university`
+    di `nginx -T` turun dari 4 menjadi 2, dan peringatan "conflicting server name coder.sam.university"
+    hilang. Kesehatan `https://coder.sam.university/health` = 200 sesudah reload. Sisa 8 peringatan
+    "conflicting server name" di server ini milik proyek lain (`crossbordermarketplace.com`,
+    `geoauthorityengine.com`) dan tidak kami sentuh.
+    (c) Tidak ada hook pasca-pembaruan untuk memuat ulang nginx; untuk sertifikat coder hal itu tidak
+    perlu karena certbot memakai installer nginx dan menjalankan reload sendiri.
 21. [SELESAI] Berkas uji sekarang diperiksa tipe: `tsconfig.test.json` (akar `coder-platform`, memuat
     `apps/api/test/**/*.ts`) dijalankan lewat `npx tsc -p tsconfig.test.json` sebagai gerbang PERTAMA
     `apps/api/test/run-all.cjs`; semua galat tipe suite lama sudah diperbaiki, bukan dimatikan.

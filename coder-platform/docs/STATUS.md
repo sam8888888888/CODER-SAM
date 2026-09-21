@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 21 Sep 2026 (versi **0.20.1 LIVE** di server Austria; **v0.20.2 sudah selesai dan teruji di lokal, belum di-deploy** karena deploy/restart produksi menunggu izin Bapak. Butir 15b, 19, dan 20 selesai di kode; rinciannya di bagian "v0.20.2" di bawah.)
+Terakhir diperbarui: 21 Sep 2026 (versi **0.20.2 LIVE** di server Austria sejak 15:16 UTC; deploy dijalankan atas izin Bapak, smoke produksi 202 lulus / 0 gagal. Butir 15b, 19, dan 20 selesai; rincian dan bukti produksinya di bagian "v0.20.2" di bawah.)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -35,6 +35,29 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
   uji kering untuk sertifikat ini berhasil. Temuan yang butuh izin Bapak (5 sertifikat proyek lain
   gagal uji kering; symlink sisa di `sites-enabled`) dicatat sebagai butir 20b di
   `docs/DAFTAR_MASALAH_TERTUNDA.md`. Laporan lengkap: `/workspace/LAPORAN_BUTIR20_CERTBOT.md`.
+
+### Deploy & operasi produksi v0.20.2 (21 Sep 2026)
+
+- Paket dibangun dengan `deploy/buat-paket.sh 0.20.2` → `PAKET_OK` (206 entri, 844K,
+  sha256 `aa99994b...`). Percobaan pertama GAGAL (`DEPLOY_ABORTED deploy/env-sync.sh + deploy/env.keys.txt
+  tidak ada di paket (butir 32)`) karena paket dibuat dengan `tar -czf` tangan; sekarang
+  `deploy/buat-paket.sh` wajib dipakai karena menyalin `deploy/env-sync.sh` + `deploy/env.keys.txt`
+  ke dalam paket.
+- `deploy/deploy-austria.sh 0.20.2` keluar 0 pukul 15:13-15:16 UTC, dengan bukti di log:
+  `REHEARSAL SCHEMA_VERSION_AFTER_MIGRATION 18 EXPECTED 18`, `REHEARSAL ROW_COUNTS_PRESERVED true`,
+  `REHEARSAL MIGRATION_REHEARSAL_OK`, `ZERO_DOWNTIME_DONE hijau dihentikan, biru melayani 3402`,
+  container pekerja dibuat ulang, dan `DEPLOY_OK coder-platform-app:0.20.2`.
+- Sesudah deploy: `coder-platform-app:0.20.2` (healthy) + `coder-platform-worker:0.20.2`;
+  `https://coder.sam.university/health` = 200.
+- Smoke produksi: **202 lulus, 0 gagal, 0 lewat**, `PRODUCTION_SMOKE_PASSED`, keluar 0 — termasuk
+  `butir19 the status hub reports the vendor price layer`, `... the recorded versus corrected AI cost`,
+  dan `... the cost reconciliation refuses a normal account`.
+- Bukti butir 15b di produksi: tabel `jobs` memuat baris `kind='ratelimit.sweep'` berstatus `done`
+  setiap 5 menit dengan hasil `{"removed":0,...,"sweepInWeb":false}` → sapuan benar-benar dikerjakan
+  proses pekerja, bukan proses web.
+- Symlink sisa nginx dihapus (izin Bapak 21 Sep 2026): `nginx -t` OK, `systemctl reload nginx` OK,
+  jumlah `server_name coder.sam.university` di `nginx -T` 4 → 2, peringatan "conflicting server name"
+  untuk domain kita hilang, `/health` tetap 200. Rinciannya di butir 20b.
 
 Wave 10 (v0.20.0, 18 Sep 2026) — jawaban butir 21–32D, semuanya di kode dan diuji.
 Status: **LIVE di server Austria** sejak 18 Sep 2026 11:25 UTC. Deploy dan smoke produksi sudah
