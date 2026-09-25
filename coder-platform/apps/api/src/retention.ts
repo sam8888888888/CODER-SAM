@@ -5,7 +5,7 @@ import { config } from "./config.js";
  *  The report always works and never changes anything. Deletion happens only when RETENTION_ENABLED=true
  *  and the caller asks for a real run, so an operator can review the numbers first. */
 
-export type RetentionPolicy = { enabled: boolean; dryRunForced: boolean; auditDays: number; notificationDays: number; runEventDays: number; exportDays: number; webhookDays: number };
+export type RetentionPolicy = { enabled: boolean; dryRunForced: boolean; auditDays: number; notificationDays: number; runEventDays: number; exportDays: number; webhookDays: number; artifactRevisionDays: number; safetyDays: number; errorDays: number; shadowDays: number };
 
 export type RetentionTableReport = { table: string; column: string; cutoff: string; candidates: number; removed: number };
 
@@ -14,6 +14,8 @@ export function retentionPolicy(): RetentionPolicy {
     enabled: config.RETENTION_ENABLED, dryRunForced: config.RETENTION_DRY_RUN, auditDays: config.RETENTION_AUDIT_DAYS,
     notificationDays: config.RETENTION_NOTIFICATION_DAYS, runEventDays: config.RETENTION_RUN_EVENT_DAYS,
     exportDays: config.RETENTION_EXPORT_DAYS, webhookDays: config.RETENTION_WEBHOOK_DAYS,
+    artifactRevisionDays: config.RETENTION_ARTIFACT_REVISION_DAYS, safetyDays: config.RETENTION_SAFETY_DAYS,
+    errorDays: config.RETENTION_ERROR_DAYS, shadowDays: config.RETENTION_SHADOW_DAYS,
   };
 }
 
@@ -29,6 +31,15 @@ const TARGETS: Target[] = [
   // Wave 10 (item 23): the history of a busy hook grows without limit. Only rows that are finished are
   // removed: a delivery that is still waiting, or being retried, is work in progress.
   { table: "webhook_deliveries", column: "created_at", where: "created_at < ? AND status IN ('delivered','failed')", days: (policy) => policy.webhookDays },
+  // Wave 11A (butir 48): revisi artefak adalah riwayat. Batas 20 revisi per artefak berlaku di jalur
+  // penulisan, sedangkan baris yang lebih tua dari batas retensi dibuang di sini.
+  { table: "artifact_revisions", column: "created_at", where: "created_at < ?", days: (policy) => policy.artifactRevisionDays },
+  // Wave 11A (butir 46): kejadian keselamatan adalah jejak, bukan bukti permanen.
+  { table: "safety_events", column: "created_at", where: "created_at < ?", days: (policy) => policy.safetyDays },
+  // Wave 11B (butir 66): laporan galat adalah riwayat operasional, bukan arsip permanen.
+  { table: "error_events", column: "created_at", where: "created_at < ?", days: (policy) => policy.errorDays },
+  // Wave 11B (butir 59): angka shadow hanya berguna sebentar; setelah keputusan diambil, catatannya dibuang.
+  { table: "shadow_measurements", column: "created_at", where: "created_at < ?", days: (policy) => policy.shadowDays },
 ];
 
 /** Wave 8: how long a closed account can still be recovered before its rows are removed. */

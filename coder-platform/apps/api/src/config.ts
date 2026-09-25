@@ -140,6 +140,90 @@ const Env = z.object({
   REFERRAL_MAX_REWARDED_PER_USER: z.coerce.number().int().min(0).default(50),
   // Wave 7: default window (in days) for the admin growth screen when the request names no window.
   GROWTH_WINDOW_DAYS: z.coerce.number().int().min(1).max(365).default(30),
+
+  /**
+   * Wave 11A (butir 43): the master key for secrets kept at rest (AES-256-GCM), 32 bytes in base64.
+   * When it is empty every feature that must store a secret refuses with `503 SECRETS_KEY_MISSING`
+   * instead of writing plain text. It is deliberately optional so an installation without secrets
+   * still starts.
+   */
+  SECRETS_KEY: z.string().optional(),
+  /** Wave 11A (butir 45): the anti prompt-hijack filter in front of the model. */
+  PROMPT_GUARD_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
+  /** Wave 11A (butir 80): the total character budget for injected context (KB, persona, memory, skills). */
+  CONTEXT_BUDGET_CHARS: z.coerce.number().int().min(1000).max(200000).default(12000),
+  /** Wave 11A (butir 79): the Content-Security-Policy header. Turning it off must be a conscious act. */
+  CSP_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
+  /** Wave 11A (butir 48): the write-back ceiling for an artifact edited from the browser. */
+  ARTIFACT_EDIT_MAX_BYTES: z.coerce.number().int().min(1024).default(2 * 1024 * 1024),
+  /** Wave 11A (butir 48): how many revisions one artifact keeps before the oldest is dropped. */
+  ARTIFACT_REVISION_LIMIT: z.coerce.number().int().min(1).max(200).default(20),
+  /** Wave 11A (butir 57): how many times one run may move to a backup model. */
+  ENGINE_FALLBACK_MAX_SWITCHES: z.coerce.number().int().min(0).max(5).default(2),
+  /** Wave 11A (butir 48 & 46): retention windows for the two new history tables. */
+  RETENTION_ARTIFACT_REVISION_DAYS: z.coerce.number().int().min(1).default(30),
+  RETENTION_SAFETY_DAYS: z.coerce.number().int().min(1).default(90),
+
+  /**
+   * Wave 11B (butir 58): the council. Each juror is one real run, so both numbers are ceilings that
+   * keep an accidental "judge everything with ten models" from becoming an unexpected bill.
+   */
+  COUNCIL_MAX_JURORS: z.coerce.number().int().min(1).max(10).default(3),
+  COUNCIL_MAX_PARALLEL: z.coerce.number().int().min(1).max(10).default(2),
+  /** Wave 11B (butir 61): the benchmark ceilings. The question set itself lives in apps/api/benchmark/questions.json. */
+  BENCHMARK_MAX_MODELS: z.coerce.number().int().min(1).max(10).default(3),
+  BENCHMARK_QUESTION_LIMIT: z.coerce.number().int().min(1).max(50).default(10),
+  /**
+   * Wave 11B (butir 59): shadow-first rollout. `off` by default; the admin API may switch it on, but the
+   * answer must stay identical either way — the measurements are estimates, never behaviour.
+   */
+  SHADOW_MODE: z.string().default("off"),
+  /** Wave 11B (butir 66): the admin error report. Retention is its own window, like the other histories. */
+  ERROR_EVENTS_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(true),
+  RETENTION_ERROR_DAYS: z.coerce.number().int().min(1).default(30),
+  RETENTION_SHADOW_DAYS: z.coerce.number().int().min(1).default(30),
+  /** Wave 11B (butir 63): how many automatic continuations one interrupted run may get (the PRD says one). */
+  RESUME_MAX_AUTO_ATTEMPTS: z.coerce.number().int().min(0).max(10).default(1),
+  /** Wave 11B (butir 64): how many personas one import file may carry, and (butir 72) how many schedules one account keeps. */
+  PERSONA_IMPORT_LIMIT: z.coerce.number().int().min(1).max(500).default(50),
+  SCHEDULE_LIMIT: z.coerce.number().int().min(1).max(100).default(10),
+  SCHEDULE_DEFAULT_TIMEZONE: z.string().default("Asia/Jakarta"),
+
+  /**
+   * Wave 11C (butir 68/71): address of the Notion API and the connector worker. The base URL is a
+   * setting, not a constant, so the e2e suites can point it at a local fake upstream.
+   */
+  NOTION_API_BASE: z.string().default("https://api.notion.com/v1"),
+  CONNECTOR_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(15000),
+  CONNECTOR_ALLOWED_HOSTS: z.string().default("hooks.slack.com,discord.com,discordapp.com,api.notion.com"),
+  /** Wave 11C (butir 69/70): outbound bot replies. The webhook secret is per channel, not global. */
+  TELEGRAM_API_BASE: z.string().default("https://api.telegram.org"),
+  TWILIO_API_BASE: z.string().default("https://api.twilio.com"),
+  BOT_REPLY_MAX_CHARS: z.coerce.number().int().min(200).max(20000).default(3500),
+  BOT_GROUP_ENABLED: z.preprocess((value) => value === true || value === "true" || value === "1", z.boolean()).default(false),
+  /**
+   * Wave 11C (butir 69/70): alamat publik tempat Telegram/Twilio mengirim webhook. Kosong berarti
+   * memakai `PUBLIC_BASE_URL`. Dipakai untuk MENAMPILKAN url dan saat mendaftar setWebhook.
+   */
+  BOT_WEBHOOK_BASE_URL: z.string().default(""),
+  BOT_HTTP_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(15000),
+  /** Batas pesan masuk per pengguna per menit; melindungi dari spam balasan dari satu akun. */
+  BOT_INBOUND_PER_MINUTE: z.coerce.number().int().min(1).max(600).default(30),
+  /** Berapa lama handler webhook menunggu run balasan selesai sebelum menjawab "diproses". */
+  BOT_REPLY_WAIT_MS: z.coerce.number().int().min(1000).max(600000).default(60000),
+  /** Wave 11C (butir 81): pairing codes last ten minutes and one chat id belongs to one account. */
+  BOT_LINK_CODE_TTL_MINUTES: z.coerce.number().int().min(1).max(60).default(10),
+  BOT_LINK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(50).default(5),
+  /** Wave 11C (butir 73): a group turn is one run, so the participant count is also a cost ceiling. */
+  GROUP_MAX_PARTICIPANTS: z.coerce.number().int().min(2).max(8).default(4),
+  /** Wave 11C (butir 74): random tail for manual-transfer verification (1..999) and how hard we try. */
+  UNIQUE_AMOUNT_MAX_TRIES: z.coerce.number().int().min(1).max(100).default(20),
+  /** Wave 11C (butir 75): trial coupons. The PRD fixes 24 hours, so this is only the default. */
+  TRIAL_COUPON_HOURS: z.coerce.number().int().min(1).max(720).default(24),
+  /** Wave 11C (butir 76): avatars. No processor available means the upload is refused, never stored raw. */
+  AVATAR_MAX_BYTES: z.coerce.number().int().min(1024).max(20 * 1024 * 1024).default(4 * 1024 * 1024),
+  AVATAR_SIZE: z.coerce.number().int().min(64).max(2048).default(512),
+  AVATAR_DIR: z.string().default("avatars"),
 });
 
 const parsedEnv = Env.parse(process.env);

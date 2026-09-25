@@ -67,6 +67,34 @@ import {
   DEVICE_LABEL_MAX, listDevices, markDeviceVerified, registerDevice, renameDevice, requestDeviceInfo, revokeDevice, setDeviceTrust, type DeviceRow,
 } from "./devices.js";
 import { SEARCH_KINDS, globalSearch, rebuildMessageIndex, searchStats, type SearchKind } from "./search.js";
+import { registerWave11aRoutes } from "./wave11a/index.js";
+import { registerCspRoutes } from "./wave11a/csp.js";
+/** Wave 11B (butir 58-67, 72, 83): dewan juri, shadow, pelajaran, benchmark, timeline, resume, jadwal. */
+import { registerWave11bRoutes } from "./wave11b/index.js";
+import { registerWave11cRoutes } from "./wave11c/index.js";
+import { guardWorkspaceUsage, workspaceGuards, workspaceSpend } from "./workspace-guard.js";
+import { tampilanNominal } from "./wave11c/bayar.js";
+import { registerConnectorJobHandlers } from "./wave11c/connector-job.js";
+// Wave 11B (butir 63/72/83): modul wave11b memakai pengirim run, pemeriksa model, dan aturan matriks
+// perilaku milik server ini — bukan salinannya.
+import { setModelValidator, setRunDispatcher, setThinkingValidator } from "./wave11b/dispatch.js";
+import { resolveSessionPersona } from "./wave11b/behavior-matrix.js";
+import { recordErrorEvent } from "./wave11b/errors.js";
+import { learningBlocks, touchLearnings } from "./wave11b/learnings.js";
+import { recordShadowMeasurements, shadowModeActive } from "./wave11b/shadow.js";
+import { markInterruptedRuns, markRunResumable } from "./wave11b/resume.js";
+import { runDueSchedules } from "./wave11b/schedules.js";
+/** Wave 11A (butir 42/45/46/51/52/80): mode, guard, guardrail, skill, KB, dan pagar konteks. */
+import { agentModeBlocks, conversationAgentMode } from "./wave11a/mode.js";
+import { guardrailBlockFor, guardrailViolations, recordSafetyEvent } from "./wave11a/guardrails.js";
+import { platformKnowledgeBlock } from "./wave11a/knowledge-base.js";
+import { touchUserSkills, userSkillsBlock } from "./wave11a/skills.js";
+import { fallbackModelsFor, isTransientEngineError, MAX_FALLBACK_SWITCHES, runWithModelFallback, validateFallbackModels } from "./wave11a/fallback.js";
+import { buildBudgetPlan, contextBudgetChars, registerContextBudgetRoutes } from "./wave11a/context-budget.js";
+import { detectPromptHijack, hijackMessage, scanPromptHijack } from "./prompt-guard.js";
+/** Wave 11A (butir 48): riwayat revisi artefak. */
+/** Wave 11A (butir 44): sewa rahasia per run (isolasi kredensial antar-sesi). */
+import { acquireRunSecretEnv, releaseRunSecrets } from "./run-secret-vault.js";
 import {
   countSubscriptions, listSubscriptions, publicPushKey, pushConfigured, pushStats, removeSubscription,
   saveSubscription, sendPushToUser,
@@ -156,36 +184,6 @@ function isPlatformAdmin(user: { id: string; email: string }): boolean {
   if (allowed.includes(user.email.toLowerCase())) return true;
   const row = db.prepare("SELECT is_admin FROM users WHERE id=?").get(user.id) as { is_admin?: number } | undefined;
   return Boolean(row?.is_admin);
-}
-
-/** True when a share of the platform (chat runs, workflow steps) may start for a workspace. */
-function workspaceGuards(workspaceId: string) {
-  const row = db.prepare("SELECT id, daily_cost_limit_micros AS daily, monthly_cost_limit_micros AS monthly, runs_per_hour_limit AS perHour FROM workspaces WHERE id=?").get(workspaceId) as { id: string; daily: number | null; monthly: number | null; perHour: number | null } | undefined;
-  return {
-    daily: row?.daily ?? config.DEFAULT_DAILY_COST_LIMIT_MICROS,
-    monthly: row?.monthly ?? config.DEFAULT_MONTHLY_COST_LIMIT_MICROS,
-    perHour: row?.perHour ?? config.DEFAULT_RUNS_PER_HOUR_LIMIT,
-  };
-}
-
-/** Cost in micros that a workspace produced today, plus this calendar month. */
-function workspaceSpend(workspaceId: string) {
-  const day = db.prepare(`SELECT COALESCE(SUM(u.cost_micros),0) AS micros, COUNT(*) AS runs FROM run_usage u JOIN projects p ON p.id=u.project_id WHERE p.workspace_id=? AND u.created_at >= ?`).get(workspaceId, new Date(Date.now() - 86_400_000).toISOString()) as { micros: number; runs: number };
-  const month = db.prepare(`SELECT COALESCE(SUM(u.cost_micros),0) AS micros FROM run_usage u JOIN projects p ON p.id=u.project_id WHERE p.workspace_id=? AND u.created_at >= ?`).get(workspaceId, new Date(Date.now() - 30 * 86_400_000).toISOString()) as { micros: number };
-  return { dayMicros: day.micros ?? 0, dayRuns: day.runs ?? 0, monthMicros: month.micros ?? 0 };
-}
-
-/**
- * Guard for a workspace about to start engine work.
- * Returns null when allowed, or { status, error } describing the block.
- */
-function guardWorkspaceUsage(workspaceId: string): { status: number; error: string; detail?: Record<string, unknown> } | null {
-  const limits = workspaceGuards(workspaceId);
-  const spend = workspaceSpend(workspaceId);
-  if (limits.daily > 0 && spend.dayMicros >= limits.daily) return { status: 429, error: "COST_LIMIT_EXCEEDED", detail: { window: "day", limitMicros: limits.daily, usedMicros: spend.dayMicros } };
-  if (limits.monthly > 0 && spend.monthMicros >= limits.monthly) return { status: 429, error: "COST_LIMIT_EXCEEDED", detail: { window: "month", limitMicros: limits.monthly, usedMicros: spend.monthMicros } };
-  if (limits.perHour > 0 && spend.dayRuns >= limits.perHour) return { status: 429, error: "RUN_RATE_LIMITED", detail: { window: "day", limitRuns: limits.perHour, usedRuns: spend.dayRuns } };
-  return null;
 }
 
 /** Stores one notification for a user and, when the workspace is known, for its owners and admins. */
@@ -369,6 +367,13 @@ app.addHook("preHandler", async (request: any, reply) => {
     return reply.code(429).send({ error: "RATE_LIMITED", retryAfter: apiLimiter.retryAfterSeconds(key), message: "Terlalu banyak permintaan dari koneksi ini. Tunggu sebentar lalu coba lagi." });
   }
 });
+
+/**
+ * Wave 11A (butir 79): header keamanan dipasang SEBELUM rute pertama didaftarkan. Fastify menyusun
+ * rangkaian hook sebuah rute saat rute itu didaftarkan, jadi hook yang ditambahkan sesudahnya tidak
+ * akan ikut berjalan. Urutan di sini penting, bukan selera.
+ */
+registerCspRoutes(app);
 
 app.get("/health", async () => ({ status: "ok", service: "coder-api", time: new Date().toISOString() }));
 app.get("/ready", async (_request, reply) => {
@@ -922,7 +927,10 @@ function recordRunUsage(runId: string, projectId: string, prompt: string, answer
   const cacheReadTokens = hasTokens ? Math.round(reported.cacheReadTokens ?? 0) : 0;
   const cacheWriteTokens = hasTokens ? Math.round(reported.cacheWriteTokens ?? 0) : 0;
   const totalTokens = typeof reported?.totalTokens === "number" ? Math.round(reported.totalTokens) : inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
-  const model = typeof reported?.model === "string" ? reported.model : (config.PRIME_AGENT_MODEL ?? null);
+  // Wave 11A (butir 57): biaya memakai model yang benar-benar dipakai; baris run adalah acuannya,
+  // sehingga run yang berpindah ke model cadangan tetap ditagih dengan harga model nyata itu.
+  const runModel = (db.prepare("SELECT model FROM runs WHERE id=?").get(runId) as { model?: string } | undefined)?.model ?? null;
+  const model = typeof reported?.model === "string" ? reported.model : (runModel ?? config.PRIME_AGENT_MODEL ?? null);
   // Cost is only reported when the engine sent real tokens; the price table resolves the rest.
   // The engine number and the catalogue are upstream cost (cost of goods); the billed amount is
   // that cost times the owner markup, stored in its own column (Wave 9, item 19).
@@ -952,38 +960,84 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
     const thinking = isThinkingLevel(engineOptions?.thinking) ? String(engineOptions?.thinking)
       : isThinkingLevel(settings?.thinking_level) ? String(settings?.thinking_level) : undefined;
     const personaId = engineOptions?.personaId ?? conversationPersonaId(conversationId);
-    const appendSystem = userId ? systemBlocksFor(userId, personaId, conversationId ?? null) : [];
+    // Wave 11A (butir 80): sisipan konteks memakai pagar dan urutan prioritas, bukan ditumpuk bebas.
+    const context = userId ? buildSystemBlocks(userId, personaId, conversationId ?? null) : null;
+    const appendSystem = context?.blocks ?? [];
     const tools = parseToolsAllow(settings?.tools_allow);
     const autonomous = engineOptions?.autonomous ?? Boolean(settings?.autonomous_default);
     db.prepare("UPDATE runs SET thinking_level=?, persona_id=?, autonomous=?, prompt_chars=?, append_system_chars=? WHERE id=?")
       .run(thinking ?? null, personaId ?? null, autonomous ? 1 : 0, prompt.length, appendSystem.join("").length, runId);
-    let usage: any = null;
-    for await (const event of engine.run({
-      runId,
-      sessionId: conversationId ? engineSessionFor(conversationId) : runId,
-      prompt: withKnowledge(prompt, knowledge),
-      model: model || config.PRIME_AGENT_MODEL,
-      provider: model ? providerForModel(model) : config.PRIME_AGENT_PROVIDER,
-      thinking,
-      appendSystem,
-      tools,
-      autonomous: autonomous ? { maxTurns: settings?.autonomous_max_turns ?? 6, maxTokens: settings?.autonomous_max_tokens ?? 40000 } : undefined,
-    })) {
-      if (event.type !== "completed") publishRunEvent(runId, event.type, event.data);
-      if (event.type === "text") text += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
-      if (event.type === "completed") usage = (event.data as { usage?: unknown })?.usage ?? null;
-      if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
+    // Wave 11B (butir 59): mode bayangan hanya MENCATAT perkiraan ukuran konteks. Pencatatannya
+    // gagal-aman dan tidak menyentuh `appendSystem`, jadi jawaban tetap identik saat mode mati
+    // maupun nyala — yang bertambah hanya catatannya.
+    if (userId && shadowModeActive()) recordShadowMeasurements({ userId, runId, promptChars: prompt.length, contextChars: appendSystem.join("").length });
+    if (userId && context && context.dropped.length) {
+      // Pemotongan dilaporkan apa adanya: berapa karakter dan bagian mana yang tidak dikirim.
+      recordAudit(null, userId, "context_budget.trimmed", { runId, budgetChars: context.budgetChars, totalChars: context.totalChars, keptChars: context.keptChars, dropped: context.dropped });
     }
+    if (userId && context?.skillIds.length) touchUserSkills(userId, context.skillIds);
+    if (userId && context?.learningIds.length) touchLearnings(userId, context.learningIds);
+    let usage: any = null;
+    // Wave 11A (butir 44): rahasia milik pengguna ini disewa HANYA untuk run ini, diberikan ke proses
+    // anak lewat env, dan dilepas di `finally` sehingga run yang gagal pun tidak meninggalkan sewa.
+    const secretEnv = userId ? await acquireRunSecretEnv(userId, runId) : {};
+    const secretEnvKeys = Object.keys(secretEnv);
+    // Wave 11A (butir 57): model cadangan dipakai hanya saat mesin gagal sementara.
+    const fallbackModels = userId ? fallbackModelsFor(userId) : [];
+    const primaryModel = model || config.PRIME_AGENT_MODEL || "default";
+    let outcome;
+    try {
+      outcome = await runWithModelFallback({
+        primary: primaryModel,
+        fallbacks: fallbackModels,
+        maxSwitches: Math.min(config.ENGINE_FALLBACK_MAX_SWITCHES, MAX_FALLBACK_SWITCHES),
+        consume: async (attempt) => {
+          let attemptText = "";
+          let attemptUsage: unknown = null;
+          for await (const event of engine.run({
+            runId,
+            sessionId: conversationId ? engineSessionFor(conversationId) : runId,
+            prompt: withKnowledge(prompt, knowledge),
+            model: attempt,
+            provider: providerForModel(attempt),
+            thinking,
+            appendSystem,
+            tools,
+            autonomous: autonomous ? { maxTurns: settings?.autonomous_max_turns ?? 6, maxTokens: settings?.autonomous_max_tokens ?? 40000 } : undefined,
+            env: secretEnvKeys.length ? secretEnv : undefined,
+          })) {
+            if (event.type !== "completed") publishRunEvent(runId, event.type, event.data);
+            if (event.type === "text") attemptText += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+            if (event.type === "completed") attemptUsage = (event.data as { usage?: unknown })?.usage ?? null;
+            if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
+          }
+          return { text: attemptText, usage: attemptUsage };
+        },
+        onFallback: (dari, ke, alasan) => {
+          // Jejak perpindahan model: kolom `runs` + satu event run + catatan audit.
+          db.prepare("UPDATE runs SET fallback_from=COALESCE(fallback_from,?), fallback_count=fallback_count+1 WHERE id=?").run(dari, runId);
+          publishRunEvent(runId, "model_fallback", { dari, ke, alasan: alasan.slice(0, 200) });
+          recordAudit(null, userId ?? null, "run.model_fallback", { runId, dari, ke });
+        },
+      });
+    } finally {
+      releaseRunSecrets(runId);
+    }
+    text = outcome.text;
+    usage = outcome.usage;
+    const usedModel = outcome.model;
+    // Model yang BENAR-BENAR dipakai dicatat, supaya biaya tidak dihitung dengan model utama.
+    if (usedModel !== primaryModel) db.prepare("UPDATE runs SET model=? WHERE id=?").run(usedModel, runId);
     recordRunUsage(runId, projectId, prompt, text, usage);
     db.prepare("UPDATE runs SET status='completed', result=?, finished_at=? WHERE id=?").run(text || null, new Date().toISOString(), runId);
     // Wave 10 (item 24): the run is finished, so its token reservation is returned to the day's budget.
     releaseRunTokens(runId);
     publishRunEvent(runId, "completed", { result: text });
     // Wave 6: tell registered webhooks. The delivery is queued, so a slow receiver never delays the run.
-    emitProjectEvent(projectId, "run.completed", { runId, conversationId: conversationId ?? null, model: model ?? null, answerChars: text.length });
+    emitProjectEvent(projectId, "run.completed", { runId, conversationId: conversationId ?? null, model: usedModel, answerChars: text.length });
     // Wave 7: growth accounting and the referral reward. The reward is paid here and only here, so an
     // invitation only pays out after the invited account really finished a run.
-    recordGrowthEvent("run_completed", { userId: userId ?? null, props: { runId, projectId, model: model ?? null, answerChars: text.length } });
+    recordGrowthEvent("run_completed", { userId: userId ?? null, props: { runId, projectId, model: usedModel, answerChars: text.length } });
     if (userId) {
       const qualified = qualifyReferralForRun(userId);
       if (qualified.status === "rewarded") {
@@ -1050,7 +1104,9 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
   if (model && !isKnownModel(model)) return reply.code(400).send({ error: "UNKNOWN_MODEL" });
   const thinking = request.body?.thinking?.trim() || undefined;
   if (thinking && !isThinkingLevel(thinking)) return reply.code(400).send({ error: "INVALID_THINKING_LEVEL", allowed: THINKING_LEVELS });
-  const personaId = request.body?.personaId?.trim() || undefined;
+  // Wave 11B (butir 83 ③): persona yang diminta satu sesi belum tentu persona percakapan. Keputusan
+  // dan jejak auditnya diambil sesudah percakapan diketahui (lihat `resolveSessionPersona` di bawah).
+  const personaDiminta = request.body?.personaId?.trim() || undefined;
   const autonomous = Boolean(request.body?.autonomous);
 
   // Attachments arrive as base64. They are validated and written to disk before the transaction,
@@ -1080,11 +1136,41 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
   const conversation = db.prepare("SELECT c.id, c.project_id AS projectId, m.role AS role FROM conversations c JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE c.id=? AND m.user_id=?").get(request.params.conversationId, request.user!.id) as { id: string; projectId: string; role: string } | undefined;
   if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
   if (conversation.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY" });
+  // Wave 11B (butir 83 ③): persona sesi menang atas persona percakapan, tetapi penggantiannya dicatat
+  // di jejak audit. Bila tidak ada penggantian, hasilnya sama seperti sebelumnya.
+  const personaChoice = resolveSessionPersona({
+    userId: request.user!.id, conversationId: conversation.id, sessionPersonaId: personaDiminta ?? null, sumber: "pesan",
+  });
+  const personaId = personaChoice.personaId ?? undefined;
   // Token quota guard: the tier limits how many tokens a customer may spend.
   const quotaBlock = quotaGuard(request.user!.id, "");
   if (quotaBlock) {
     notify(null, request.user!.id, "quota", quotaBlock.error === "DAILY_TOKEN_QUOTA_EXCEEDED" ? "Kuota harian habis" : "Kuota bulanan habis", String((quotaBlock.detail as any)?.message ?? "Kuota token paket Anda habis."), "/");
     return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
+  }
+
+  // Wave 11A (butir 45): filter anti prompt-hijack diperiksa SEBELUM run dibuat, sehingga pesan yang
+  // menyerang tidak pernah sampai ke mesin, tidak masuk riwayat, dan tidak menambah biaya.
+  if (config.PROMPT_GUARD_ENABLED) {
+    const hijack = scanPromptHijack(content);
+    if (hijack.blocked) {
+      recordAudit(null, request.user!.id, "prompt_hijack_blocked", { conversationId: conversation.id, pola: hijack.pattern, kategori: hijack.category, kutipan: hijack.snippet, panjangPesan: content.length });
+      return reply.code(400).send({ error: "PROMPT_BLOCKED", message: hijackMessage(hijack.pattern), pola: hijack.pattern, kategori: hijack.category });
+    }
+  }
+  // Wave 11A (butir 46): aturan larangan milik akun. Aksi yang dilarang TIDAK dijalankan, tetapi
+  // percobaannya dicatat supaya pemiliknya melihatnya di halaman Safety.
+  const pelanggaran = guardrailViolations(request.user!.id, content);
+  if (pelanggaran.length) {
+    for (const hit of pelanggaran) {
+      recordSafetyEvent({ userId: request.user!.id, ruleId: hit.rule.id, pattern: hit.pattern, snippet: content });
+      recordAudit(null, request.user!.id, "safety_violation", { conversationId: conversation.id, ruleId: hit.rule.id, judul: hit.rule.title, pola: hit.pattern, kutipan: content.replace(/\s+/g, " ").slice(0, 200) });
+    }
+    return reply.code(400).send({
+      error: "GUARDRAIL_BLOCKED",
+      message: `Permintaan ini dilarang aturan "${pelanggaran[0].rule.title}". Aksi tidak dijalankan.`,
+      aturan: pelanggaran.map((hit) => ({ id: hit.rule.id, title: hit.rule.title, pola: hit.pattern })),
+    });
   }
 
   const runId = randomUUID(); const messageId = randomUUID(); const now = new Date().toISOString();
@@ -1206,6 +1292,26 @@ app.post<{ Params: { projectId: string }; Body: { prompt?: string; model?: strin
   }
   const quotaBlock = quotaGuard(request.user!.id, project.workspaceId);
   if (quotaBlock) return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
+  // Wave 11A (butir 45/46): jalur run langsung (otonom) memakai pengaman yang sama dengan chat.
+  if (config.PROMPT_GUARD_ENABLED) {
+    const hijack = scanPromptHijack(prompt);
+    if (hijack.blocked) {
+      recordAudit(project.workspaceId, request.user!.id, "prompt_hijack_blocked", { projectId: project.id, pola: hijack.pattern, kategori: hijack.category, kutipan: hijack.snippet, panjangPesan: prompt.length });
+      return reply.code(400).send({ error: "PROMPT_BLOCKED", message: hijackMessage(hijack.pattern), pola: hijack.pattern, kategori: hijack.category });
+    }
+  }
+  const pelanggaran = guardrailViolations(request.user!.id, prompt);
+  if (pelanggaran.length) {
+    for (const hit of pelanggaran) {
+      recordSafetyEvent({ userId: request.user!.id, ruleId: hit.rule.id, pattern: hit.pattern, snippet: prompt });
+      recordAudit(project.workspaceId, request.user!.id, "safety_violation", { projectId: project.id, ruleId: hit.rule.id, judul: hit.rule.title, pola: hit.pattern, kutipan: prompt.replace(/\s+/g, " ").slice(0, 200) });
+    }
+    return reply.code(400).send({
+      error: "GUARDRAIL_BLOCKED",
+      message: `Permintaan ini dilarang aturan "${pelanggaran[0].rule.title}". Aksi tidak dijalankan.`,
+      aturan: pelanggaran.map((hit) => ({ id: hit.rule.id, title: hit.rule.title, pola: hit.pattern })),
+    });
+  }
   const id = randomUUID(); const createdAt = new Date().toISOString();
   db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)").run(id, project.id, "queued", prompt, model ?? config.PRIME_AGENT_MODEL, createdAt);
   queueRunJob({ runId: id, projectId: project.id, prompt, model, userId: request.user!.id });
@@ -1228,9 +1334,15 @@ app.get<{ Params: { runId: string } }>("/api/v1/runs/:runId/events", { preHandle
 });
 
 app.get<{ Params: { runId: string } }>("/api/v1/runs/:runId", { preHandler: requireUser }, async (request: any, reply) => {
-  const run = db.prepare("SELECT r.id, r.project_id AS projectId, r.status, r.prompt, r.result, r.model, r.error_code AS errorCode, r.started_at AS startedAt, r.finished_at AS finishedAt, r.created_at AS createdAt FROM runs r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE r.id=? AND m.user_id=?").get(request.params.runId, request.user!.id);
+  const run = db.prepare("SELECT r.id, r.project_id AS projectId, r.status, r.prompt, r.result, r.model, r.error_code AS errorCode, r.fallback_from AS fallbackFrom, r.fallback_count AS fallbackCount, r.started_at AS startedAt, r.finished_at AS finishedAt, r.created_at AS createdAt FROM runs r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE r.id=? AND m.user_id=?").get(request.params.runId, request.user!.id);
   if (!run) return reply.code(404).send({ error: "RUN_NOT_FOUND" });
-  return run;
+  // Wave 11A (butir 46): panel kecil di Riwayat run butuh jejak pelanggaran aturan untuk run ini.
+  // Catatan jujur: pelanggaran dicegat SEBELUM run dibuat (server.ts:1168/1308/3658 tidak mengirim
+  // runId), jadi daftar ini hampir selalu kosong; jejak lengkap per akun ada di GET /api/v1/safety.
+  const violations = db.prepare(`SELECT e.id, e.rule_id AS ruleId, r.title AS judul, r.kind, e.pattern, e.snippet, e.created_at AS createdAt
+    FROM safety_events e LEFT JOIN guardrail_rules r ON r.id=e.rule_id
+    WHERE e.run_id=? AND e.user_id=? ORDER BY e.created_at ASC`).all(request.params.runId, request.user!.id);
+  return { ...run, violations };
 });
 
 app.post<{ Params: { runId: string } }>("/api/v1/runs/:runId/cancel", { preHandler: requireUser }, async (request: any, reply) => {
@@ -1688,7 +1800,9 @@ app.post<{ Params: { projectId: string }; Body: { name?: string; mimeType?: stri
   const id = randomUUID(); const dir = join(config.DATA_DIR, "artifacts", request.params.projectId); await mkdir(dir, { recursive: true }); const storagePath = join(dir, id); await writeFile(storagePath, content, { flag: "wx" });
   const sha256 = createHash("sha256").update(content).digest("hex"); const now = new Date().toISOString();
   db.prepare("INSERT INTO artifacts (id,project_id,run_id,name,mime_type,size_bytes,sha256,storage_path,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(id,request.params.projectId,request.body.runId ?? null,name,mimeType,content.length,sha256,storagePath,now);
-  return reply.code(201).send({ id, projectId: request.params.projectId, runId: request.body.runId ?? null, name, mimeType, sizeBytes: content.length, sha256, createdAt: now });
+  // Wave 11A (butir 48): belum ada revisi saat artefak dibuat. Revisi pertama ditulis oleh PUT,
+  // dan isi lama disalin lebih dulu, jadi tidak ada versi yang hilang.
+  return reply.code(201).send({ id, projectId: request.params.projectId, runId: request.body.runId ?? null, name, mimeType, sizeBytes: content.length, sha256, createdAt: now, revision: 0 });
 });
 
 // ---------------------------------------------------------------- komersial: paket, pesanan, kredit token
@@ -1795,7 +1909,15 @@ app.post<{ Params: { orderId: string }; Body: { filename?: string; contentBase64
 app.get<{ Querystring: { status?: string } }>("/api/v1/admin/orders", { preHandler: requireUser }, async (request: any, reply) => {
   if (!isPlatformAdmin(request.user!)) return reply.code(403).send({ error: "ADMIN_REQUIRED", message: "Hanya admin platform yang boleh membuka daftar pesanan." });
   const status = request.query?.status && ["pending", "paid", "rejected", "cancelled"].includes(request.query.status) ? request.query.status : undefined;
-  const orders = listOrders({ status, limit: 200 }).map((order) => ({ ...order, userEmail: userEmail(order.userId) }));
+  const orders = listOrders({ status, limit: 200 }).map((order) => {
+    // Wave 11C butir 74: admin harus bisa melihat nominal transfer yang harus dicocokkan dengan mutasi bank.
+    const nominal = tampilanNominal(order.id);
+    return {
+      ...order, userEmail: userEmail(order.userId),
+      uniqueAmountIdr: nominal?.uniqueAmountIdr ?? null,
+      nominalBayarIdr: nominal?.nominalBayarIdr ?? order.totalIdr,
+    };
+  });
   return { orders };
 });
 
@@ -2307,8 +2429,9 @@ function isThinkingLevel(value: unknown): boolean { return typeof value === "str
 type AgentSettingsRow = {
   thinking_level: string; auto_compact: number; compact_after_messages: number; tools_allow: string;
   autonomous_default: number; autonomous_max_turns: number; autonomous_max_tokens: number;
+  fallback_models: string;
 };
-const AGENT_SETTINGS_DEFAULTS: AgentSettingsRow = { thinking_level: "medium", auto_compact: 1, compact_after_messages: 24, tools_allow: "", autonomous_default: 0, autonomous_max_turns: 6, autonomous_max_tokens: 40000 };
+const AGENT_SETTINGS_DEFAULTS: AgentSettingsRow = { thinking_level: "medium", auto_compact: 1, compact_after_messages: 24, tools_allow: "", autonomous_default: 0, autonomous_max_turns: 6, autonomous_max_tokens: 40000, fallback_models: "[]" };
 /** Tools allowlist is free text because the engine owns the tool names: "" = engine default, "none" = no tools. */
 function parseToolsAllow(raw: unknown): string[] | undefined {
   const value = String(raw ?? "").trim();
@@ -2318,19 +2441,20 @@ function parseToolsAllow(raw: unknown): string[] | undefined {
 }
 
 function agentSettings(userId: string): AgentSettingsRow {
-  const row = db.prepare("SELECT thinking_level,auto_compact,compact_after_messages,tools_allow,autonomous_default,autonomous_max_turns,autonomous_max_tokens FROM agent_settings WHERE user_id=?").get(userId) as AgentSettingsRow | undefined;
+  const row = db.prepare("SELECT thinking_level,auto_compact,compact_after_messages,tools_allow,autonomous_default,autonomous_max_turns,autonomous_max_tokens,fallback_models FROM agent_settings WHERE user_id=?").get(userId) as AgentSettingsRow | undefined;
   return row ? { ...AGENT_SETTINGS_DEFAULTS, ...row } : { ...AGENT_SETTINGS_DEFAULTS };
 }
 
 function saveAgentSettings(userId: string, patch: Partial<AgentSettingsRow>): AgentSettingsRow {
   const next = { ...agentSettings(userId), ...patch };
-  db.prepare(`INSERT INTO agent_settings (user_id,thinking_level,auto_compact,compact_after_messages,tools_allow,autonomous_default,autonomous_max_turns,autonomous_max_tokens,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?)
+  db.prepare(`INSERT INTO agent_settings (user_id,thinking_level,auto_compact,compact_after_messages,tools_allow,autonomous_default,autonomous_max_turns,autonomous_max_tokens,fallback_models,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(user_id) DO UPDATE SET thinking_level=excluded.thinking_level, auto_compact=excluded.auto_compact,
       compact_after_messages=excluded.compact_after_messages, tools_allow=excluded.tools_allow,
       autonomous_default=excluded.autonomous_default, autonomous_max_turns=excluded.autonomous_max_turns,
-      autonomous_max_tokens=excluded.autonomous_max_tokens, updated_at=excluded.updated_at`)
-    .run(userId, next.thinking_level, next.auto_compact, next.compact_after_messages, next.tools_allow, next.autonomous_default, next.autonomous_max_turns, next.autonomous_max_tokens, new Date().toISOString());
+      autonomous_max_tokens=excluded.autonomous_max_tokens, fallback_models=excluded.fallback_models,
+      updated_at=excluded.updated_at`)
+    .run(userId, next.thinking_level, next.auto_compact, next.compact_after_messages, next.tools_allow, next.autonomous_default, next.autonomous_max_turns, next.autonomous_max_tokens, next.fallback_models ?? "[]", new Date().toISOString());
   return next;
 }
 
@@ -2349,27 +2473,76 @@ function conversationPersonaId(conversationId?: string | null): string | null {
   return row?.personaId ?? null;
 }
 
-/** Extra system prompt blocks: persona, memory bank, and the newest compaction summary. */
-function systemBlocksFor(userId?: string | null, personaId?: string | null, conversationId?: string | null): string[] {
-  const blocks: string[] = [];
+/** Wave 11A (butir 80): satu kandidat sisipan beserta prioritasnya. Prioritas besar dipotong lebih dulu. */
+type ContextCandidate = { name: string; priority: number; text: string };
+
+/**
+ * Wave 11A (butir 42/46/51/52/80): menyusun seluruh sisipan konteks dalam satu tempat.
+ *
+ * Urutan kirim: mode percakapan (butir 42) → Knowledge Base platform (butir 52) → aturan kualitas
+ * akun (butir 46) → persona → memori dipin → skill pengguna (butir 51) → memori lain → ringkasan
+ * percakapan. Pagar konteks (butir 80) memotong dari prioritas terendah, jadi KB dan persona selalu
+ * bertahan lebih lama daripada skill dan memori biasa. Riwayat percakapan pengguna tidak pernah
+ * disusun di sini (mesin memegang sesinya), jadi pagar ini tidak pernah memakan riwayat.
+ */
+function buildSystemBlocks(userId?: string | null, personaId?: string | null, conversationId?: string | null) {
+  const candidates: ContextCandidate[] = [];
+  const skillIds: string[] = [];
+  const learningIds: string[] = [];
+  if (conversationId) {
+    const modeBlocks = agentModeBlocks(conversationId);
+    // Instruksi mode wajib paling awal dan tidak boleh dipotong: ini pengaman, bukan konteks.
+    if (modeBlocks.length) candidates.push({ name: "mode_diskusi", priority: 0, text: modeBlocks.join("\n") });
+  }
+  const knowledge = platformKnowledgeBlock();
+  if (knowledge.block) candidates.push({ name: "knowledge_base", priority: 1, text: knowledge.block });
   if (userId) {
     const persona = personaRow(userId, personaId);
     if (persona) {
       const parts = [`Persona aktif: ${persona.name}.`, String(persona.systemPrompt ?? "").trim()];
       if (String(persona.tone ?? "").trim()) parts.push(`Gaya bicara: ${persona.tone}.`);
       if (persona.language === "id") parts.push("Jawab dalam Bahasa Indonesia yang baku, ringkas, dan jelas.");
-      blocks.push(parts.filter(Boolean).join(" ").slice(0, 4000));
+      candidates.push({ name: "persona", priority: 2, text: parts.filter(Boolean).join(" ").slice(0, 4000) });
     }
-    const memories = db.prepare("SELECT title, body FROM agent_memories WHERE user_id=? AND enabled=1 ORDER BY pinned DESC, updated_at DESC LIMIT 12").all(userId) as { title: string; body: string }[];
-    if (memories.length) {
-      blocks.push(`Bank memori pengguna (pakai bila relevan, jangan dibacakan mentah):\n${memories.map((memory) => `- ${memory.title}: ${String(memory.body).replace(/\s+/g, " ").slice(0, 400)}`).join("\n")}`);
-    }
+    const quality = guardrailBlockFor(userId);
+    if (quality) candidates.push({ name: "guardrail_kualitas", priority: 2, text: quality });
+    // Wave 11B (butir 60): memori biasa dan pelajaran berbagi tabel yang sama, dibedakan oleh `kind`,
+    // supaya menyalakan/mematikan pelajaran tidak mengubah isi bank memori.
+    const memories = db.prepare("SELECT title, body, pinned FROM agent_memories WHERE user_id=? AND enabled=1 AND kind='memory' ORDER BY pinned DESC, updated_at DESC LIMIT 12").all(userId) as { title: string; body: string; pinned: number }[];
+    const asText = (rows: { title: string; body: string }[]) => rows.map((memory) => `- ${memory.title}: ${String(memory.body).replace(/\s+/g, " ").slice(0, 400)}`).join("\n");
+    const pinned = memories.filter((memory) => Boolean(memory.pinned));
+    const others = memories.filter((memory) => !memory.pinned);
+    if (pinned.length) candidates.push({ name: "memori_dipin", priority: 3, text: `Bank memori dipin (WAJIB dipakai bila relevan, jangan dibacakan mentah):\n${asText(pinned)}` });
+    const skills = userSkillsBlock(userId);
+    if (skills.block) candidates.push({ name: "skill_pengguna", priority: 4, text: skills.block });
+    const learnings = learningBlocks(userId);
+    if (learnings.block) candidates.push({ name: "pelajaran_pengguna", priority: 4, text: learnings.block });
+    if (others.length) candidates.push({ name: "memori_lain", priority: 5, text: `Bank memori pengguna (pakai bila relevan, jangan dibacakan mentah):\n${asText(others)}` });
+    for (const skill of skills.skills) skillIds.push(skill.id);
+    for (const learning of learnings.learnings) learningIds.push(learning.id);
   }
   if (conversationId) {
     const summary = db.prepare("SELECT summary FROM conversation_summaries WHERE conversation_id=? ORDER BY created_at DESC LIMIT 1").get(conversationId) as { summary: string } | undefined;
-    if (summary?.summary) blocks.push(`Ringkasan percakapan sebelum pemadatan (pakai sebagai konteks, jangan minta diulang):\n${String(summary.summary).slice(0, 6000)}`);
+    // Prioritas 0: ringkasan adalah riwayat percakapan pengguna, jadi TIDAK PERNAH dipotong untuk
+    // memberi ruang sisipan (butir 80). Sisipan yang dipotong, bukan percakapannya.
+    if (summary?.summary) candidates.push({ name: "ringkasan_percakapan", priority: 0, text: `Ringkasan percakapan sebelum pemadatan (pakai sebagai konteks, jangan minta diulang):\n${String(summary.summary).slice(0, 6000)}` });
   }
-  return blocks;
+  const plan = buildBudgetPlan(candidates.map((candidate) => ({ name: candidate.name, priority: candidate.priority, text: candidate.text })), contextBudgetChars());
+  return {
+    blocks: plan.blocks.map((block) => block.text),
+    plan,
+    skillIds,
+    learningIds,
+    dropped: plan.dropped,
+    budgetChars: plan.budgetChars,
+    totalChars: plan.totalChars,
+    keptChars: plan.keptChars,
+  };
+}
+
+/** Blok sistem untuk satu pengguna; dipakai jalur run dan halaman pratinjau. */
+function systemBlocksFor(userId?: string | null, personaId?: string | null, conversationId?: string | null): string[] {
+  return buildSystemBlocks(userId, personaId, conversationId).blocks;
 }
 
 /** The engine session of a conversation. Compaction replaces it, so the column is the source of truth. */
@@ -2503,6 +2676,8 @@ app.get("/api/v1/agents/settings", { preHandler: requireUser }, async (request: 
   const userId = request.user!.id;
   return {
     settings: agentSettings(userId),
+    fallbackModels: fallbackModelsFor(userId),
+    fallbackHelp: "Model cadangan dipakai berurutan hanya saat galat sementara (429/5xx/timeout), maksimal 2 perpindahan per run.",
     thinkingLevels: THINKING_LEVELS,
     toolsAllowHelp: "Kosong = bawaan mesin. Isi 'none' untuk tanpa alat. Atau daftar nama alat dipisah koma.",
     autonomousHelp: "Mode otonom menjalankan mesin sampai batas langkah/token, bukan sekali jawab.",
@@ -2510,8 +2685,15 @@ app.get("/api/v1/agents/settings", { preHandler: requireUser }, async (request: 
   };
 });
 
-app.patch<{ Body: { thinkingLevel?: string; autoCompact?: boolean; compactAfterMessages?: number; toolsAllow?: string; autonomousDefault?: boolean; autonomousMaxTurns?: number; autonomousMaxTokens?: number } }>("/api/v1/agents/settings", { preHandler: requireUser }, async (request: any, reply) => {
+app.patch<{ Body: { thinkingLevel?: string; autoCompact?: boolean; compactAfterMessages?: number; toolsAllow?: string; autonomousDefault?: boolean; autonomousMaxTurns?: number; autonomousMaxTokens?: number; fallbackModels?: unknown; modelUtama?: string } }>("/api/v1/agents/settings", { preHandler: requireUser }, async (request: any, reply) => {
   const userId = request.user!.id; const body = request.body ?? {}; const patch: Partial<AgentSettingsRow> = {};
+  if (body.fallbackModels !== undefined) {
+    // Wave 11A (butir 57): model cadangan tidak boleh sama dengan model utama, tanpa duplikat, maks 3.
+    const primary = String(body.modelUtama ?? config.PRIME_AGENT_MODEL ?? "").trim() || null;
+    const problem = validateFallbackModels(body.fallbackModels, primary);
+    if (problem) return reply.code(400).send({ error: "INVALID_FALLBACK_MODELS", message: problem });
+    patch.fallback_models = JSON.stringify((body.fallbackModels as unknown[]).map((item) => String(item).trim()).filter(Boolean));
+  }
   if (body.thinkingLevel !== undefined) {
     if (!isThinkingLevel(body.thinkingLevel)) return reply.code(400).send({ error: "INVALID_THINKING_LEVEL", allowed: THINKING_LEVELS });
     patch.thinking_level = String(body.thinkingLevel);
@@ -2586,7 +2768,7 @@ app.get<{ Querystring: { conversationId?: string; personaId?: string } }>("/api/
 // ------------------------------------------------------------
 app.get<{ Querystring: { limit?: string } }>("/api/v1/memories", { preHandler: requireUser }, async (request: any) => {
   const limit = Math.min(Math.max(Number(request.query?.limit ?? 100) || 100, 1), 300);
-  const memories = db.prepare("SELECT id,title,body,tags,pinned,enabled,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM agent_memories WHERE user_id=? ORDER BY pinned DESC, updated_at DESC LIMIT ?").all(request.user!.id, limit);
+  const memories = db.prepare("SELECT id,title,body,tags,pinned,enabled,use_count AS useCount,created_at AS createdAt,updated_at AS updatedAt FROM agent_memories WHERE user_id=? AND kind='memory' ORDER BY pinned DESC, updated_at DESC LIMIT ?").all(request.user!.id, limit);
   return { memories };
 });
 
@@ -2601,7 +2783,7 @@ app.post<{ Body: { title?: string; body?: string; tags?: string; pinned?: boolea
 });
 
 app.patch<{ Params: { memoryId: string }; Body: { title?: string; body?: string; tags?: string; pinned?: boolean; enabled?: boolean } }>("/api/v1/memories/:memoryId", { preHandler: requireUser }, async (request: any, reply) => {
-  const existing = db.prepare("SELECT id,user_id AS userId FROM agent_memories WHERE id=?").get(request.params.memoryId) as { id: string; userId: string } | undefined;
+  const existing = db.prepare("SELECT id,user_id AS userId FROM agent_memories WHERE id=? AND kind='memory'").get(request.params.memoryId) as { id: string; userId: string } | undefined;
   if (!existing || existing.userId !== request.user!.id) return reply.code(404).send({ error: "MEMORY_NOT_FOUND" });
   const body = request.body ?? {};
   const title = body.title !== undefined ? String(body.title).trim().slice(0, 200) : undefined;
@@ -2614,7 +2796,7 @@ app.patch<{ Params: { memoryId: string }; Body: { title?: string; body?: string;
 });
 
 app.delete<{ Params: { memoryId: string } }>("/api/v1/memories/:memoryId", { preHandler: requireUser }, async (request: any, reply) => {
-  const existing = db.prepare("SELECT id,user_id AS userId FROM agent_memories WHERE id=?").get(request.params.memoryId) as { id: string; userId: string } | undefined;
+  const existing = db.prepare("SELECT id,user_id AS userId FROM agent_memories WHERE id=? AND kind='memory'").get(request.params.memoryId) as { id: string; userId: string } | undefined;
   if (!existing || existing.userId !== request.user!.id) return reply.code(404).send({ error: "MEMORY_NOT_FOUND" });
   db.prepare("DELETE FROM agent_memories WHERE id=?").run(existing.id);
   return { deleted: true };
@@ -3077,6 +3259,14 @@ app.post<{ Body: { prompt?: string; model?: string; thinking?: string; personaId
   const userId = request.user!.id;
   const quotaBlock = quotaGuard(userId, "");
   if (quotaBlock) return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
+  // Wave 11A (butir 45): playground pun menolak pesan yang mencoba mengubah instruksi dasar.
+  if (config.PROMPT_GUARD_ENABLED) {
+    const hijack = scanPromptHijack(prompt);
+    if (hijack.blocked) {
+      recordAudit(null, userId, "prompt_hijack_blocked", { asal: "playground", pola: hijack.pattern, kategori: hijack.category, kutipan: hijack.snippet, panjangPesan: prompt.length });
+      return reply.code(400).send({ error: "PROMPT_BLOCKED", message: hijackMessage(hijack.pattern), pola: hijack.pattern, kategori: hijack.category });
+    }
+  }
   const settings = agentSettings(userId);
   const thinking = isThinkingLevel(request.body?.thinking) ? String(request.body?.thinking) : settings.thinking_level;
   const model = request.body?.model?.trim() || undefined;
@@ -3088,26 +3278,44 @@ app.post<{ Body: { prompt?: string; model?: string; thinking?: string; personaId
   // The playground is a real engine call, so it must honour the same tool allowlist as a chat run.
   const playgroundTools = parseToolsAllow(settings.tools_allow);
   let text = ""; let usage: unknown = null;
+  // Wave 11A (butir 57): jalur sinkron ini pun berpindah ke model cadangan saat galat sementara, dan
+  // melaporkan 502 ENGINE_UNAVAILABLE bila semua percobaan habis.
+  const primaryPlaygroundModel = model || config.PRIME_AGENT_MODEL || "default";
+  let modelDipakai = primaryPlaygroundModel;
+  let pindahModel = 0;
   try {
-    for await (const event of engine.run({
-      runId: playgroundRunId, sessionId, prompt,
-      model: model || config.PRIME_AGENT_MODEL, provider: model ? providerForModel(model) : config.PRIME_AGENT_PROVIDER,
-      thinking, appendSystem: blocks, tools: playgroundTools ?? undefined,
-      autonomous: autonomous ? { maxTurns: settings.autonomous_max_turns, maxTokens: settings.autonomous_max_tokens } : undefined,
-    })) {
-      if (event.type === "text") text += typeof event.data === "string" ? event.data : "";
-      if (event.type === "completed") usage = (event.data as { usage?: unknown })?.usage ?? null;
-      if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
-    }
+    const outcome = await runWithModelFallback({
+      primary: primaryPlaygroundModel,
+      fallbacks: fallbackModelsFor(userId),
+      maxSwitches: Math.min(config.ENGINE_FALLBACK_MAX_SWITCHES, MAX_FALLBACK_SWITCHES),
+      consume: async (attempt) => {
+        let attemptText = ""; let attemptUsage: unknown = null;
+        for await (const event of engine.run({
+          runId: playgroundRunId, sessionId, prompt,
+          model: attempt, provider: providerForModel(attempt),
+          thinking, appendSystem: blocks, tools: playgroundTools ?? undefined,
+          autonomous: autonomous ? { maxTurns: settings.autonomous_max_turns, maxTokens: settings.autonomous_max_tokens } : undefined,
+        })) {
+          if (event.type === "text") attemptText += typeof event.data === "string" ? event.data : "";
+          if (event.type === "completed") attemptUsage = (event.data as { usage?: unknown })?.usage ?? null;
+          if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
+        }
+        return { text: attemptText, usage: attemptUsage };
+      },
+      onFallback: (dari, ke, alasan) => recordAudit(null, userId, "playground.model_fallback", { dari, ke, alasan: alasan.slice(0, 200) }),
+    });
+    text = outcome.text; usage = outcome.usage; modelDipakai = outcome.model; pindahModel = outcome.switches;
   } catch (error) {
-    return reply.code(502).send({ error: "PLAYGROUND_FAILED", message: error instanceof Error ? error.message : "Mesin gagal menjawab." });
+    const pesan = error instanceof Error ? error.message : "Mesin gagal menjawab.";
+    if (pesan === "ENGINE_UNAVAILABLE") return reply.code(502).send({ error: "ENGINE_UNAVAILABLE", message: "Model utama dan semua model cadangan gagal karena galat sementara (429/5xx/timeout). Coba lagi sebentar lagi atau ganti model." });
+    return reply.code(502).send({ error: "PLAYGROUND_FAILED", message: pesan });
   }
   const reported = usage as { totalTokens?: number; inputTokens?: number; outputTokens?: number; model?: string } | null;
   const tokens = Math.round(Number(reported?.totalTokens ?? 0) || Math.ceil(prompt.length / 4) + Math.ceil(text.length / 4));
   // A playground call has no project, so run_usage cannot hold it; user_usage makes the tokens visible
   // to quotaState() and to the usage figures. Without this row the call was free and unreported.
   const reportedTokens = typeof reported?.totalTokens === "number" || typeof reported?.inputTokens === "number" || typeof reported?.outputTokens === "number";
-  const usageModel = typeof reported?.model === "string" ? reported.model : (model ?? config.PRIME_AGENT_MODEL ?? null);
+  const usageModel = typeof reported?.model === "string" ? reported.model : modelDipakai;
   const inputTokens = reportedTokens ? Math.round(reported?.inputTokens ?? 0) : Math.ceil(prompt.length / 4);
   const outputTokens = reportedTokens ? Math.round(reported?.outputTokens ?? 0) : Math.ceil(text.length / 4);
   const playgroundQuote = quoteCosts(usageModel, { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
@@ -3116,7 +3324,7 @@ app.post<{ Body: { prompt?: string; model?: string; thinking?: string; personaId
   db.prepare("INSERT INTO user_usage (id,user_id,run_id,source,model,provider,input_tokens,output_tokens,total_tokens,cost_micros,sell_cost_micros,estimated,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
     .run(randomUUID(), userId, playgroundRunId, "playground", usageModel, usageModel ? providerForModel(usageModel) : config.PRIME_AGENT_PROVIDER ?? null, inputTokens, outputTokens, tokens, costMicros, sellCostMicros, reportedTokens ? 0 : 1, new Date().toISOString());
   chargeQuota(userId, tokens);
-  return { text, usage, thinking, autonomous, model: usageModel, systemBlocks: blocks.length, tools: playgroundTools ?? null, tokens, durationMs: Date.now() - started, sessionId };
+  return { text, usage, thinking, autonomous, model: usageModel, modelUtama: primaryPlaygroundModel, pindahModel, systemBlocks: blocks.length, tools: playgroundTools ?? null, tokens, durationMs: Date.now() - started, sessionId };
 });
 
 // ------------------------------------------------------------
@@ -3208,7 +3416,20 @@ app.get<{ Params: { projectId: string }; Querystring: { kind?: string; conversat
     .send(report.markdown);
 });
 
-app.setErrorHandler((error: any, _request, reply) => { app.log.error(error); const status = Number(error.statusCode) >= 400 && Number(error.statusCode) < 500 ? Number(error.statusCode) : 500; return reply.code(status).send({ error: status < 500 ? "INVALID_REQUEST" : "INTERNAL_ERROR" }); });
+app.setErrorHandler((error: any, request: any, reply) => {
+  app.log.error(error);
+  const status = Number(error.statusCode) >= 400 && Number(error.statusCode) < 500 ? Number(error.statusCode) : 500;
+  // Wave 11B (butir 66): galat server dicatat ke `error_events` supaya bisa ditelusuri tanpa masuk
+  // ke container. Pencatatan ini gagal-aman dan melewati permintaan yang jelas bukan galat server;
+  // pesannya disaring dulu oleh recordErrorEvent sebelum disimpan.
+  if (status >= 500) {
+    recordErrorEvent({
+      kind: "server", code: String(error?.code ?? error?.name ?? "INTERNAL_ERROR"), message: String(error?.message ?? error),
+      userId: request?.user?.id ?? null, runId: request?.params?.runId ?? null,
+    });
+  }
+  return reply.code(status).send({ error: status < 500 ? "INVALID_REQUEST" : "INTERNAL_ERROR" });
+});
 
 const contentTypes: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 
@@ -3454,6 +3675,27 @@ app.post<{ Params: { conversationId: string }; Body: { content?: string; model?:
     const conversation = apiConversationFor(auth, request.params.conversationId);
     if (!conversation) return reply.code(404).send({ error: "CONVERSATION_NOT_FOUND" });
     if (auth.role === "viewer") return reply.code(403).send({ error: "VIEWER_READ_ONLY", message: "Kunci milik anggota viewer tidak boleh mengirim pesan." });
+    // Wave 11A (butir 45/46): API publik TIDAK boleh menjadi jalan pintas. Filter prompt-hijack dan
+    // aturan larangan diperiksa sebelum run dibuat, sama seperti jalur antarmuka.
+    if (config.PROMPT_GUARD_ENABLED) {
+      const hijack = scanPromptHijack(content);
+      if (hijack.blocked) {
+        recordAudit(auth.workspaceId, auth.userId, "prompt_hijack_blocked", { conversationId: conversation.id, via: "public-api", pola: hijack.pattern, kategori: hijack.category, kutipan: hijack.snippet, panjangPesan: content.length });
+        return reply.code(400).send({ error: "PROMPT_BLOCKED", message: hijackMessage(hijack.pattern), pola: hijack.pattern, kategori: hijack.category });
+      }
+    }
+    const pelanggaran = guardrailViolations(auth.userId, content);
+    if (pelanggaran.length) {
+      for (const hit of pelanggaran) {
+        recordSafetyEvent({ userId: auth.userId, ruleId: hit.rule.id, pattern: hit.pattern, snippet: content });
+        recordAudit(auth.workspaceId, auth.userId, "safety_violation", { conversationId: conversation.id, via: "public-api", ruleId: hit.rule.id, judul: hit.rule.title, pola: hit.pattern, kutipan: content.replace(/\s+/g, " ").slice(0, 200) });
+      }
+      return reply.code(400).send({
+        error: "GUARDRAIL_BLOCKED",
+        message: `Permintaan ini dilarang aturan "${pelanggaran[0].rule.title}". Aksi tidak dijalankan.`,
+        aturan: pelanggaran.map((hit) => ({ id: hit.rule.id, title: hit.rule.title, pola: hit.pattern })),
+      });
+    }
     const quotaBlock = quotaGuard(auth.userId, "");
     if (quotaBlock) return reply.code(quotaBlock.status).send({ error: quotaBlock.error, ...(quotaBlock.detail ?? {}) });
 
@@ -3887,6 +4129,27 @@ app.post("/api/v1/admin/retention/run", { preHandler: requireUser }, async (requ
   };
 });
 
+/* ---------------------------------------------------------------- Wave 11A (v0.21.0) */
+// Rute baru (butir 42-57, 79, 80) tinggal di `apps/api/src/wave11a/**`; server.ts hanya menyambung.
+registerWave11aRoutes(app);
+// Wave 11A (butir 80): laporan pagar konteks memakai penyusun blok yang sama dengan jalur run.
+registerContextBudgetRoutes(app, (userId, personaId, conversationId) => buildSystemBlocks(userId, personaId, conversationId).plan);
+
+/* ---------------------------------------------------------------- Wave 11B (v0.22.0) */
+// Rute baru (butir 58-67, 72, 83) tinggal di `apps/api/src/wave11b/**`; server.ts hanya menyambung.
+registerWave11bRoutes(app);
+// Wave 11C (butir 68-82): modul ditambahkan bertahap di wave11c/index.ts.
+registerWave11cRoutes(app);
+// Wave 11B: jalur eksekusi mesin tetap MILIK server. Modul wave11b (lanjutkan run, jadwal prompt)
+// memakai jalur yang sama lewat penitian fungsi ini, jadi tidak ada rumus kuota/biaya kedua.
+setRunDispatcher((input) => executeRun(
+  input.runId, input.projectId, input.prompt, input.conversationId ?? undefined,
+  knowledgeFor(input.projectId, input.prompt), input.model ?? undefined, input.userId,
+  { thinking: input.thinking ?? undefined, personaId: input.personaId ?? null, autonomous: Boolean(input.autonomous) },
+));
+setModelValidator(isKnownModel);
+setThinkingValidator(isThinkingLevel);
+
 app.setNotFoundHandler(async (request, reply) => {
   // HEAD is answered like GET so uptime checks and monitors see a healthy page.
   if (!["GET", "HEAD"].includes(request.method) || request.url.startsWith("/api/")) return reply.code(404).send({ error: "NOT_FOUND" });
@@ -4310,8 +4573,10 @@ function registerBackgroundHandlers() {
     const report = reapAbandonedRuns();
     for (const run of report.runs) {
       recordAudit(projectAuditWorkspace(run.projectId), null, "run.reaped", { runId: run.id, reason: "WORKER_LOST", startedAt: run.startedAt });
+      // Wave 11B (butir 63): run yang putus ditandai bisa dilanjutkan, bukan sekadar mati.
+      markRunResumable(run.id);
     }
-    return { marked: report.marked };
+    return { marked: report.marked, resumable: report.runs.length };
   });
 
   registerJobHandler("workflow.reap", async () => {
@@ -4365,6 +4630,29 @@ function registerBackgroundHandlers() {
   registerJobHandler("ratelimit.sweep", async () => {
     const swept = sweepRateLimitHits();
     return { removed: swept.removed, cutoff: new Date(swept.cutoff).toISOString(), sweepInWeb: config.RATE_LIMIT_SWEEP_IN_WEB };
+  });
+
+  /**
+   * Wave 11B (butir 72): jadwal prompt memakai pekerja `jobs` yang sudah ada, bukan penjadwal baru.
+   * Setiap menit pekerja ini mencari jadwal yang sudah waktunya dan menjalankannya satu kali.
+   */
+  registerJobHandler("schedule.run", async () => {
+    const report = await runDueSchedules();
+    for (const item of report.dilewati) {
+      recordAudit(null, item.userId, "schedule.skipped", { scheduleId: item.scheduleId, reason: item.reason });
+    }
+    return { due: report.due, dijalankan: report.dijalankan, dilewati: report.dilewati.length };
+  });
+
+  /**
+   * Wave 11B (butir 63): pemindai run yang putus. Mesin yang mati tidak meninggalkan jejak sendiri,
+   * jadi penandanya diperiksa berkala — sama seperti `run.reap`, tetapi hanya untuk menandai.
+   */
+  // Wave 11C butir 82: pengiriman konektor berjalan di proses pekerja terpisah.
+  registerConnectorJobHandlers();
+  registerJobHandler("resume.scan", async () => {
+    const marked = markInterruptedRuns();
+    return { marked };
   });
 }
 

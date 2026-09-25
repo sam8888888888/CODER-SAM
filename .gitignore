@@ -51,3 +51,14 @@ __pycache__/
 # Paket deploy TIDAK di-commit (butir 13: hindari berkas besar & rahasia)
 deploy/*.tar.gz
 deploy/*.tar.gz.sha256
+
+# Kode sumber TIDAK boleh ikut terabaikan oleh pola rahasia di atas.
+# Nyata: pola `*token*` menelan `coder-platform/apps/api/src/wave11b/token-accounting.ts`
+# (di-import oleh wave11b/index.ts). Karena paket rilis dibangun dengan `git ls-files`,
+# berkas itu akan HILANG dari paket dan API gagal saat impor. Pola di bawah hanya
+# mengecualikan berkas kode (.ts/.tsx/.mjs), bukan berkas rahasia/data.
+!coder-platform/apps/**/*.ts
+!coder-platform/apps/**/*.tsx
+!coder-dashboard/src/**/*.ts
+!coder-dashboard/src/**/*.tsx
+!coder-dashboard/e2e/**/*.mjs

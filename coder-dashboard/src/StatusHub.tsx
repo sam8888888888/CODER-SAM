@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from './api';
+import { PlatformHealth } from './PlatformHealth';
+import { EngineVersionCard } from './EngineVersionCard';
 import type { DirStats, StatusHub as StatusHubData } from './api';
 
 
@@ -133,7 +135,12 @@ function Row({ label, value }: { label: string; value: string }) {
  * pembayaran, surat, keamanan, batas biaya, penyimpanan, cadangan, dan run terakhir.
  * Data diambil langsung dari api.statusHub() tanpa nilai karangan.
  */
-export function StatusHub({ onError }: { onError?: (message: string) => void }) {
+/**
+ * Halaman "Status platform".
+ * `isAdmin` diteruskan ke kartu "Kesehatan platform" (butir 53) supaya kartu itu bisa menjelaskan
+ * lebih dulu bahwa uji mandiri hanya untuk admin platform; jawaban server tetap yang menentukan.
+ */
+export function StatusHub({ onError, isAdmin }: { onError?: (message: string) => void; isAdmin?: boolean }) {
   const [data, setData] = useState<StatusHubData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -205,6 +212,13 @@ export function StatusHub({ onError }: { onError?: (message: string) => void }) 
       {error ? <p className="mb-3 rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-slate-100">{error}</p> : null}
       {loading && !data ? <p className="mb-3 text-slate-400">Memuat status platform…</p> : null}
 
+      {/* Wave 11A (butir 53): kartu kesehatan platform + tombol "Jalankan uji mandiri".
+          Kartu ini memanggil GET /api/v1/admin/self-audit hanya saat tombolnya ditekan. */}
+      <h3 className="mb-2 text-sm font-semibold text-slate-100">Kesehatan platform</h3>
+      <div className="mb-4">
+        <PlatformHealth onError={onError} isAdmin={isAdmin} />
+      </div>
+
       {/* Mesin agen. */}
       <h3 className="mb-2 text-sm font-semibold text-slate-100">Mesin agen</h3>
       <div className="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -218,6 +232,12 @@ export function StatusHub({ onError }: { onError?: (message: string) => void }) 
           {engine?.note ? <p className="mt-2 text-slate-300">Catatan: {engine.note}</p> : null}
           {engine?.error ? <p className="mt-2 text-slate-100">Galat mesin: {engine.error}</p> : null}
         </div>
+      </div>
+
+      {/* Wave 11C (butir 78 tahap 1): kartu versi mesin. Hanya admin platform; rute server juga admin saja. */}
+      <h3 className="mb-2 text-sm font-semibold text-slate-100">Versi mesin (laporan server)</h3>
+      <div className="mb-4">
+        <EngineVersionCard isAdmin={isAdmin} onError={onError} />
       </div>
 
       {/* Basis data. */}

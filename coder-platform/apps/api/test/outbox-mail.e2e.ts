@@ -11,8 +11,9 @@
  * Tidak ada email yang benar-benar terkirim: tidak ada kredensial SMTP, dan suite ini tidak
  * menyentuh jaringan luar.
  */
+import { pilihPortUji } from "./port-aman.js";
 
-const port = 6000 + Math.floor(Math.random() * 200); // rentang khusus 6000-6200
+const port = pilihPortUji(6000, 200); // rentang khusus 6000-6200; nomor 6000 diblokir fetch, jadi dilewati
 const dataDir = `/tmp/coder-outbox-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 const stamp = Date.now();
 const adminEmail = `outbox-admin-${stamp}@example.test`;

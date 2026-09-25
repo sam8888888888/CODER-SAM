@@ -1,5 +1,5 @@
 /** Pages of the workspace shell. Shared by the sidebar, the dashboard cards and the tool panels. */
-export type PageKey = 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'billing' | 'admin' | 'settings' | 'memory' | 'templates' | 'personas' | 'playground' | 'skills' | 'status' | 'agents' | 'diff' | 'tokenSaver' | 'apiKeys' | 'privacy' | 'adminEmail' | 'adminJobs' | 'adminPricing' | 'apiWebhooks' | 'referrals' | 'growth' | 'search' | 'devices' | 'metrics' | 'growthBackfill' | 'webhookDeliveries';
+export type PageKey = 'notion' | 'botChannels' | 'connectors' | 'council' | 'benchmark' | 'runTimeline' | 'accountUsage' | 'accountActivity' | 'adminErrors' | 'schedules' | 'guardrails' | 'knowledgeBase' | 'userSkills' | 'toolsPolicy' | 'home' | 'chat' | 'projects' | 'knowledge' | 'workflow' | 'team' | 'artifacts' | 'usage' | 'audit' | 'runs' | 'billing' | 'admin' | 'settings' | 'memory' | 'templates' | 'personas' | 'playground' | 'skills' | 'status' | 'agents' | 'diff' | 'tokenSaver' | 'apiKeys' | 'privacy' | 'adminEmail' | 'adminJobs' | 'adminPricing' | 'apiWebhooks' | 'referrals' | 'growth' | 'search' | 'devices' | 'metrics' | 'growthBackfill' | 'webhookDeliveries';
 
 export type NavItem = { key: PageKey; label: string; icon: string; blurb: string };
 
@@ -40,7 +40,26 @@ export const NAV_ITEMS: NavItem[] = [
   { key: 'metrics', label: 'Metrik', icon: '◈', blurb: 'Angka operasional platform dan keluaran /metrics untuk pemantauan (khusus admin)' },
   { key: 'growthBackfill', label: 'Pelengkapan data', icon: '⇪', blurb: 'Lengkapi peristiwa pertumbuhan dari tabel asli, dengan pratinjau sebelum dijalankan (khusus admin)' },
   { key: 'webhookDeliveries', label: 'Riwayat webhook', icon: '⇉', blurb: 'Urutan pengiriman webhook, percobaan, dan tombol kirim ulang' },
+  // Wave 11A (butir 46, 51, 52, v0.21.0).
+  { key: 'guardrails', label: 'Guardrail', icon: '⛨', blurb: 'Aturan kualitas dan larangan milik akun Anda yang selalu disisipkan ke prompt agen' },
+  { key: 'knowledgeBase', label: 'Basis pengetahuan', icon: '❐', blurb: 'Isi pengetahuan platform (umum & whitelabel) yang dipakai agen; hanya admin boleh mengubah' },
+  { key: 'userSkills', label: 'Skill saya', icon: '✱', blurb: 'Pasang skill sendiri, aktifkan maksimal 8 sekaligus, lihat batas karakter' },
+  // Wave 11A (butir 47, v0.21.0).
+  { key: 'toolsPolicy', label: 'Kebijakan alat', icon: '⛭', blurb: 'Atur alat yang boleh dipakai agen: daftar pilihan, tanpa alat, atau keadaan bawaan mesin' },
+  // Wave 11B (butir 58, 61, 62, 65, 66, 72, v0.22.0).
+  { key: 'council', label: 'Dewan juri', icon: '⚖', blurb: 'Minta beberapa model menilai satu jawaban: verdict, skor, dan biaya tiap juri' },
+  { key: 'benchmark', label: 'Benchmark model', icon: '◫', blurb: 'Uji sampai tiga model pada soal bawaan server, lengkap dengan perkiraan biaya sebelum jalan' },
+  { key: 'runTimeline', label: 'Timeline run', icon: '⟲', blurb: 'Urutan kejadian satu run: kapan mulai, langkah apa saja, dan bagaimana akhirnya' },
+  { key: 'schedules', label: 'Jadwal', icon: '⏱', blurb: 'Jalankan perintah yang sama secara berkala dengan cron, zona waktu, dan mode otonom' },
+  { key: 'accountUsage', label: 'Pemakaian saya', icon: '∑', blurb: 'Token dan biaya akun Anda sendiri: per hari, per model, dan selisih rekonsiliasi' },
+  { key: 'accountActivity', label: 'Aktivitas saya', icon: '≡', blurb: 'Jejak aksi akun Anda sendiri pada rentang hari tertentu' },
+  { key: 'adminErrors', label: 'Laporan galat', icon: '⚠', blurb: 'Galat server yang tercatat, bisa disaring per jenis dan tanggal, dan diunduh sebagai CSV (khusus admin)' },
+  // Wave 11C (butir 68, 69/81, 71, v0.23.0).
+  { key: 'notion', label: 'Notion', icon: '❏', blurb: 'Sambungkan token Notion, lihat ruang kerja, dan kirim jawaban agen menjadi halaman baru' },
+  { key: 'botChannels', label: 'Kanal bot', icon: '☏', blurb: 'Kanal Telegram/WhatsApp: webhook, token tersegel, dan kode sekali pakai untuk menautkan akun' },
+  { key: 'connectors', label: 'Konektor', icon: '⇌', blurb: 'Slack, Discord, dan MCP: status sambungan, uji kirim, dan galat terakhir apa adanya' },
 ];
+
 
 export const TOOL_PAGES: PageKey[] = ['knowledge', 'workflow', 'team', 'artifacts', 'usage', 'audit'];
 

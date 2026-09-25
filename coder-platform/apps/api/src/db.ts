@@ -580,9 +580,186 @@ if (authTokenDdl && !authTokenDdl.includes("device_verify")) {
   `);
 }
 
+/**
+ * Wave 11A (butir 42-57, 79, 80): mode diskusi per percakapan, aturan keselamatan + guardrails,
+ * revisi artefak, skill milik pengguna, pengetahuan platform, dan model cadangan.
+ * Semua perubahan bersifat menambah: tidak ada kolom atau tabel lama yang diubah bentuknya.
+ */
+// Butir 42: satu percakapan boleh berada dalam mode diskusi. CHECK baru boleh ikut ALTER TABLE
+// ADD COLUMN, dan SQLite tetap menegakkannya untuk baris baru maupun UPDATE.
+try { db.exec("ALTER TABLE conversations ADD COLUMN agent_mode TEXT NOT NULL DEFAULT 'eksekusi' CHECK(agent_mode IN ('diskusi','eksekusi'))"); } catch {}
+// Butir 57: daftar model cadangan (maks 3, berurutan) dan asal model saat perpindahan terjadi.
+try { db.exec("ALTER TABLE agent_settings ADD COLUMN fallback_models TEXT NOT NULL DEFAULT '[]'"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN fallback_from TEXT"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN fallback_count INTEGER NOT NULL DEFAULT 0"); } catch {}
+db.exec(`
+CREATE TABLE IF NOT EXISTS guardrail_rules (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ kind TEXT NOT NULL DEFAULT 'larangan', title TEXT NOT NULL, body TEXT NOT NULL,
+ enabled INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_guardrail_rules_user ON guardrail_rules(user_id, enabled, sort_order, updated_at DESC);
+CREATE TABLE IF NOT EXISTS safety_events (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ run_id TEXT, rule_id TEXT, pattern TEXT NOT NULL DEFAULT '', snippet TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_safety_events_user ON safety_events(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS artifact_revisions (
+ id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+ revision_number INTEGER NOT NULL, content TEXT NOT NULL DEFAULT '', size_bytes INTEGER NOT NULL DEFAULT 0,
+ checksum TEXT NOT NULL DEFAULT '', created_by TEXT, created_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_artifact_revisions_number ON artifact_revisions(artifact_id, revision_number);
+CREATE INDEX IF NOT EXISTS idx_artifact_revisions_created ON artifact_revisions(artifact_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS user_skills (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', content TEXT NOT NULL,
+ enabled INTEGER NOT NULL DEFAULT 1, use_count INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_skills_name ON user_skills(user_id, name);
+CREATE INDEX IF NOT EXISTS idx_user_skills_user ON user_skills(user_id, enabled, updated_at DESC);
+CREATE TABLE IF NOT EXISTS platform_knowledge (
+ id TEXT PRIMARY KEY, section TEXT NOT NULL CHECK(section IN ('umum','whitelabel')),
+ title TEXT NOT NULL, content TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+ sort_order INTEGER NOT NULL DEFAULT 0, created_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_platform_knowledge_section ON platform_knowledge(section, enabled, sort_order);
+CREATE TABLE IF NOT EXISTS user_secrets (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, label TEXT NOT NULL DEFAULT '', secret_ciphertext TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_secrets_name ON user_secrets(user_id, name);
+`);
+
+
+/**
+ * Wave 11B (butir 58-67, 83, plus butir 72 yang ditarik lebih awal karena 83 memprasyaratkannya):
+ * dewan juri, shadow-first rollout, learnings registry, benchmark, laporan galat, dan jadwal prompt.
+ * Semua perubahan bersifat menambah: tidak ada kolom atau tabel lama yang diubah bentuknya.
+ */
+// Butir 60: pelajaran yang dipakai ulang disimpan di tabel memori yang sudah ada, dibedakan oleh kind.
+try { db.exec("ALTER TABLE agent_memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'memory' CHECK(kind IN ('memory','learning'))"); } catch {}
+// Butir 63: run yang terputus ditandai supaya bisa dilanjutkan tanpa mengulang biaya dari nol.
+try { db.exec("ALTER TABLE runs ADD COLUMN resume_state TEXT NOT NULL DEFAULT 'none'"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN resumed_from TEXT"); } catch {}
+try { db.exec("ALTER TABLE runs ADD COLUMN resume_attempts INTEGER NOT NULL DEFAULT 0"); } catch {}
+// Butir 72 (jadwal prompt) sebenarnya milik Wave 11C, tetapi ditarik ke sini karena butir 83 memprasyaratkannya.
+db.exec(`
+CREATE TABLE IF NOT EXISTS council_runs (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ project_id TEXT, conversation_id TEXT, material TEXT NOT NULL DEFAULT '',
+ question TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'queued'
+   CHECK(status IN ('queued','running','completed','failed')),
+ summary TEXT NOT NULL DEFAULT '', cost_micros INTEGER NOT NULL DEFAULT 0,
+ jurors TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_council_runs_user ON council_runs(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS council_verdicts (
+ id TEXT PRIMARY KEY, council_run_id TEXT NOT NULL REFERENCES council_runs(id) ON DELETE CASCADE,
+ juror TEXT NOT NULL, verdict TEXT NOT NULL DEFAULT '', score INTEGER, notes TEXT NOT NULL DEFAULT '',
+ run_id TEXT, cost_micros INTEGER NOT NULL DEFAULT 0, error_code TEXT, created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_council_verdicts_juror ON council_verdicts(council_run_id, juror);
+CREATE TABLE IF NOT EXISTS shadow_measurements (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ run_id TEXT, kind TEXT NOT NULL, chars INTEGER NOT NULL DEFAULT 0, tokens_est INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_measurements_user ON shadow_measurements(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_shadow_measurements_run ON shadow_measurements(run_id);
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed')),
+ model_list TEXT NOT NULL DEFAULT '[]', question_count INTEGER NOT NULL DEFAULT 0,
+ estimated_cost_micros INTEGER NOT NULL DEFAULT 0, cost_micros INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_runs_user ON benchmark_runs(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS benchmark_results (
+ id TEXT PRIMARY KEY, benchmark_run_id TEXT NOT NULL REFERENCES benchmark_runs(id) ON DELETE CASCADE,
+ model TEXT NOT NULL, question_id TEXT NOT NULL DEFAULT '', question TEXT NOT NULL DEFAULT '',
+ answer TEXT NOT NULL DEFAULT '', score INTEGER, latency_ms INTEGER, cost_micros INTEGER NOT NULL DEFAULT 0,
+ error_code TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_results_run ON benchmark_results(benchmark_run_id, model, question_id);
+CREATE TABLE IF NOT EXISTS error_events (
+ id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'server', code TEXT NOT NULL DEFAULT '',
+ message TEXT NOT NULL DEFAULT '', run_id TEXT, user_id TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_error_events_created ON error_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_events_kind ON error_events(kind, created_at DESC);
+CREATE TABLE IF NOT EXISTS prompt_schedules (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ project_id TEXT, conversation_id TEXT, prompt TEXT NOT NULL, cron TEXT NOT NULL,
+ timezone TEXT NOT NULL DEFAULT 'Asia/Jakarta', model TEXT, thinking TEXT NOT NULL DEFAULT 'medium',
+ autonomous INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+ last_run_at TEXT, next_run_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_schedules_user ON prompt_schedules(user_id, enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_prompt_schedules_next ON prompt_schedules(enabled, next_run_at);
+`);
+
+/**
+ * Wave 11C (butir 68-76, 78, 81, 82): integrasi & konektor, kanal bot + identitas, grup multi-agen,
+ * nominal unik, kupon percobaan, avatar, dan versi mesin. Sama seperti gelombang sebelumnya, semua
+ * perubahan bersifat menambah (ALTER TABLE ... ADD COLUMN atau CREATE TABLE IF NOT EXISTS).
+ */
+// Butir 73: grup multi-agen memakai percakapan yang sudah ada, dibedakan oleh kind.
+try { db.exec("ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'solo'"); } catch {}
+db.exec(`
+CREATE TABLE IF NOT EXISTS conversation_participants (
+ id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ persona_id TEXT, label TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_participants ON conversation_participants(conversation_id, created_at);
+-- Butir 68: token integrasi pihak ketiga (Notion) disegel lewat secrets.ts; provider dipakai bersama.
+CREATE TABLE IF NOT EXISTS user_integrations (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ provider TEXT NOT NULL, secret_ciphertext TEXT NOT NULL, meta_json TEXT NOT NULL DEFAULT '{}',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_integrations_provider ON user_integrations(user_id, provider);
+-- Butir 69/70/81: satu tabel untuk semua kanal bot; rahasia (token bot) disegel, bukan disimpan mentah.
+CREATE TABLE IF NOT EXISTS bot_channels (
+ id TEXT PRIMARY KEY, provider TEXT NOT NULL CHECK(provider IN ('telegram','whatsapp')),
+ name TEXT NOT NULL DEFAULT '', config_ciphertext TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0,
+ agent_name TEXT NOT NULL DEFAULT '', tagline TEXT NOT NULL DEFAULT '', webhook_secret TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bot_channels_provider ON bot_channels(provider, enabled);
+-- Butir 81: satu external_id (chat_id) hanya boleh menempel pada satu akun; kode pemasangan sekali pakai.
+CREATE TABLE IF NOT EXISTS bot_identities (
+ id TEXT PRIMARY KEY, channel_id TEXT NOT NULL REFERENCES bot_channels(id) ON DELETE CASCADE,
+ external_id TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ linked_at TEXT NOT NULL, code_hash TEXT NOT NULL DEFAULT '', code_expires_at TEXT, used_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_identities_external ON bot_identities(channel_id, external_id);
+CREATE INDEX IF NOT EXISTS idx_bot_identities_user ON bot_identities(user_id);
+-- Butir 71: katalog konektor; status dilaporkan apa adanya (siap/aktif/dikembangkan/gagal).
+CREATE TABLE IF NOT EXISTS connectors (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ kind TEXT NOT NULL CHECK(kind IN ('slack','discord','mcp')), config_ciphertext TEXT NOT NULL DEFAULT '',
+ enabled INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'siap', last_error TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_connectors_user ON connectors(user_id, kind);
+`);
+// Butir 74: nominal unik hanya untuk transfer manual; gateway tetap memakai nominal persis.
+try { db.exec("ALTER TABLE orders ADD COLUMN unique_amount_idr INTEGER"); } catch {}
+// Butir 75: kupon percobaan ditandai supaya tidak diperpanjang diam-diam, dan paket sasarannya
+// disimpan supaya kupon percobaan tidak bisa dipakai untuk paket lain.
+try { db.exec("ALTER TABLE coupons ADD COLUMN trial INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE coupons ADD COLUMN trial_plan_code TEXT"); } catch {}
+// Butir 76: berkas avatar disimpan di DATA_DIR/avatars, kolom hanya menyimpan nama berkas.
+try { db.exec("ALTER TABLE users ADD COLUMN avatar_path TEXT"); } catch {}
+
 /** Records the applied schema version so operators can see which shape the database has. */
-export const SCHEMA_VERSION = 18;
-export const SCHEMA_VERSION_NOTE = "Ordered webhook deliveries, in-flight token reservations, backfillable growth events, sign-in devices, message search index, browser push subscriptions";
+export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION_NOTE = "Mode diskusi per percakapan, guardrails + kejadian keselamatan, revisi artefak, skill milik pengguna, pengetahuan platform, model cadangan, dewan juri, shadow measurement, benchmark, error events, jadwal prompt, penanda resume, kind memori/pelajaran, grup multi-agen, integrasi pihak ketiga, kanal bot + identitas terpaut, katalog konektor, nominal unik transfer manual, kupon percobaan + paket sasarannya, avatar pengguna";
 db.prepare("INSERT OR IGNORE INTO schema_migrations (version, note, applied_at) VALUES (?,?,?)").run(SCHEMA_VERSION, SCHEMA_VERSION_NOTE, new Date().toISOString());
 
 // Runs after the additive columns exist, because it copies them.

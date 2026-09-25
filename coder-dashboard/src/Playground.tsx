@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { api } from './api';
-import type { Persona, PlaygroundResult, QuotaState, ThinkingLevel } from './api';
+import { api, failureOf } from './api';
+import type { Persona, PlaygroundEstimate, PlaygroundResult, QuotaState, ThinkingLevel } from './api';
 
 /** Properti halaman "Playground": pelapor galat dari induk (opsional). */
 type Props = {
@@ -50,6 +50,35 @@ function durationText(value: unknown): string {
   return `${ms} ms (${(ms / 1000).toFixed(2)} detik)`;
 }
 
+/**
+ * Baca isian angka opsional. Kembalikan `undefined` bila kolom kosong atau isinya
+ * bukan bilangan bulat lebih dari 0, supaya field itu tidak dikirim ke server
+ * (server lalu memakai nilai bawaannya).
+ */
+function angkaOpsional(teks: string): number | undefined {
+  const clean = teks.trim();
+  if (!clean) return undefined;
+  const value = Number(clean);
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) return undefined;
+  return value;
+}
+
+/** Format rupiah tanpa desimal, contoh: "Rp 12.345". */
+function rupiahText(value: unknown): string {
+  return `Rp ${Math.round(num(value)).toLocaleString('id-ID')}`;
+}
+
+/** Format mikrodolar menjadi USD dengan 6 angka desimal supaya nilai kecil tetap terbaca. */
+function microUsdText(value: unknown): string {
+  return `$${(num(value) / 1e6).toFixed(6)}`;
+}
+
+/** Format persentase kuota; nilai null berarti server tidak bisa menghitungnya. */
+function percentText(value: unknown): string {
+  if (value === null || value === undefined) return 'tidak bisa dihitung';
+  return `${num(value).toLocaleString('id-ID', { maximumFractionDigits: 2 })}%`;
+}
+
 /** Periksa apakah teks termasuk tingkat penalaran yang dikenali. */
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
   return THINKING_LEVELS.includes(value as ThinkingLevel);
@@ -70,6 +99,12 @@ function playgroundErrorMessage(error: unknown): string {
   if (code.includes('INVALID_PROMPT')) {
     return `Tulis pertanyaan ${1}-${PROMPT_MAX} karakter.`;
   }
+  if (code.includes('MODEL_REQUIRED')) {
+    return 'Sebutkan model yang ingin dihitung perkiraan biayanya.';
+  }
+  if (code.includes('MODEL_UNKNOWN')) {
+    return 'Model itu tidak ada di katalog harga. Cek ejaan namanya atau pilih dari daftar model.';
+  }
   if (code.includes('UNKNOWN_MODEL')) {
     return 'Model yang Anda pilih tidak ada di katalog mesin. Muat ulang halaman ini lalu pilih lagi.';
   }
@@ -80,6 +115,17 @@ function playgroundErrorMessage(error: unknown): string {
     return 'Sesi Anda sudah berakhir. Silakan masuk kembali.';
   }
   return 'Prompt gagal dijalankan. Periksa pilihan model, persona, dan koneksi Anda.';
+}
+
+/**
+ * Pesan galat kalkulator biaya: utamakan pesan Indonesia dari server
+ * (rute estimate memakai `requestDetailed`), lalu pesan cadangan kita sendiri.
+ */
+function estimateErrorMessage(error: unknown): string {
+  const failure = failureOf(error);
+  const kodeMesin = /^[A-Z0-9_]+$/.test(failure.message); // contoh: "MODEL_REQUIRED"
+  if (failure.message && !kodeMesin) return failure.message;
+  return playgroundErrorMessage(new Error(failure.code));
 }
 
 /**
@@ -111,6 +157,14 @@ export function Playground({ onError }: Props) {
   const [formError, setFormError] = useState('');
   const [result, setResult] = useState<PlaygroundResult | null>(null);
   const [showUsage, setShowUsage] = useState(false);
+
+  // Kalkulator biaya (butir 56): perkiraan harga jual tanpa menjalankan model.
+  const [estimate, setEstimate] = useState<PlaygroundEstimate | null>(null);
+  const [estimating, setEstimating] = useState(false);
+  const [estimateError, setEstimateError] = useState('');
+  // Isian opsional untuk menambah ketelitian perkiraan; kosong = pakai bawaan server.
+  const [outputTokensText, setOutputTokensText] = useState('');
+  const [runsText, setRunsText] = useState('');
 
   /** Catat galat ke halaman ini dan teruskan ke induk supaya bisa ditampilkan di sana. */
   function fail(message: string): void {
@@ -170,6 +224,12 @@ export function Playground({ onError }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Perkiraan lama dibuang bila prompt atau model berubah, supaya angka lama tidak menyesatkan.
+  useEffect(() => {
+    setEstimate(null);
+    setEstimateError('');
+  }, [prompt, model]);
+
   /** Segarkan angka kuota setelah satu prompt dijalankan. */
   async function refreshQuota(): Promise<void> {
     try {
@@ -215,8 +275,66 @@ export function Playground({ onError }: Props) {
     }
   }
 
+  /**
+   * Hitung perkiraan biaya tanpa menjalankan model (butir 56).
+   * Server mewajibkan `model`, jadi bila pengguna belum memilih model kita pakai model
+   * pertama dari katalog yang sudah dimuat, lalu model itu disebut di panel hasil.
+   */
+  async function hitungSaja(): Promise<void> {
+    const clean = prompt.trim();
+    setEstimateError('');
+    setEstimate(null);
+    if (!clean) {
+      fail('Tulis pertanyaan atau prompt dulu sebelum menghitung perkiraan biaya.');
+      return;
+    }
+    const dipilih = model.trim();
+    const modelHitung = dipilih || String(models[0]?.model ?? '').trim();
+    if (!modelHitung) {
+      fail('Pilih model dulu. Server perlu nama model untuk menghitung perkiraan biaya, dan katalog model belum termuat.');
+      return;
+    }
+    // Isian tidak sah (mis. 2,5 atau -3) ditolak supaya angkanya tidak menyesatkan.
+    if ((outputTokensText.trim() && angkaOpsional(outputTokensText) === undefined) || (runsText.trim() && angkaOpsional(runsText) === undefined)) {
+      fail('Kolom "Token keluaran" dan "Jumlah perhitungan" harus bilangan bulat lebih dari 0, atau dikosongkan untuk memakai bawaan server.');
+      return;
+    }
+    // Field opsional hanya dikirim bila terisi dan valid; kalau kosong, server memakai bawaannya (0 dan 1).
+    const isian: { model: string; prompt: string; outputTokens?: number; runs?: number } = { model: modelHitung, prompt: clean };
+    const keluaran = angkaOpsional(outputTokensText);
+    if (keluaran !== undefined) isian.outputTokens = keluaran;
+    const jumlah = angkaOpsional(runsText);
+    if (jumlah !== undefined) isian.runs = jumlah;
+
+    setEstimating(true);
+    try {
+      const data = await api.playgroundEstimate(isian);
+      setEstimate(data);
+    } catch (error) {
+      // Jangan pernah menampilkan angka palsu saat perhitungan gagal.
+      setEstimate(null);
+      const message = estimateErrorMessage(error);
+      setEstimateError(message);
+      onError?.(message);
+    } finally {
+      setEstimating(false);
+    }
+  }
+
   const usageText = result ? JSON.stringify(result.usage ?? null, null, 2) : '';
   const hasUsage = Boolean(result) && result?.usage !== null && result?.usage !== undefined;
+  // Dipakai untuk memberi tahu pengguna bahwa hitungan memakai model pertama katalog.
+  const pakaiModelPertamaKatalog = model.trim() === '';
+  /** Kotak kecil untuk satu angka pada panel perkiraan biaya. */
+  function kotak(judul: string, nilai: string, catatan?: string) {
+    return (
+      <div className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2">
+        <p className="text-xs text-slate-400">{judul}</p>
+        <p className="break-all text-slate-100">{nilai}</p>
+        {catatan ? <p className="mt-0.5 text-xs text-slate-500">{catatan}</p> : null}
+      </div>
+    );
+  }
 
   return (
     <section className="space-y-5 text-sm text-slate-300">
@@ -376,6 +494,66 @@ export function Playground({ onError }: Props) {
           >
             {running ? 'Menjalankan...' : 'Jalankan'}
           </button>
+          {/* Butir 56: hitung perkiraan biaya tanpa menjalankan model. */}
+          <button
+            type="button"
+            data-testid="playground-estimate-button"
+            className={BTN}
+            onClick={() => void hitungSaja()}
+            disabled={estimating || loadingOptions}
+          >
+            {estimating ? 'Menghitung...' : 'Hitung saja'}
+          </button>
+        </div>
+
+        {/* Isian opsional kalkulator biaya (butir 56). Kosongkan untuk memakai bawaan server. */}
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div>
+            <label className={LABEL} htmlFor="playground-estimate-output-tokens">
+              Token keluaran (opsional)
+            </label>
+            <input
+              id="playground-estimate-output-tokens"
+              data-testid="playground-estimate-output-tokens"
+              className={FIELD}
+              type="number"
+              min={1}
+              step={1}
+              inputMode="numeric"
+              placeholder="Kosongkan = bawaan server (0)"
+              value={outputTokensText}
+              onChange={(event) => setOutputTokensText(event.target.value)}
+              disabled={estimating}
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              Perkiraan panjang jawaban. Kolom ini hanya menambah ketelitian perkiraan biaya; tidak menyentuh kuota atau
+              pemakaian token Anda.
+            </p>
+          </div>
+
+          <div>
+            <label className={LABEL} htmlFor="playground-estimate-runs">
+              Jumlah perhitungan (opsional)
+            </label>
+            <input
+              id="playground-estimate-runs"
+              data-testid="playground-estimate-runs"
+              className={FIELD}
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              inputMode="numeric"
+              placeholder="Kosongkan = bawaan server (1)"
+              value={runsText}
+              onChange={(event) => setRunsText(event.target.value)}
+              disabled={estimating}
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              Berapa kali prompt ini diperkirakan dijalankan (server membatasi 1-100). Kolom ini hanya menambah ketelitian
+              perkiraan biaya; tidak menyentuh kuota atau pemakaian token Anda.
+            </p>
+          </div>
         </div>
 
         {quota ? (
@@ -387,6 +565,57 @@ export function Playground({ onError }: Props) {
           </p>
         ) : null}
       </div>
+
+      {/* Butir 56: panel perkiraan biaya. Hanya muncul setelah "Hitung saja" ditekan. */}
+      {estimating || estimate || estimateError ? (
+        <div className={CARD} data-testid="playground-estimate">
+          <h3 className="mb-2 text-sm font-semibold text-slate-100">Perkiraan biaya</h3>
+          {estimating ? <p className="text-slate-400">Menghitung perkiraan biaya...</p> : null}
+          {estimateError ? (
+            <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-rose-300">{estimateError}</p>
+          ) : null}
+          {estimate ? (
+            <div className="space-y-3">
+              <div className="grid gap-3 sm:grid-cols-3">
+                {kotak(
+                  'Model yang dihitung',
+                  estimate.model || '—',
+                  pakaiModelPertamaKatalog ? 'Anda belum memilih model, jadi dihitung dengan model pertama katalog.' : undefined,
+                )}
+                {kotak('Panjang prompt', `${tokenText(estimate.promptChars)} karakter`)}
+                {kotak('Jumlah perhitungan', `${tokenText(estimate.tokens.runs)} kali`)}
+                {kotak('Token masukan', tokenText(estimate.tokens.input))}
+                {kotak('Token keluaran', tokenText(estimate.tokens.output), 'Terisi bila panjang jawaban disebutkan; biasanya 0.')}
+                {kotak('Total token', tokenText(estimate.tokens.total))}
+                {kotak(
+                  'Harga jual per 1 juta token',
+                  `${estimate.hargaJualPerJuta.mataUang} ${num(estimate.hargaJualPerJuta.input)} masuk · ${num(estimate.hargaJualPerJuta.output)} keluar`,
+                  `Markup ×${num(estimate.markup)} · sumber harga: ${estimate.priceSource}`,
+                )}
+                {kotak(
+                  'Perkiraan biaya',
+                  rupiahText(estimate.estimatedCostIdr),
+                  `${microUsdText(estimate.estimatedCostMicros)} (mikrodolar: ${tokenText(estimate.estimatedCostMicros)})`,
+                )}
+                {kotak('Kurs USD ke IDR', `1 USD = ${rupiahText(estimate.usdIdrRate)}`, `Nilai kurs: ${num(estimate.usdIdrRate)}`)}
+                {kotak(
+                  'Bagian dari kuota harian',
+                  percentText(estimate.percentOfDailyQuota),
+                  `Batas harian ${tokenText(estimate.dailyLimitTokens)} token (dihitung dari token masukan).`,
+                )}
+              </div>
+
+              <p className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-300">{estimate.catatan}</p>
+              <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-amber-200">
+                Angka di atas adalah <b>perkiraan harga jual</b> (sudah termasuk markup ×{num(estimate.markup)}),{' '}
+                <b>bukan tagihan</b> Anda. Tekan "Hitung saja" tidak menjalankan model, jadi perhitungan ini tidak menambah
+                pemakaian token atau kuota
+                {estimate.tanpaEfekSamping ? ' (server menandai tanpaEfekSamping: true).' : '.'}
+              </p>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className={CARD}>
         <h3 className="mb-2 text-sm font-semibold text-slate-100">Hasil</h3>

@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 21 Sep 2026 malam (versi **0.20.2 LIVE** di server Austria sejak 15:16 UTC; deploy dijalankan atas izin Bapak, smoke produksi 202 lulus / 0 gagal. Butir 15b, 19, dan 20 selesai. Malam harinya, atas izin Bapak: beres-beres 5 sertifikat domain lain (24 dari 25 uji kering certbot hijau) dan sandi akun uji `smoke.bot` dirotasi. Rincian di bagian "v0.20.2" dan "Beres-beres sertifikat" di bawah.)
+Terakhir diperbarui: 26 Sep 2026 (Wave 11A + 11B + 11C **selesai di kode, belum di-deploy**; produksi masih **0.20.2 LIVE** sejak 21 Sep 2026. Wave 11C menutup 13 butir (68–76, 78, 81, 82) dengan skema **21**; gate lengkap ada di bagian "Wave 11C (v0.23.0)" di bawah. Antarmuka Wave 11B ditutup pada gerbang peramban terakhir.)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -14,6 +14,337 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - DNS `coblai.com` belum dipasang (MX/SPF/DKIM); rinciannya di `docs/DNS_COBLAI_COM.md`.
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
+
+## Wave 11C (v0.23.0) — integrasi, bot, grup, bayar, media, versi mesin (13 butir: 68–76, 78, 81, 82) — SELESAI DI KODE, BELUM DI-DEPLOY
+
+Sumber: `PRD_WAVE_11_EKSEKUSI_v5.md` butir 68–76, 78, 81, 82 (13 butir; butir 77 tetap TERTAHAN per PRD).
+Skema basis data: **20 → 21** (`SCHEMA_VERSION = 21`).
+
+**Tabel baru:** `conversation_participants`, `user_integrations`, `bot_channels`, `bot_identities`, `connectors`.
+**Kolom baru:** `conversations.kind`, `orders.unique_amount_idr`, `coupons.trial`, `coupons.trial_plan_code`, `users.avatar_path`.
+`coupons.trial_plan_code` **tidak diminta PRD**: keputusan lead supaya kupon percobaan bisa dikunci ke satu paket tanpa menambal `platform_settings`.
+**config.ts:** NOTION_API_BASE, CONNECTOR_TIMEOUT_MS, CONNECTOR_ALLOWED_HOSTS, TELEGRAM_API_BASE, TWILIO_API_BASE, BOT_WEBHOOK_BASE_URL, BOT_HTTP_TIMEOUT_MS, BOT_INBOUND_PER_MINUTE, BOT_REPLY_WAIT_MS, BOT_REPLY_MAX_CHARS, BOT_GROUP_ENABLED, BOT_LINK_CODE_TTL_MINUTES, BOT_LINK_MAX_ATTEMPTS, GROUP_MAX_PARTICIPANTS, UNIQUE_AMOUNT_MAX_TRIES, TRIAL_COUPON_HOURS, AVATAR_MAX_BYTES, AVATAR_SIZE, AVATAR_DIR.
+**dataexport.ts:** bagian baru `user_integrations` (tanpa token), `bot_identities`, `connectors` (tanpa konfigurasi), `conversation_participants`.
+**jobs.ts:** jenis pekerjaan baru `connector.deliver`, `bot.reply`.
+**retention.ts:** tidak ada sasaran baru di Wave 11C.
+**Berkas lain yang disentuh lead:** `billing.ts` (pagar `TRIAL_PLAN_ONLY`), `server.ts` (penyambungan rute + handler pekerja), `apps/api/src/workspace-guard.ts` (penjaga biaya ruang kerja dipindah keluar dari `server.ts` supaya bisa dipakai ulang), `.env.austria.example` + `deploy/env.keys.txt`.
+Status: **kode selesai, gerbang hijau; BELUM di-deploy, belum di-restart, belum ada commit.**
+
+### Gerbang
+- `npx tsc -p apps/api/tsconfig.json` → 0 galat. `npx tsc -p tsconfig.test.json` → 0 galat.
+- Suite Wave 11C dijalankan dari sisi lead, berurutan, satu DATA_DIR per suite:
+  `wave11c` 42/0 · `wave11c-konektor` 44/0 · `wave11c-konektor-proses` 28/0 · `wave11c-grup` 73/0 · `wave11c-bayar` 40/0 · `wave11c-kupon` 41/0 · `wave11c-media` 65/0 · `wave11c-mesin` 35/0 · `wave11c-bot` 91/0
+  → **459 pemeriksaan API, 0 gagal, 0 dilewati** untuk 13 butir.
+- Uji sambung rute (`/workspace/outputs/wire_probe.ts`): 23/23 lulus — 22 rute 11C menjawab 401/403 (ter-mount), rute palsu menjawab 404 sebagai kontrol negatif.
+- `npm run verify` → **59/59 suite hijau, `ALL_SUITES_PASSED`, exit 0** (termasuk gerbang tipe uji dan gerbang migrasi).
+  Angka 57 naik ke 59 karena dua suite gerbang baru: `deploy-paket-integritas.e2e.ts` (24 pemeriksaan, menjaga paket rilis
+  dari berkas kode yang terabaikan `.gitignore`) dan `port-uji-fetch-aman.e2e.ts` (20 pemeriksaan, menjaga port suite dari
+  daftar "bad port" `fetch`). **Dua putaran penuh berturut-turut pada 26 Sep 2026 (putaran 6 dan 7), tanpa pekerjaan lain
+  berbarengan, sama-sama 59/59 dan exit 0** (`/workspace/outputs/wave11c_verify_run6.log`, `..._run7.log`) — inilah yang
+  saya pakai sebagai syarat "hijau stabil" sebelum meminta izin rilis.
+  Gerbang migrasi melaporkan `MIGRATION_REHEARSAL_OK`, `REOPEN_IDEMPOTENT true`, `INTEGRITY_CHECK ok`, dan `ROW_COUNTS_PRESERVED true` (yang terakhir dibuktikan oleh suite `worker-split`, bukan oleh baris ringkasan verify).
+- Gerbang env `deploy-env-sync.e2e.ts` → 70 lulus / 0 gagal / 0 dilewati (`ALL_WAVE10_ENV_SYNC_TESTS_PASSED`).
+- **Antarmuka dashboard Wave 11C** (butir 68, 69, 71, 74, 76, 78 tahap 1, 81): `npx tsc -b` 0 galat; `npm run build` **exit 0** (684 modul); uji peramban `node e2e/ui.e2e.mjs` **222/222 lulus, 0 gagal, 1 dilewati, `consoleErrors=0`, exit 0** — **3 jalan agen + 2 jalan lead sendiri**, semuanya 222/222. Naik dari 169 (gerbang 11B) → **53 pemeriksaan peramban baru**. Dua cacat NYATA aplikasi ditemukan uji ini dan diperbaiki: (i) aliran jawaban SSE tidak pernah masuk ke layar karena server mengirim peristiwa BERNAMA sementara klien hanya memakai `onmessage`; (ii) tombol "Hapus semua riwayat" meninggalkan percakapan basi → `GET /mode` dan `/messages` menembak percakapan yang sudah dihapus (404). Perbaikan hanya di berkas UI/uji; tidak ada pemeriksaan yang dilemahkan.
+- Antarmuka dashboard Wave 11B (riwayat gerbang 11B): `npm run build` exit 0 (680 modul); uji peramban **169/169 lulus, 0 gagal, 1 dilewati**, `consoleErrors=0`.
+  Satu pemeriksaan dilewati dengan alasan jujur (lihat catatan 19). Jalannya side lead menemukan satu BALAPAN WAKTU di berkas uji ("hapus pelajaran": server sudah menghapus, halaman belum melukis ulang) — sudah diperbaiki dengan menunggu server DAN halaman, lalu dijalankan ulang oleh lead: 169/169.
+
+### Butir per butir
+| Butir | Isi | Berkas utama | Bukti |
+|---|---|---|---|
+| 68 | Notion sebagai integrasi | `wave11c/notion.ts` + UI `NotionHub.tsx`, `ShareMenu.tsx` | 42 cek: ciphertext `enc:v1:`, batas 10 halaman/10 menit, token tak pernah keluar; **uji nyata** (catatan 21). UI: hub Notion + "Kirim ke Notion", hulu gagal → 502 `NOTION_UPSTREAM_ERROR` apa adanya |
+| 69 | Bot Telegram | `wave11c/telegram-bot.ts`, `bot-core.ts` + UI `BotChannels.tsx` | 32 cek: rahasia webhook 401, run nyata, balasan sampai hulu; **uji nyata** `sendMessage` → 200 `ok:true` (catatan 21). UI: halaman kanal bot (webhook, token tersegel, catatan jujur soal `setWebhook`) |
+| 70 | Bot WhatsApp (Twilio) | `wave11c/whatsapp-bot.ts` | 19 cek: tanda tangan HMAC, TwiML, `?format=json` |
+| 71 | Katalog konektor Slack/Discord/MCP | `wave11c/connectors.ts`, `connector-store.ts` + UI `Connectors.tsx` | 44 cek: daftar putih host, 403 MCP, nama dari JSON tersegel; **uji nyata** ke penangkap webhook (catatan 21). UI: katalog + simpan/uji/hapus |
+| 73 | Percakapan grup multi-agen | `wave11c/grup.ts` | 73 cek: 1 giliran = 1 run, batas 4 peserta, kunci giliran 409 `GROUP_TURN_BUSY` (diuji dua proses) |
+| 74 | Nominal unik transfer manual | `wave11c/bayar.ts` + UI `Billing.tsx` | 40 cek: 200 nominal berbeda, habis → 503 setelah 20 percobaan. UI menampilkan nominal hanya dari dua sumber nyata (`POST /:orderId/unique-amount` dan antrean admin `bayar.ts`) karena `billing.ts` memang tidak mengembalikan kolom itu |
+| 75 | Kupon percobaan | `wave11c/kupon.ts`, `billing.ts` | 41 cek: 100%, sekali pakai, salah paket → 400 `TRIAL_PLAN_ONLY` |
+| 76 | Avatar pengguna & agen | `wave11c/avatar.ts`, `image-sanitize.ts` + UI `ProfilePanel.tsx` | 65 cek: tulis ulang PNG pakai `node:zlib`, JPEG/WebP ditolak. UI: JPEG/WebP diubah ke PNG **di peramban** (`canvas.toBlob`) lalu dikirim — tanpa pustaka asli |
+| 78 | Versi mesin (tahap 1) | `wave11c/engine-version.ts` + UI `EngineVersionCard.tsx`, `StatusHub.tsx` | 35 cek: hanya membaca, tahap 2 dijawab 404 + `tersedia=false` |
+| 81 | Identitas kanal bot | `wave11c/bot-identities.ts` | 20 cek: kode sekali pakai, TTL, satu chat satu akun |
+| 82 | Konektor sebagai proses terpisah | `wave11c/connector-child.ts`, `connector-job.ts` | 28 cek: anak tidak menerima `DATA_DIR`/`SECRETS_KEY`, dibunuh paksa saat hulu menggantung |
+
+### Catatan jujur (batas yang tidak terbukti)
+1. **Butir 76**: JPEG dan WebP **ditolak** `503 IMAGE_PROCESSOR_UNAVAILABLE`. Tidak ada pustaka gambar di image (tanpa `sharp`/`jimp`), jadi hanya PNG yang ditulis ulang. Menerima JPEG/WebP butuh keputusan memasang pemroses gambar.
+2. **Butir 76**: badan permintaan di atas ±5,66 MB dipotong lebih dulu oleh pengurai Fastify, jadi `413 AVATAR_TOO_LARGE` hanya sampai untuk badan di bawah ambang itu.
+3. **Butir 78 tahap 2** (perbarui/rollback mesin) memang tidak dibangun; ketiadaannya diuji (POST/PUT/DELETE pada rute versi = 404, `tahap2.tersedia=false`). Menunggu keputusan K5.
+4. **Versi mesin**: mesin sungguhan tidak dijalankan di suite; pembacaan versi diuji dengan biner tiruan (mencetak ke stdout, ke stderr, diam, sampah, menggantung, tidak ada). Fakta dari luar suite: `prime-agent --version` mencetak `0.9.5` ke **stderr** dan stdout-nya kosong.
+5. **Bot 69/70/81**: di dalam suite, hulu Telegram/Twilio adalah tiruan 127.0.0.1 — yang terbukti perilaku COBLAI. **Diperbarui 26 Sep 2026:** jalur KELUAR Telegram sudah dibuktikan terhadap `api.telegram.org` sungguhan (getMe/getChat/sendMessage 200, `ok:true`, pesan nyata sampai ke penerima — catatan 21); yang BELUM diuji dengan layanan asli adalah pembaruan MASUK (`setWebhook` tidak dipanggil karena alamat kita masih lokal) dan seluruh jalur Twilio/WhatsApp.
+6. **WhatsApp**: Fastify bawaan menjawab 415 untuk `application/x-www-form-urlencoded` padahal Twilio mengirim tipe itu, jadi modul bot mendaftarkan pengurai tipe isi sendiri (`app.addContentTypeParser`) tanpa menyentuh `server.ts`.
+7. **Bot**: galat nyata ditemukan uji — `channelId = sekarang?.id ?? id ?? randomUUID()` membuat kanal lahir tanpa id (`""`) sehingga jalur webhook-nya 404; diperbaiki menjadi `||`.
+8. **Konektor 71/82**: hulu Slack/Discord/Notion/MCP semuanya tiruan. `CONNECTOR_TIMEOUT_MS` produksi (15000 ms) sengaja **tidak** diuji; uji memakai 2–3 detik. Dua knob uji (`CONNECTOR_CHILD_DEADLINE_MS`, `CONNECTOR_CHILD_START_GRACE_MS`) dibaca dari `process.env` dengan bawaan di kode dan **bukan** setelan produksi.
+9. **Konektor 82**: proses anak **tidak boleh** dijalankan lewat pembungkus `node_modules/tsx/dist/cli.mjs`. Saat itu dipakai, proses yang bekerja menjadi cucu, sehingga `SIGKILL` induk hanya membunuh pembungkusnya: terukur 31 detik padahal batas 3,5 detik. Sekarang `process.execPath` dipakai langsung (Node 22 punya `process.features.typescript`), dan ada cek khusus yang membuktikan berkas hasil build `.js` juga dijalankan langsung tanpa pembungkus.
+10. **Konektor**: tabel `connectors` tidak punya kolom nama; nama hidup di dalam JSON tersegel dan dibuka di sisi server saat pemilik membaca katalognya. Konsekuensi: katalog tidak bisa mencari/mengurutkan berdasarkan nama.
+11. **Konektor**: tidak ada batas laju untuk kirim/uji konektor (hanya pembuatan halaman Notion: 10 per 10 menit). Kandidat uji hanya bisa dijalankan pemilik konektor.
+12. **Bot**: tidak ada lagi knob uji tanpa kunci resmi. Lima setelan yang dulu ditulis di kode (`BOT_WEBHOOK_BASE_URL`, `BOT_INBOUND_PER_MINUTE`, `BOT_HTTP_TIMEOUT_MS`, `BOT_REPLY_WAIT_MS`, `TWILIO_API_BASE`) sekarang punya kunci di `config.ts`; knob mati `BOT_PUBLIC_BASE_URL` dihapus. Hanya `BOT_GROUP_ENABLED` dan `BOT_REPLY_MAX_CHARS` yang masih membaca `process.env` lebih dulu (bawaannya tetap dari `config.*`) supaya satu proses uji bisa membuktikan bendera berubah.
+13. **Grup 73**: satu percakapan grup memakai satu sesi mesin bersama; identitas giliran dijamin lewat `runs.persona_id` dan riwayat dibangun ulang dari tabel `messages`. Giliran **tidak dikunci**: dua giliran bersamaan bisa membuat dua run (prompt terakhir yang menang).
+    **DIPERBARUI 26 Sep 2026 (keputusan Bapak): kunci giliran SUDAH DIPASANG** — pemeriksaan "masih ada run berjalan" dan pembuatan run berada di satu transaksi tulis (`db.transaction(...).immediate()`), giliran kedua dijawab 409 `GROUP_TURN_BUSY` tanpa baris `runs`/`messages` baru. Balapannya dibuktikan dengan menjalankan SALINAN KEDUA `server.ts` (proses terpisah, `DATA_DIR` sama): dua giliran bersamaan → tepat satu 202 + satu 409. Batasnya tetap jujur: run `running` yang macet baru dibebaskan `run.reap` (45 menit).
+14. **Grup 73**: penjaga biaya/kecepatan ruang kerja (`RUN_RATE_LIMITED`) sekarang ikut berlaku karena penjaganya dipindah ke `workspace-guard.ts` dan dipakai modul grup.
+15. **Bayar 74**: idempotensi — pesanan yang sudah punya kode mengembalikan 200 (bahkan setelah dibayar) supaya rekonsiliasi bank tetap jalan. Kalau Anda ingin pesanan non-pending dijawab 409, itu satu baris di `bayar.ts` (menunggu keputusan).
+16. **Kupon 75**: `hours` hanya membatasi umur kupon; lama langganan mengikuti `plans.period_days` dan bulan percobaan dipaksa 1.
+17. **Berkas sementara** `apps/api/test/w11c-selfcheck.ts` (milik agen media) sudah dihapus; 10 folder sisa `/tmp` dari putaran uji yang gagal juga sudah dibersihkan.
+18. **`APP_VERSION`** di `.env.austria.example` dan `deploy/env.keys.txt` sudah dinaikkan `0.19.0` → **`0.23.0`** (26 Sep 2026, menyusul keputusan rilis Bapak). Nilai itu tetap nilai informasi: `deploy-austria.sh` menyetel `APP_VERSION=<versi>` sendiri di `.env` peladen pada tiap deploy. Gerbang `deploy-env-sync` tetap 70/0 sesudah perubahan.
+19. **Antarmuka 11B**: satu pemeriksaan dilewati dengan alasan jujur — baris tabel Laporan galat tidak bisa dibandingkan dengan isi server karena basis data uji belum pernah punya catatan galat (hanya galat status 500 yang dicatat, dan itu tidak bisa dipicu dari peramban). Halaman, kalimat jumlah, saringan, dan unduh CSV tetap diuji sungguhan.
+
+20. **Uji kunci giliran grup (butir 73) — jebakan yang nyata dan cara menutupnya.** Jalan pertama saya sendiri
+    GAGAL: `Ringkasan: 69 lulus, 4 gagal`, `status 202/202`. Sebabnya uji, bukan kunci: umur run tiruan hanya
+    ~50 ms sehingga run pemenang sudah selesai saat giliran kedua mengklaim — dan 202 untuk keduanya memang
+    benar menurut aturan. Dua cacat diperbaiki: (a) knob uji **`MOCK_ENGINE_DELAY_MS`** di `MockEngine`
+    (`engine-adapter.ts`) menahan jawaban tiruan N milidetik supaya run benar-benar masih hidup
+    (`1500` dipakai suite; bawaan 0 = tanpa tunda, jadi tidak berpengaruh di produksi atau suite lain);
+    (b) tiap pemeriksaan menghitung dasarnya sendiri tepat sebelum permintaan, supaya satu kegagalan tidak
+    menjatuhkan yang lain. Sesudah perbaikan: **73/0** pada 3 jalan agen + 1 jalan berbeban CPU + **2 jalan
+    yang saya jalankan sendiri** (`selisih byte pertama 14/107 ms` dan `26/26 ms`, keduanya `status 202/409`).
+    Pelajaran: uji balapan yang hasilnya bergantung pada kecepatan mesin BUKAN bukti — perpanjang umur objek
+    yang diperebutkan, lalu buktikan premisnya dengan pemeriksaan tersendiri (suite menambahkan `G49c`).
+21. **Uji keluar SUNGGUHAN (bukan hulu tiruan) — 26 Sep 2026.** Memakai kredensial uji dari Bapak (berkas di
+    luar repo, mode 600, dihapus setelah selesai; tidak satu pun nilainya ditulis di dokumen ini):
+    **Notion** — `PUT /api/v1/integrations/notion` → 200 dengan `users/me` nyata (nama workspace terbaca), lalu
+    `POST /api/v1/integrations/notion/pages` membuat halaman di bawah halaman induk yang diwajibkan Notion; halaman
+    itu **diarsipkan** dan `GET /v1/pages/<id>` membalas `archived=true`. **Konektor** — `POST /connectors/<id>/test`
+    mengirim ke penangkap webhook nyata: gaya Slack `{text,username}` dan gaya Discord `{content,username}`, keduanya
+    `hulu=200` di sisi kita dan **tercatat di penangkap** (user-agent `node`, penanda uji unik sampai). Token Notion
+    tersegel (`enc:v1:`) dan tidak pernah kembali lewat API; token asli tidak ditemukan di `coder.db` maupun `coder.db-wal`.
+    Batas jujur: bentuk badan Slack/Discord baru terbukti **diterima penangkap**, belum diterima Slack/Discord asli
+    (URL webhook Slack/Discord asli belum ada); Telegram dibuktikan terpisah. Log: `/workspace/outputs/uji_nyata_notion_konektor.log`.
+
+22. **Kerapuhan gerbang rilis: port uji yang diblokir `fetch` — akar ditemukan dan ditutup (26 Sep 2026).**
+    Gejalanya menyesatkan: suite kadang melapor "server tidak siap" padahal peladen uji hidup (gerbang putaran 5 merah di
+    `wave6.e2e.ts`; direproduksi 2 kali dari 24 putaran mandiri). Sebabnya BUKAN bug produk: `fetch()` Node menolak daftar
+    "bad port" spesifikasi Fetch, jadi bila nomor acak yang terpilih ada di daftar itu, setiap `fetch` gagal seketika
+    (`TypeError: fetch failed` dengan cause `bad port`), sementara sambungan TCP biasa dan `node:http` ke port yang sama
+    menjawab normal (jejak: `tcp=tersambung httpPolos=HTTP 200 ragamGalatFetch=160x ... bad port`). Daftar terblokir
+    saya UKUR langsung pada rentang 3300–7599, bukan dari hafalan: 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666,
+    6667, 6668, 6669, 6679, 6697. Perbaikan: berkas baru `apps/api/test/port-aman.ts` (`PORT_TERBLOKIR_FETCH` +
+    `pilihPortUji()` yang melewati nomor terblokir) dipakai tiga suite yang rentangnya kena (`wave6.e2e.ts` 6500–6700,
+    `csrf-limits.e2e.ts` 3900–4400, `outbox-mail.e2e.ts` 6000–6200), plus gerbang baru `port-uji-fetch-aman.e2e.ts`
+    **20/20 hijau** yang memindai 40 rentang port di 64 berkas uji, 30 basis penolong port-bebas, dan 2 port turunan
+    (`hookPort = port + 500`), lalu GAGAL bila ada rentang yang memuat nomor terblokir. Suite `wave11a.e2e.ts` dan
+    `wave6.e2e.ts` kini mencetak jejak diagnosis (status run, pekerjaan, rantai `error.cause`) saat batas waktu habis, dan
+    `run-all.cjs` menyimpan log UTUH setiap suite merah (`/tmp/verify-logs/<suite>.log`). Tidak ada pemeriksaan yang
+    dilemahkan. **Batas jujur yang tersisa:** gerbang putaran 2 merah di `wave11a.e2e.ts` (169/176, 97,8 dtk, tiga batas
+    30 dtk) dan sebabnya BELUM terbukti — dugaan terkuat: di dalam jendela putaran itu saya menjalankan suite berat lain
+    (`paket_integritas` pukul 20:25:31), melanggar aturan "jangan menjalankan dua gerbang node berat berbarengan"; dugaan
+    itu belum direproduksi, jadi tidak saya nyatakan sebagai sebab. Dua klaim saya sebelumnya juga saya TARIK setelah
+    diukur ulang: "proses Chromium bocor" (ternyata 0 sisa proses; yang terlihat di sampel adalah peramban suite csp yang
+    masih berjalan) dan "suite 11A mati 1 detik" (itu bug skrip driver saya sendiri: nama `wave11a.e2e` ditambah akhiran
+    `.e2e.ts` → `ERR_MODULE_NOT_FOUND`).
+
+## Wave 11B (v0.22.0) — paritas lanjutan: 11 butir (58–67, 83, plus 72) — SELESAI DI KODE, BELUM DI-DEPLOY
+
+Sumber kerja: `PRD_WAVE_11_EKSEKUSI_v5.md`. Skema basis data naik **19 → 20** satu kali saja
+(`SCHEMA_VERSION = 20`), dengan ringkasan perubahan ditulis di `SCHEMA_VERSION_NOTE`. Skema baru:
+kolom `agent_memories.kind` ('memory'|'learning'), kolom `runs.resume_state` / `resumed_from` /
+`resume_attempts`, dan tabel `council_runs`, `council_verdicts`, `shadow_measurements`,
+`benchmark_runs`, `benchmark_results`, `error_events`, `prompt_schedules`. `config.ts`, `retention.ts`
+(dua sasaran baru: `error_events`, `shadow_measurements`), `dataexport.ts` (tujuh bagian baru) dan
+`jobs.ts` (jenis pekerjaan `schedule.run`, `resume.scan`) ikut diperbarui.
+**Belum ada deploy, belum ada restart, belum ada commit.**
+
+Gerbang yang dijalankan sendiri (26 Sep 2026, di mesin ini, berurutan satu per satu):
+- `npm run verify` → **48/48 suite hijau** (sebelumnya 44; bertambah 4 suite Wave 11B), keluar kode **0**,
+  `ALL_SUITES_PASSED`.
+- Suite Wave 11B: `wave11b.e2e.ts` **81 lulus / 0 gagal / 0 dilewati**, `wave11b-council.e2e.ts`
+  **92/0**, `wave11b-metrik.e2e.ts` **111/0/0 dilewati**, `wave11b-riwayat.e2e.ts` **103/0** →
+  **387 pemeriksaan API**, nol gagal, nol dilewati.
+- `npx tsc -p apps/api/tsconfig.json` dan `npx tsc -p tsconfig.test.json` → 0 galat.
+- Gerbang migrasi: `MIGRATION_REHEARSAL_OK`, `REOPEN_IDEMPOTENT true`, `INTEGRITY_CHECK ok`.
+- Gerbang env: `deploy-env-sync.e2e.ts` 70/0 (kunci baru Wave 11B ada di `.env.austria.example`
+  **dan** `deploy/env.keys.txt`).
+- Antarmuka peramban: **169/169 lulus, 0 gagal, 1 dilewati jujur**, `consoleErrors=0` (halaman 11B).
+
+### Peta butir → berkas → bukti
+
+| # | Judul | Berkas utama | Bukti uji (jumlah pemeriksaan) |
+|---|-------|--------------|-------------------------------|
+| 58 | Dewan juri | `wave11b/council.ts` | `wave11b-council` C1–C34 + U1–U10 + Q1–Q6 = 50 |
+| 59 | Shadow-first rollout | `wave11b/shadow.ts`, `platform_settings.shadow_mode` | `wave11b-metrik` §59 = 23 |
+| 60 | Learnings registry | `wave11b/learnings.ts`, `agent_memories.kind` | `wave11b-metrik` §60 = 30 |
+| 61 | Benchmark + uji model | `wave11b/benchmark.ts`, `apps/api/benchmark/questions.json` | `wave11b-council` B1–B23 + U11–U16 + Q7–Q8 = 31 |
+| 62 | Replay timeline | `wave11b/timeline.ts` | `wave11b-riwayat` §5 = 23 |
+| 63 | Resume seeding | `wave11b/resume.ts`, `runs.resume_state/resumed_from/resume_attempts` | `wave11b` §6 = 24 |
+| 64 | Ekspor/impor agen | `wave11b/persona-transfer.ts` | `wave11b-riwayat` §7 = 28 |
+| 65 | Metrik jujur: pemakaian & audit pribadi | `wave11b/account-usage.ts` | `wave11b-riwayat` §8 = 44 |
+| 66 | Laporan galat admin + ekspor | `wave11b/errors.ts`, tabel `error_events` | `wave11b-metrik` §66 = 24 |
+| 67 | Akuntansi token: saldo + proyeksi | `wave11b/token-accounting.ts` | `wave11b-metrik` §67 = 26 |
+| 72 | Jadwal prompt bebas | `wave11b/schedules.ts`, `jobs.ts`, `cron.ts` | `wave11b` §12 = 30 |
+| 83 | Matriks perilaku gabungan | `wave11b/behavior-matrix.ts`, `docs/ARCHITECTURE.md` | `wave11b` §11 = 20 |
+
+Bagian §0 (penyiapan, 6 pemeriksaan) dan A1–A3 (penutup, 3 pemeriksaan) pada `wave11b-council`
+tidak dihitung ke salah satu butir. Jumlah total 11B: 92 + 111 + 103 + 81 = **387 pemeriksaan API**.
+
+### Catatan jujur (yang TIDAK terbukti atau menyimpang dari PRD)
+
+1. **Butir 72 ditarik dari Wave 11C ke Wave 11B.** Butir 83 (matriks perilaku) memprasyaratkan 42, 72,
+   dan 63, jadi 72 dikerjakan lebih awal. Akibatnya uji jadwal ada di `wave11b.e2e.ts` §12, bukan di
+   `wave11c` §3 port 7322 seperti tertulis di kartu butir. Ini penyimpangan urutan, bukan penyimpangan
+   perilaku: seluruh isi kartu butir 72 (termasuk `SCHEDULE_LIMIT=10`, `CRON_INVALID`, zona waktu
+   bawaan `Asia/Jakarta`) dipenuhi.
+2. **Butir 58 — kuota dihitung antar-gelombang, bukan di dalam gelombang.** Juri di dalam satu
+   gelombang berjalan bersamaan (`COUNCIL_MAX_PARALLEL=2`), jadi pemotongan kuota hanya terlihat saat
+   gelombang berikutnya dimulai. Uji Q4 memakai 3 juri (dua gelombang) supaya efeknya terbukti.
+   Pencegahan di dalam gelombang menuntut reservasi token lebih awal — belum dibangun.
+3. **Butir 58 — mesin mock tidak bisa menghasilkan verdict terstruktur.** Karena itu verdict pada uji
+   e2e "tidak terbaca" dan penguraian verdict diuji langsung (U1–U5). Uji C23 membuktikan jawaban
+   tanpa verdict **tidak** ditebak dari kata kunci.
+4. **Butir 61 — skor benchmark dengan mesin mock = 100.** Dua model tiruan menerima prompt identik,
+   jadi jawabannya sama (B14). Rumus penilaiannya sendiri diuji terpisah (U11–U13).
+5. **Butir 61 — berkas soal harus ikut ke image produksi.** `questions.json` dibaca saat berjalan,
+   jadi `Dockerfile` dan `Dockerfile.austria` diberi baris `COPY` untuk folder `apps/api/benchmark`.
+   Tanpa itu, produksi akan gagal dengan `BENCHMARK_QUESTIONS_MISSING`.
+6. **Butir 59 — mode bayangan bawaannya mati** (`SHADOW_MODE=off`); admin boleh menyalakannya lewat
+   API. Semua penulisan pengukuran bersifat gagal-aman: kegagalan pencatatan tidak pernah menggagalkan
+   jawaban.
+7. **Butir 63 — kebijakan lanjutkan yang dipakai:** otomatis maksimum 1 percobaan
+   (`RESUME_MAX_AUTO_ATTEMPTS`), manual maksimum 3; run yang sudah merupakan lanjutan tidak pernah
+   dilanjutkan lagi (tidak ada rantai, alasan `LANJUTAN_DARI_LANJUTAN`); percakapan mode diskusi tidak
+   pernah dilanjutkan otomatis (aturan ① matriks 83); percobaan otomatis yang habis dilaporkan
+   `PERCOBAAN_OTOMATIS_HABIS`. Prompt lanjutan memakai ringkasan percakapan terakhir + hasil sebagian.
+8. **Butir 65 — angka tidak dibulatkan** dan rekonsiliasi memakai `run_usage.sell_cost_micros`
+   sebagai sumber kebenaran. Token yang tidak bisa diatribusikan ke pengguna tetap **ikut** dijumlah
+   dengan catatan, bukan dibuang diam-diam.
+9. **Temuan agen `metrik` yang sudah ditutup:** rute `GET/PATCH/DELETE /api/v1/memories` sempat
+   memperlakukan pelajaran (`kind='learning'`) sebagai memori biasa. Sudah diperbaiki di `server.ts`
+   (`AND kind='memory'` di ketiga rute) dan sekarang dibuktikan uji (daftar memori bersih; PATCH/DELETE
+   lewat rute memori atas id pelajaran menjawab `404 MEMORY_NOT_FOUND` tanpa merusak barisnya).
+10. **Bug tanggal/zona yang ditemukan uji dan diperbaiki:** `next_run_at` sempat mewarisi detik dan
+    milidetik (`00:00:00.372Z`) dan selisih zona tidak bulat (Jakarta terbaca 25.199.628 ms, bukan
+    25.200.000 ms). Keduanya sudah dipotong ke menit penuh / dibulatkan; uji tiga zona (Jakarta
+    00:00Z, UTC 07:00Z, Wina 05:00 dan 06:00Z saat DST) sekarang lulus.
+11. **Butir 66 — batas yang dipakai:** pesan galat dipotong 800 karakter, ekspor CSV maksimum 5.000
+    baris, retensi 30 hari (`RETENTION_ERROR_DAYS`).
+12. **Butir 67 — saldo disimpan di `platform_settings` kunci `token_accounting.<YYYY-MM>`**;
+    proyeksi = terpakai / hari berjalan × jumlah hari bulan itu. Bulan yang sudah lewat dianggap penuh,
+    bulan depan belum dihitung.
+13. **`APP_VERSION` di `.env.austria.example` sudah `0.23.0`** (26 Sep 2026; sebelumnya `0.19.0`, sedangkan
+    produksi berjalan `0.20.2`). `deploy-austria.sh` menyetel `APP_VERSION=<versi>` sendiri di `.env` peladen
+    pada tiap deploy, jadi nilai di berkas contoh hanya penanda.
+14. **Antarmuka 11B** (butir 58, 60, 61, 62, 63, 64, 65, 66, 67, 72 dan kartu mode bayangan 59)
+    SELESAI: `npm run build` exit 0 (680 modul, dari 668), uji peramban 169/169 lulus (dari 97),
+    0 gagal, 1 dilewati jujur, `consoleErrors=0`. Satu balapan waktu ditemukan jalannya side lead
+    pada pemeriksaan "hapus pelajaran" lalu diperbaiki di berkas uji (tunggu server DAN halaman).
+    Rinciannya di catatan 19 bagian Wave 11C.
+
+## Wave 11A (v0.21.0) — paritas `chat.coblai.com`: 18 butir (42–57, 79, 80) — SELESAI DI KODE, BELUM DI-DEPLOY
+
+Sumber kerja: `PRD_WAVE_11_EKSEKUSI_v5.md` (25 Sep 2026; 42 butir, nomor 42–83, lanjutan daftar
+masalah yang berakhir di 41). Wave 11A adalah gelombang pertama. Skema basis data naik **18 → 19**
+satu kali saja (`SCHEMA_VERSION = 19`, ringkasan perubahan ditulis di `SCHEMA_VERSION_NOTE`),
+`retention.ts` dan `dataexport.ts` ikut diperbarui. **Belum ada deploy, belum ada restart, belum ada
+commit.**
+
+Gerbang yang dijalankan sendiri (26 Sep 2026, semua di mesin ini):
+- `npm run verify` → **44/44 suite hijau** (gerbang tipe uji `tsconfig.test.json` → gerbang migrasi
+  `migration-check.ts` → seluruh suite e2e), keluar kode **0**.
+- Suite baru Wave 11A (dijalankan ulang satu per satu setelah semua perubahan selesai, keluar kode 0):
+  `wave11a.e2e.ts` **176 lulus / 0 gagal / 0 lewat**, `wave11a-rahasia.e2e.ts` **127/0**,
+  `wave11a-artefak.e2e.ts` **84/0**, `wave11a-csp.e2e.ts` **187/0**.
+- Dashboard: `npm run build` LULUS (`tsc -b` + vite, 668 modul) dan `node e2e/ui.e2e.mjs` **97/97 lulus,
+  0 gagal, 0 galat konsol** (Chromium sungguhan; total naik dari 73 menjadi 97 — 24 tambahan dari penutupan tiga kekurangan
+  antarmuka butir 46/47/53).
+
+### Peta butir → berkas → bukti
+
+| # | Judul | Berkas utama | Bukti uji (jumlah pemeriksaan) |
+|---|-------|--------------|-------------------------------|
+| 42 | Mode diskusi/eksekusi per percakapan | `wave11a/mode.ts`, `server.ts` (`buildSystemBlocks`) | `wave11a §1` = 15 |
+| 43 | Enkripsi rahasia at-rest (AES-256-GCM) | `secrets.ts`, `wave11a/secrets-routes.ts`, tabel `user_secrets` | `wave11a-rahasia §1+§2` = 65 |
+| 44 | Isolasi kredensial antar-sesi | `run-secret-vault.ts`, `engine-adapter.ts`, `prime-rpc-engine.ts` | `wave11a-rahasia §3` = 20 + `wave11a §3b` = 7 |
+| 45 | Filter anti prompt-hijack | `prompt-guard.ts` | `wave11a §4` = 20 |
+| 46 | Guardrails (kualitas & larangan) | `wave11a/guardrails.ts`, kolom `violations` di detail run | `wave11a §5` = 24 + uji UI panel pelanggaran |
+| 47 | Kebijakan alat berhalaman | `wave11a/tools-policy.ts`, `platform_settings.tools_catalog` | `wave11a §6` = 14 + uji UI halaman Kebijakan alat |
+| 48 | Tulis-balik artefak + riwayat + jaring aman | `wave11a/artifact-edit.ts`, tabel `artifact_revisions` | `wave11a-artefak` = 84 + uji UI 4 |
+| 49 | Preview Word/Excel/PowerPoint | dashboard `ArtifactPreview.tsx`, `ArtifactEditor.tsx` | uji UI 8 (docx, xlsx, pptx, md, >10 MB, docx rusak, sandbox, tautan unduh) |
+| 50 | Generasi & edit/gabung gambar | — | **TERTAHAN** menurut PRD (tidak dikerjakan di 11A) |
+| 51 | Skill pengguna bisa dipasang | `wave11a/skills.ts`, tabel `user_skills` | `wave11a §7` = 18 |
+| 52 | Knowledge base platform | `wave11a/knowledge-base.ts`, tabel `platform_knowledge` | `wave11a §8` = 15 |
+| 53 | Audit-diri kredensial + uji mandiri | `selfaudit.ts`, dashboard `PlatformHealth.tsx` | `wave11a-rahasia §4` = 39 + uji UI kartu Kesehatan platform |
+| 54 | Hapus semua riwayat | `wave11a/history.ts` | `wave11a §10` = 16 + uji UI 4 |
+| 55 | Tombol instal di HP (+ panduan iOS) | dashboard `InstallPrompt.tsx`, `public/manifest.webmanifest` | uji UI 6 |
+| 56 | Playground kalkulator biaya | `wave11a/estimate.ts` | `wave11a §11` = 9 |
+| 57 | Fallback model otomatis | `wave11a/fallback.ts`, kolom `runs.fallback_from/fallback_count` | `wave11a §12` = 16 |
+| 79 | CSP + netralisasi HTML dokumen | `wave11a/csp.ts`, `html-sanitize.ts`, `nginx/coder.sam.university.conf` | `wave11a-csp` = 187 (naik 2 tiap halaman dashboard bertambah) |
+| 80 | Pagar konteks total | `wave11a/context-budget.ts`, `server.ts` (`buildSystemBlocks`) | `wave11a §13` = 14 |
+
+Jumlah pemeriksaan Wave 11A: 176 + 127 + 84 + 187 = **574 pemeriksaan API** + 97 pemeriksaan UI.
+Angka suite CSP tidak tetap: berkas itu menyusuri setiap halaman dashboard lewat tautan navigasi, jadi
+jumlahnya bertambah 2 setiap halaman baru ditambahkan (185 sebelum halaman "Kebijakan alat" ada,
+187 sesudahnya).
+
+### Catatan jujur (yang TIDAK terbukti atau menyimpang dari PRD)
+
+1. **Butir 42 — mode diskusi hanya dijaga di tingkat instruksi, bukan di tingkat kode.** Yang
+   terbukti: mode disimpan di `conversations.agent_mode`, nilai tak sah ditolak `400
+   INVALID_AGENT_MODE`, percakapan milik ruang kerja lain ditolak, mode bertahan setelah server
+   dijalankan ulang, dan blok instruksi `【MODE DISKUSI】` benar-benar terkirim ke mesin (dibuktikan
+   lewat gema mesin mock) dengan prioritas **0** sehingga tidak pernah dipotong pagar konteks.
+   Yang **belum** terbukti: "perintah tulis berkas X tidak menghasilkan artefak" pada DoD butir 42.
+   Itu perilaku model, dan mesin mock tidak pernah menulis berkas. Bukti penuh butuh mesin AI nyata
+   (suite `real-ai.e2e.ts` tidak dijalankan di gerbang ini).
+2. **Butir 47 — penyimpangan sadar.** Saat katalog alat belum diatur, daftar bawaan **kosong** =
+   semua alat bawaan mesin tetap dipakai (perilaku lama). Penyaringan hanya aktif setelah admin
+   mengisi `platform_settings.tools_catalog`. Ini memenuhi DoD "daftar bawaan aman", tetapi
+   artinya bukan daftar putih yang ketat sejak awal.
+3. **Butir 48 — arti nomor revisi.** Artefak baru melaporkan `revision: 0` ("belum ada revisi").
+   Setiap `PUT /content` menyalin isi **sebelum** perubahan sebagai revisi bernomor `+1`, baru
+   menimpa berkas nyata — jadi `revision` = nomor salinan terakhir, dan `baseRevision` wajib sama
+   dengan nomor itu (kalau tidak → `409 ARTIFACT_CHANGED` beserta nomor terbaru). Batas retensi 20
+   revisi dan pagar anti-bentrok-tulis (`409 ARTIFACT_WRITE_BUSY`) bekerja, tetapi pagar tulis itu
+   hidup di memori proses: dua pekerja terpisah tidak saling melihat.
+4. **Butir 49 — satu pemeriksaan memakai simulasi.** Server menolak unggahan artefak di atas 10 MB
+   (`413 ARTIFACT_TOO_LARGE`), jadi uji antarmuka "berkas besar jatuh ke mode unduh" menyadap
+   jawaban daftar artefak agar ukurannya 11 MB. Yang terbukti: aturan antarmuka. Aturan server-nya
+   tidak diuji di sana.
+5. **Butir 79 — `style-src-attr` sengaja tidak dipasang.** Diukur dengan Chromium sungguhan:
+   127 elemen bergaya inline di semua halaman dashboard tetap tampil tanpa galat CSP, karena React
+   menulis gaya lewat CSSOM, bukan atribut. Konsekuensinya: HTML dari dokumen yang ditampilkan
+   lewat `srcdoc` **mewarisi** CSP halaman induk, jadi gaya inline di dalam dokumen Word bisa hilang
+   (isi tetap terbaca, skrip tetap diblokir). Kalau Bapak ingin gaya dokumen utuh, jalan resminya
+   sudah disediakan di `wave11a/csp.ts`: menambahkan `style-src-attr 'unsafe-inline'` **tanpa**
+   menyentuh `script-src`.
+6. **Dua suite lama diperbaiki karena kenaikan skema/daftar kunci** (bukan karena kode lama rusak):
+   `wave10.e2e.ts` mematok "versi skema = 18" → sekarang memakai `${SCHEMA_VERSION}`; daftar resmi
+   kunci lingkungan `deploy/env.keys.txt` bertambah 9 kunci Wave 11A sehingga gerbang anti-basi
+   `deploy-env-sync.e2e.ts` hijau lagi.
+7. **Kunci `.env` baru = pekerjaan deploy, bukan pekerjaan kode.** `SECRETS_KEY` (32 byte base64),
+   `PROMPT_GUARD_ENABLED`, `CONTEXT_BUDGET_CHARS`, `CSP_ENABLED`, `ARTIFACT_EDIT_MAX_BYTES`,
+   `ARTIFACT_REVISION_LIMIT`, `ENGINE_FALLBACK_MAX_SWITCHES`, `RETENTION_ARTIFACT_REVISION_DAYS`,
+   `RETENTION_SAFETY_DAYS` sudah masuk **dua-duanya**: `.env.austria.example` (template di repo) dan
+   `deploy/env.keys.txt` (daftar resmi yang dibaca `deploy/env-sync.sh`). Pada deploy berikutnya
+   `deploy-austria.sh` akan menambahkannya sendiri ke `.env` server. Tanpa `SECRETS_KEY` terisi,
+   semua rute rahasia menjawab `503 SECRETS_KEY_MISSING` (fitur tetap hidup, hanya tidak menyimpan).
+8. **`env-sync.sh` hanya menambah kunci yang belum ada** — nilai kunci lama di `.env` produksi tidak
+   pernah ditimpa, dan baris lama tidak dihapus.
+9. **Berkas uji sementara di `/tmp`** masih menumpuk (butir 40). Suite Wave 11A yang baru sudah
+   membersihkan direktori kerjanya sendiri di akhir; sisa lama (~174 direktori, ~800 MB) menunggu
+   izin Bapak untuk dihapus.
+10. **Nama berkas rahasia diubah** dari `credential-vault.ts`/`credentials.ts` menjadi
+    `run-secret-vault.ts`/`secrets-routes.ts` (menghindari `.gitignore` root baris 7 `*credential*`),
+    dan nama berkas uji menjadi `wave11a-rahasia.e2e.ts`. Nama **fungsi** di dalamnya tetap sesuai
+    PRD (`encryptSecret`, `decryptSecret`, `isSealed`).
+11. **Mesin mock menambah dua tuas uji**: `MOCK_ENGINE_FAIL_MODELS` (daftar model yang gagal) dan
+    `MOCK_ENGINE_FAIL_TEXT` (teks galat; kata pertama = kode). Hanya dipakai suite uji.
+12. **Suite uji tidak memakai pemeriksaan "selalu lulus"** dan tidak ada yang dilewati
+    (`Dilewati: 0`). Pemeriksaan dibuang kalau ternyata tidak bisa gagal.
+
+13. **Dua kegagalan palsu ditemukan dan diperbaiki (kejujuran uji).** Dua kali suite utama melaporkan
+   gagal ketika dijalankan bersamaan dengan pekerjaan berat lain. Akar masalahnya ditemukan: berkas uji
+   memakai nomor port acak tanpa memeriksa, sehingga bila ada server uji lama yang masih memegang port
+   itu, server baru gagal mengikat port dan permintaan uji nyasar ke server lama — yang tidak tahu
+   variabel lingkungan milik proses ini (`MOCK_ENGINE_FAIL_MODELS`), jadi pemeriksaan §12m/§12n gagal.
+   Perbaikannya: tiga berkas uji (`wave11a.e2e.ts`, `wave11a-artefak.e2e.ts`, `wave11a-rahasia.e2e.ts`)
+   kini mencari port yang benar-benar bebas lebih dulu, dan berhenti dengan pesan jelas bila tidak ada.
+   Pemeriksaan yang sama juga tidak lagi menyerah setelah 8 detik menunggu run selesai (jadi 30 detik).
+   Bukti: setelah perbaikan, keempat suite dijalankan berurutan dan semuanya keluar kode 0.
+14. **Tiga kekurangan antarmuka ditemukan saat memeriksa PRD butir per butir, lalu ditutup.**
+   PRD mewajibkan halaman "Kebijakan alat" (butir 47), kartu "Kesehatan platform" + tombol "Jalankan uji
+   mandiri" di halaman Status (butir 53), dan panel pelanggaran kecil di Riwayat run (butir 46).
+   Ketiganya belum ada pada penyerahan pertama; sekarang ada (`ToolsPolicy.tsx`, `PlatformHealth.tsx`,
+   panel di `Runs.tsx`). Untuk butir 46, rute `GET /api/v1/runs/:runId` juga ditambah kolom `violations`.
+15. **Panel pelanggaran di Riwayat run hampir selalu kosong — dan itu benar.** Aturan larangan menahan
+   permintaan SEBELUM run dibuat, jadi baris pelanggaran tidak punya `run_id`. Jejak lengkap per akun ada
+   di `GET /api/v1/safety` (halaman Guardrail). Panel hanya muncul bila ada isinya.
+16. **Dashboard adalah repo terpisah** (`/workspace/coblai-dinda/coder-dashboard`) di dalam satu repo git
+   `/workspace/coblai-dinda`. Belum ada deploy dashboard maupun API.
 
 ## Beres-beres sertifikat & rotasi sandi akun uji (21 Sep 2026 malam) — atas izin Bapak
 

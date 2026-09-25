@@ -1,0 +1,44 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "text": "Sebutkan satu risiko paling besar di dalam kode ini dan jelaskan akibatnya bila terjadi di produksi."
+    },
+    {
+      "id": "q2",
+      "text": "Apakah kode ini layak dipakai produksi sekarang? Jawab dengan alasan terkuat dan syarat minimal yang harus dipenuhi."
+    },
+    {
+      "id": "q3",
+      "text": "Bagaimana perilaku kode ini bila menerima masukan kosong atau bernilai null? Sebutkan galat yang muncul."
+    },
+    {
+      "id": "q4",
+      "text": "Periksa penanganan galat pada kode ini: adakah galat yang ditelan diam-diam? Tunjukkan bagiannya."
+    },
+    {
+      "id": "q5",
+      "text": "Apakah ada celah keamanan pada kode ini, misalnya rahasia yang bocor ke log atau masukan yang tidak divalidasi?"
+    },
+    {
+      "id": "q6",
+      "text": "Sebutkan langkah uji paling penting yang belum ada untuk kode ini, beserta alasannya."
+    },
+    {
+      "id": "q7",
+      "text": "Apakah kode ini bisa menjadi lambat saat data bertambah besar? Sebutkan titik panasnya."
+    },
+    {
+      "id": "q8",
+      "text": "Periksa nama variabel dan pemisahan tanggung jawab: bagian mana yang paling sulit dirawat, dan usulkan perbaikan singkat."
+    },
+    {
+      "id": "q9",
+      "text": "Bila kode ini gagal di tengah jalan, apakah pekerjaan setengah jadi bisa terbaca sebagai hasil akhir? Jelaskan."
+    },
+    {
+      "id": "q10",
+      "text": "Tuliskan tiga perbaikan berurutan dari yang paling mendesak untuk kode ini, sertakan alasan tiap perbaikan."
+    }
+  ]
+}

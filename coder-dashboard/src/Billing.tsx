@@ -1,9 +1,12 @@
 import { useEffect, useState } from 'react';
-import { api } from './api';
-import type { Plan, BillingOrder } from './api';
+import { api, failureOf } from './api';
+import type { Plan, BillingOrder, ManualQueueResponse, UniqueAmountResponse } from './api';
 
 type Props = {
   onError?: (message: string) => void;
+  // Butir 74: antrean nominal unik hanya boleh dibaca admin platform (server menjawab 403 selain admin),
+  // jadi permintaannya pun hanya dikirim kalau penanda ini benar.
+  isAdmin?: boolean;
 };
 
 /** Batas ukuran berkas bukti transfer yang boleh diunggah pengguna. */
@@ -116,7 +119,7 @@ function readFileAsBase64(file: File): Promise<string> {
  * serta riwayat kredit token. Semua aksi server dibungkus try/catch dan
  * pesan galat ditampilkan di dalam halaman ini.
  */
-export function Billing({ onError }: Props) {
+export function Billing({ onError, isAdmin = false }: Props) {
   const [plans, setPlans] = useState<Plan[]>([]);
   const [orders, setOrders] = useState<BillingOrder[]>([]);
   const [tier, setTier] = useState('');
@@ -137,6 +140,64 @@ export function Billing({ onError }: Props) {
   const [couponInfo, setCouponInfo] = useState<{ code: string; discountIdr: number; percent: number } | null>(null);
   const [couponNote, setCouponNote] = useState('');
   const [proofFiles, setProofFiles] = useState<Record<string, File | null>>({});
+
+  // Butir 74: nominal unik. Server TIDAK mengirim kolom ini di daftar pesanan, jadi nilai per pesanan
+  // hanya dipegang di sini setelah tombol "Pasang nominal unik" dijawab server (atau dari antrean admin).
+  const [nominal, setNominal] = useState<Record<string, UniqueAmountResponse>>({});
+  const [antrean, setAntrean] = useState<ManualQueueResponse | null>(null);
+  const [antreanBusy, setAntreanBusy] = useState(false);
+  const [antreanHasil, setAntreanHasil] = useState<{ diisi: number; gagal: number } | null>(null);
+  const [unikBusy, setUnikBusy] = useState<string>('');
+
+  /** Butir 74: minta nominal unik untuk satu pesanan transfer manual. */
+  async function pasangNominalUnik(orderId: string) {
+    setUnikBusy(orderId);
+    setError('');
+    setOk('');
+    try {
+      const jawaban = await api.billingUniqueAmount(orderId);
+      setNominal((lama) => ({ ...lama, [orderId]: jawaban }));
+      setOk(`Nominal unik dipasang: transfer ${rupiah(jawaban.order.nominalBayarIdr)} (tagihan tidak berubah: ${rupiah(jawaban.order.totalIdr)}).`);
+    } catch (e) {
+      const detail = failureOf(e);
+      reportError(`${detail.message || detail.code} [${detail.code}]`);
+    } finally {
+      setUnikBusy('');
+    }
+  }
+
+  /** Butir 74 (admin): baca antrean pesanan transfer manual beserta nominal uniknya. */
+  async function muatAntrean() {
+    setAntreanBusy(true);
+    setError('');
+    try {
+      const jawaban = await api.billingManualQueue();
+      setAntrean(jawaban);
+    } catch (e) {
+      const detail = failureOf(e);
+      reportError(`${detail.message || detail.code} [${detail.code}]`);
+    } finally {
+      setAntreanBusy(false);
+    }
+  }
+
+  /** Butir 74 (admin): isi nominal unik untuk seluruh pesanan yang belum punya. */
+  async function isiAntrean() {
+    setAntreanBusy(true);
+    setError('');
+    setOk('');
+    try {
+      const jawaban = await api.billingFillManualQueue();
+      setAntreanHasil({ diisi: num(jawaban.diisi), gagal: num(jawaban.gagal) });
+      setOk(`Antrean diproses: ${num(jawaban.diisi)} nominal diisi, ${num(jawaban.gagal)} gagal.`);
+      await muatAntrean();
+    } catch (e) {
+      const detail = failureOf(e);
+      reportError(`${detail.message || detail.code} [${detail.code}]`);
+    } finally {
+      setAntreanBusy(false);
+    }
+  }
 
   /** Tampilkan galat di dalam halaman sekaligus laporkan ke induk. */
   function reportError(message: string) {
@@ -307,6 +368,8 @@ export function Billing({ onError }: Props) {
   const selectedPlan = plans.find((plan) => plan.code === selectedCode) ?? null;
   const previewAmount = selectedPlan ? num(selectedPlan.priceIdr) * months : 0;
   const previewTotal = selectedPlan ? Math.max(0, previewAmount - num(couponInfo?.discountIdr)) : 0;
+  // Butir 74: hanya pesanan pending yang relevan untuk nominal unik.
+  const pesananPending = orders.filter((order) => order.status === 'pending');
 
   return (
     <section className="space-y-5 text-sm text-slate-300">
@@ -569,6 +632,126 @@ export function Billing({ onError }: Props) {
             </table>
           </div>
         )}
+      </section>
+
+      {/* 4b. Butir 74: nominal unik untuk pembayaran transfer manual. */}
+      <section className="rounded-lg border border-slate-700 bg-slate-800/60 p-3"
+        data-testid="billing-unik"
+        data-jumlah-manual={pesananPending.filter((order) => order.method === 'manual').length}>
+        <h3 className="mb-2 font-semibold text-slate-100">Nominal unik (verifikasi transfer manual)</h3>
+        <p className="mb-2 text-sm text-slate-400" data-testid="billing-unik-catatan">
+          Nominal unik menambahkan kode angka di belakang jumlah tagihan supaya transfer Anda bisa
+          dicocokkan otomatis. Server <b>tidak</b> mengubah kolom <code>amount_idr</code> maupun
+          <code> total_idr</code> pesanan: kode itu hanya penanda verifikasi. Daftar pesanan dari server juga
+          tidak memuat kolom nominal unik, jadi nominal hanya muncul di sini setelah tombol di bawah dijawab
+          server (atau dari antrean admin). Bagian ini hanya menampilkan pesanan yang masih menunggu
+          pembayaran: pesanan yang sudah lunas (mis. paket gratis yang langsung aktif) tidak muncul di sini.
+          Pesanan non-transfer yang masih menunggu pembayaran harus dibayar persis — server menolaknya
+          dengan 409 GATEWAY_EXACT_AMOUNT dan halaman ini tidak menawarkan tombolnya.
+        </p>
+        {pesananPending.length === 0 ? (
+          <p className="text-slate-400" data-testid="billing-unik-kosong">Tidak ada pesanan yang menunggu pembayaran.</p>
+        ) : (
+          <div className="space-y-2">
+            {pesananPending.map((order) => {
+              const jawaban = nominal[order.id];
+              const manual = order.method === 'manual';
+              return (
+                <div key={order.id} className="rounded-lg border border-slate-700 bg-slate-900/50 px-3 py-2 text-sm"
+                  data-testid={`unik-${order.id}`}
+                  data-method={order.method}
+                  data-nominal={jawaban ? String(jawaban.order.nominalBayarIdr) : ''}>
+                  <p className="text-slate-300">
+                    {order.planCode} · {num(order.months)} bulan · tagihan {rupiah(order.totalIdr)} ·
+                    jalur <b>{order.method}</b> · status {statusLabel(order.status)}
+                  </p>
+                  {manual ? (
+                    <div className="mt-1 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 disabled:opacity-50"
+                        data-testid={`unik-pasang-${order.id}`}
+                        disabled={disabledAll || unikBusy === order.id}
+                        onClick={() => { void pasangNominalUnik(order.id); }}
+                      >
+                        {unikBusy === order.id ? 'Memasang…' : jawaban ? 'Pasang nominal unik baru' : 'Pasang nominal unik'}
+                      </button>
+                      {jawaban ? (
+                        <span className="text-emerald-300" data-testid={`unik-nilai-${order.id}`}>
+                          Transfer {rupiah(jawaban.order.nominalBayarIdr)} = {rupiah(jawaban.baseIdr)} + kode {num(jawaban.k)}
+                          {jawaban.sudahAda ? ' (nominal ini sudah ada sebelumnya)' : ''}
+                        </span>
+                      ) : (
+                        <span className="text-slate-400" data-testid={`unik-nilai-${order.id}`}>Belum dipasang.</span>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-amber-300" data-testid={`unik-lewat-${order.id}`}>
+                      Jalur '{order.method}' bukan transfer manual: jumlahnya harus dibayar persis, jadi tidak
+                      ada nominal unik. Server menolak permintaan nominal unik untuk pesanan seperti ini
+                      (GATEWAY_EXACT_AMOUNT untuk pesanan gateway; pesanan yang sudah lunas lebih dulu
+                      dijawab ORDER_NOT_PENDING).
+                    </p>
+                  )}
+                  {jawaban ? <p className="mt-1 text-xs text-slate-400">{jawaban.catatan}</p> : null}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {isAdmin ? (
+          <div className="mt-3 space-y-2 rounded-lg border border-slate-700 bg-slate-900/40 p-3"
+            data-testid="billing-antrean"
+            data-belum={antrean ? String(antrean.belumBernominalUnik) : ''}>
+            <b className="text-slate-100">Antrean admin: pesanan transfer manual</b>
+            <div className="flex flex-wrap items-center gap-2">
+              <button type="button" className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 disabled:opacity-50"
+                data-testid="antrean-muat" disabled={antreanBusy} onClick={() => { void muatAntrean(); }}>
+                {antreanBusy ? 'Memuat…' : 'Muat antrean'}
+              </button>
+              <button type="button" className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 disabled:opacity-50"
+                data-testid="antrean-isi" disabled={antreanBusy} onClick={() => { void isiAntrean(); }}>
+                Isi nominal unik sekaligus
+              </button>
+              <span className="text-slate-300" data-testid="antrean-hitung">
+                {antrean ? `${num(antrean.belumBernominalUnik)} pesanan belum bernominal unik (dari ${antrean.orders.length} baris).` : 'Antrean belum dimuat.'}
+              </span>
+            </div>
+            {antreanHasil ? (
+              <p className="text-slate-300" data-testid="antrean-hasil" data-diisi={antreanHasil.diisi} data-gagal={antreanHasil.gagal}>
+                Selesai: {antreanHasil.diisi} nominal diisi, {antreanHasil.gagal} gagal.
+              </p>
+            ) : null}
+            {antrean && antrean.orders.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr className="text-left text-slate-400">
+                      <th scope="col" className="border-b border-slate-700 px-3 py-2">Pembeli</th>
+                      <th scope="col" className="border-b border-slate-700 px-3 py-2">Paket</th>
+                      <th scope="col" className="border-b border-slate-700 px-3 py-2">Tagihan</th>
+                      <th scope="col" className="border-b border-slate-700 px-3 py-2">Nominal unik</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {antrean.orders.map((baris) => (
+                      <tr key={baris.orderId} className="text-slate-300" data-testid={`antrean-${baris.orderId}`}
+                        data-nominal={String(baris.nominalBayarIdr)}>
+                        <td className="border-b border-slate-700/60 px-3 py-2">{baris.email || baris.userId}</td>
+                        <td className="border-b border-slate-700/60 px-3 py-2">{baris.planCode} · {num(baris.months)} bulan</td>
+                        <td className="border-b border-slate-700/60 px-3 py-2">{rupiah(baris.totalIdr)}</td>
+                        <td className="border-b border-slate-700/60 px-3 py-2">
+                          {baris.punyaNominalUnik ? rupiah(baris.nominalBayarIdr) : 'belum bernominal unik'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </section>
 
       {/* 5. Riwayat kredit token pengguna. */}

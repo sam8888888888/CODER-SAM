@@ -11,7 +11,9 @@
  *   RATE_LIMIT_REGISTER_PER_HOUR=3, RATE_LIMIT_PASSWORD_PER_HOUR=3.
  * Angka default produksi tidak diubah oleh suite ini.
  */
-const port = 3900 + Math.floor(Math.random() * 500); // hindari tabrakan dengan port tetap suite lain (3424-3460)
+import { pilihPortUji } from "./port-aman.js";
+
+const port = pilihPortUji(3900, 500); // hindari port tetap suite lain (3424-3460) dan nomor yang diblokir fetch (4045, 4190)
 const dataDir = `/tmp/coder-csrf-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 process.env.NODE_ENV = "test";
 process.env.CSRF_STRICT = "true";

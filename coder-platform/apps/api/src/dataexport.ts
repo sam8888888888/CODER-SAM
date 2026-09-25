@@ -56,6 +56,36 @@ export function collectUserData(userId: string): { data: Record<string, unknown>
   add("email_outbox", pick("SELECT id, kind, subject, status, attempts, created_at AS createdAt, sent_at AS sentAt FROM email_outbox WHERE user_id=?", [userId]));
   add("knowledge_documents", pick(`SELECT k.id, k.project_id AS projectId, k.title, k.source_type AS sourceType, k.created_at AS createdAt
       FROM knowledge_documents k JOIN projects p ON p.id=k.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=?`, [userId]));
+  // Wave 11A: the new per-user tables. `artifact_revisions` ships its metadata only (number, size,
+  // checksum, note); the text itself is already reachable through the artifact itself, and shipping
+  // every revision would multiply the size of this file. `platform_knowledge` is not personal data:
+  // it belongs to the platform, so it is deliberately absent here.
+  add("user_skills", pick("SELECT id, name, description, content, enabled, use_count AS useCount, created_at AS createdAt, updated_at AS updatedAt FROM user_skills WHERE user_id=?", [userId]));
+  add("guardrail_rules", pick("SELECT id, kind, title, body, enabled, sort_order AS sortOrder, created_at AS createdAt, updated_at AS updatedAt FROM guardrail_rules WHERE user_id=?", [userId]));
+  add("safety_events", pick("SELECT id, run_id AS runId, rule_id AS ruleId, pattern, snippet, created_at AS createdAt FROM safety_events WHERE user_id=?", [userId]));
+  add("artifact_revisions", pick(`SELECT r.id, r.artifact_id AS artifactId, r.revision_number AS revisionNumber, r.size_bytes AS sizeBytes, r.checksum, r.note, r.created_at AS createdAt
+      FROM artifact_revisions r JOIN artifacts a ON a.id=r.artifact_id JOIN projects p ON p.id=a.project_id
+      JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=?`, [userId]));
+  // Wave 11B: the new per-user histories. `error_events` ships only the rows that name this user
+  // (the ones without a user are internal and stay in the admin report), and `shadow_measurements`
+  // ships estimates, which is exactly what they are.
+  add("council_runs", pick("SELECT id, project_id AS projectId, conversation_id AS conversationId, question, status, summary, cost_micros AS costMicros, jurors, created_at AS createdAt, finished_at AS finishedAt FROM council_runs WHERE user_id=?", [userId]));
+  add("council_verdicts", pick(`SELECT v.id, v.council_run_id AS councilRunId, v.juror, v.verdict, v.score, v.notes, v.run_id AS runId, v.cost_micros AS costMicros, v.error_code AS errorCode, v.created_at AS createdAt
+      FROM council_verdicts v JOIN council_runs c ON c.id=v.council_run_id WHERE c.user_id=?`, [userId]));
+  add("benchmark_runs", pick("SELECT id, status, model_list AS modelList, question_count AS questionCount, estimated_cost_micros AS estimatedCostMicros, cost_micros AS costMicros, created_at AS createdAt, finished_at AS finishedAt FROM benchmark_runs WHERE user_id=?", [userId]));
+  add("benchmark_results", pick(`SELECT b.id, b.benchmark_run_id AS benchmarkRunId, b.model, b.question_id AS questionId, b.question, b.answer, b.score, b.latency_ms AS latencyMs, b.cost_micros AS costMicros, b.error_code AS errorCode, b.created_at AS createdAt
+      FROM benchmark_results b JOIN benchmark_runs r ON r.id=b.benchmark_run_id WHERE r.user_id=?`, [userId]));
+  add("prompt_schedules", pick("SELECT id, project_id AS projectId, conversation_id AS conversationId, prompt, cron, timezone, model, thinking, autonomous, enabled, last_run_at AS lastRunAt, next_run_at AS nextRunAt, created_at AS createdAt, updated_at AS updatedAt FROM prompt_schedules WHERE user_id=?", [userId]));
+  add("shadow_measurements", pick("SELECT id, run_id AS runId, kind, chars, tokens_est AS tokensEst, created_at AS createdAt FROM shadow_measurements WHERE user_id=?", [userId]));
+  add("error_events", pick("SELECT id, kind, code, message, run_id AS runId, created_at AS createdAt FROM error_events WHERE user_id=?", [userId]));
+  // Wave 11C: konfigurasi milik pengguna sendiri. Rahasia (token Notion, token bot, rahasia webhook,
+  // konfigurasi konektor) TIDAK pernah ikut; yang diekspor hanya keterangan bahwa sesuatu pernah dipasang.
+  add("user_integrations", pick("SELECT id, provider, CASE WHEN secret_ciphertext='' THEN 0 ELSE 1 END AS terpasang, meta_json AS metaJson, created_at AS createdAt, updated_at AS updatedAt FROM user_integrations WHERE user_id=?", [userId]));
+  add("bot_identities", pick("SELECT id, channel_id AS channelId, external_id AS externalId, linked_at AS linkedAt, used_at AS usedAt FROM bot_identities WHERE user_id=?", [userId]));
+  add("connectors", pick("SELECT id, kind, enabled, status, last_error AS lastError, CASE WHEN config_ciphertext='' THEN 0 ELSE 1 END AS terpasang, created_at AS createdAt, updated_at AS updatedAt FROM connectors WHERE user_id=?", [userId]));
+  add("conversation_participants", pick(`SELECT cp.id, cp.conversation_id AS conversationId, cp.persona_id AS personaId, cp.label, cp.created_at AS createdAt
+      FROM conversation_participants cp JOIN conversations c ON c.id=cp.conversation_id
+      JOIN projects p ON p.id=c.project_id JOIN memberships m ON m.workspace_id=p.workspace_id WHERE m.user_id=?`, [userId]));
   return { data, sections };
 }
 

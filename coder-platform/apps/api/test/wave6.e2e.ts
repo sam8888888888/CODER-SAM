@@ -16,8 +16,10 @@
  */
 
 import http from "node:http";
+import net from "node:net";
+import { pilihPortUji } from "./port-aman.js";
 
-const port = 6500 + Math.floor(Math.random() * 200); // rentang khusus 6500-6700
+const port = pilihPortUji(6500, 200); // rentang khusus 6500-6700; nomor yang diblokir fetch dilewati
 const hookPort = port + 500;                          // penerima webhook lokal
 const dataDir = `/tmp/coder-wave6-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 const stamp = Date.now();
@@ -122,13 +124,50 @@ function receiver() {
     of: (path: string) => hits.filter((hit) => hit.path.includes(path)),
   };
 }
+function rantaiGalat(error: any): string {
+  // undici menyembunyikan sebab asli di properti `cause`; tanpa ini "fetch failed" tidak memberi
+  // informasi apa pun (jejak 26 Sep 2026).
+  const bagian: string[] = [];
+  let kaki: any = error;
+  for (let depth = 0; kaki && depth < 5; depth += 1) {
+    bagian.push(`${kaki.name ?? "?"}:${kaki.message ?? "?"}${kaki.code ? `/code=${kaki.code}` : ""}${kaki.errno ? `/errno=${kaki.errno}` : ""}${kaki.syscall ? `/syscall=${kaki.syscall}` : ""}`);
+    kaki = kaki.cause;
+  }
+  return bagian.join(" <- ");
+}
+function ambilLewatHttp(): Promise<string> {
+  // Pembanding langsung: permintaan HTTP polos (node:http) ke alamat yang sama. Kalau ini berhasil
+  // sementara fetch gagal, masalahnya ada di lapisan fetch/undici, bukan di peladen.
+  return new Promise((resolve) => {
+    const permintaan = http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3000 }, (jawaban) => {
+      jawaban.resume();
+      resolve(`HTTP ${jawaban.statusCode}`);
+    });
+    permintaan.on("timeout", () => { permintaan.destroy(); resolve("habis batas 3 detik"); });
+    permintaan.on("error", (error: any) => resolve(`galat: ${error.code ?? error.message}`));
+  });
+}
 async function waitForHealth(): Promise<void> {
   // 40 detik: cukup longgar saat mesin sedang sibuk menjalankan suite lain berurutan.
+  const ragamGalat = new Map<string, number>();
   for (let attempt = 0; attempt < 160; attempt += 1) {
-    try { const response = await fetch(`${base}/health`); if (response.ok) { await response.arrayBuffer(); return; } } catch { /* belum siap */ }
+    try { const response = await fetch(`${base}/health`); if (response.ok) { await response.arrayBuffer(); return; } ragamGalat.set(`HTTP ${response.status}`, (ragamGalat.get(`HTTP ${response.status}`) ?? 0) + 1); }
+    catch (error) { const kunci = rantaiGalat(error); ragamGalat.set(kunci, (ragamGalat.get(kunci) ?? 0) + 1); }
     await sleep(250);
   }
-  throw new Error("server tidak siap");
+  // Jejak diagnosis (26 Sep 2026): gerbang penuh dan 20 putaran mandiri sama-sama pernah merah di
+  // suite ini dengan "server tidak siap" padahal peladen mencatat dirinya mendengarkan. Sekarang
+  // sebab asli rantai galat fetch, sambungan TCP langsung, dan permintaan HTTP polos ikut dilaporkan.
+  let sambungTcp = "tidak dicoba";
+  await new Promise<void>((resolve) => {
+    const soket = net.connect(port, "127.0.0.1");
+    const batas = setTimeout(() => { sambungTcp = sambungTcp === "tidak dicoba" ? "habis batas 2 detik" : sambungTcp; soket.destroy(); resolve(); }, 2000);
+    soket.once("connect", () => { sambungTcp = "tersambung"; clearTimeout(batas); soket.destroy(); resolve(); });
+    soket.once("error", (error) => { sambungTcp = `galat: ${error.message}`; clearTimeout(batas); resolve(); });
+  });
+  const lewatHttp = await ambilLewatHttp();
+  const ragam = [...ragamGalat.entries()].map(([kunci, jumlah]) => `${jumlah}x ${kunci}`).join(" | ");
+  throw new Error(`server tidak siap (port=${port} envPORT=${process.env.PORT} tcp=${sambungTcp} httpPolos=${lewatHttp} ragamGalatFetch=${ragam})`);
 }
 
 const hooks = receiver();

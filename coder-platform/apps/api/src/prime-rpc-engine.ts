@@ -33,7 +33,9 @@ export class PrimeRpcEngine implements AgentEngine {
       if (request.autonomous.maxTokens) args.push("--autonomous-max-tokens", String(request.autonomous.maxTokens));
       if (request.autonomous.maxContinuations) args.push("--autonomous-max-continuations", String(request.autonomous.maxContinuations));
     }
-    const child = spawn(this.options.binary, args, { stdio: ["pipe", "pipe", "pipe"], env: process.env });
+    // Wave 11A (butir 44): rahasia satu run hanya masuk ke lingkungan proses anak ini, bukan ke
+    // `process.env` proses web (satu proses melayani banyak pengguna).
+    const child = spawn(this.options.binary, args, { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, ...(request.env ?? {}) } });
     let ended = false; const timeout = this.options.timeoutMs ?? 30 * 60_000;
     const queue: EngineEvent[] = []; let wake: (() => void) | null = null; let streamed = false;
     const push = (event: EngineEvent) => { queue.push(event); wake?.(); wake = null; };

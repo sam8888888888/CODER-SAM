@@ -526,7 +526,7 @@ check("1i. token lewat parameter ?token= juga diterima", metricsQueryToken.statu
 
 const adminMetrics = await admin.call("GET", "/api/v1/admin/metrics");
 check("2a. admin membaca /api/v1/admin/metrics", adminMetrics.status === 200 && typeof adminMetrics.json?.numbers === "object", `${adminMetrics.status} ${short(Object.keys(adminMetrics.json ?? {}))}`);
-check("2b. versi skema = 18 (dari tabel migrasi)", Number(adminMetrics.json?.schemaVersion) === SCHEMA_VERSION && Number(adminMetrics.json?.schemaVersion) === 18, short(adminMetrics.json?.schemaVersion));
+check(`2b. versi skema = ${SCHEMA_VERSION} (dari tabel migrasi)`, Number(adminMetrics.json?.schemaVersion) === SCHEMA_VERSION, short(adminMetrics.json?.schemaVersion));
 const liveNumbers = adminMetrics.json?.numbers ?? {};
 check("2c. angka cocok dengan hitungan tabel langsung",
   Number(liveNumbers.users_total) === tableCount("SELECT COUNT(*) AS n FROM users WHERE deleted_at IS NULL")

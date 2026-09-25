@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, type Artifact, type AuditEvent, type ExecutionDetail, type Invitation, type KnowledgeDocument, type KnowledgeHit, type Member, type Workflow, type WorkflowExecution, type WorkflowStep } from './api';
+// Wave 11A (butir 48 & 49): pratinjau multi-format dan sunting artefak dengan riwayat revisi.
+import { ArtifactPreview } from './ArtifactPreview';
+import { ArtifactEditor } from './ArtifactEditor';
 
 const STEP_TYPES: WorkflowStep['type'][] = ['prompt', 'condition', 'branch', 'approval', 'delay'];
 const TERMINAL = ['completed', 'failed', 'cancelled'];
@@ -39,7 +42,8 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
   const [intervalMinutes, setIntervalMinutes] = useState(60);
   const [cron, setCron] = useState('');
   const [previewId, setPreviewId] = useState<string | null>(null);
-  const [previewText, setPreviewText] = useState('');
+  // Wave 11A (butir 48): id artefak yang sedang dibuka di modal sunting.
+  const [editId, setEditId] = useState<string | null>(null);
 
   // Team state
   const [members, setMembers] = useState<Member[]>([]);
@@ -78,18 +82,13 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
   async function loadTeam() { if (!workspaceId) return; setMembers(await api.members(workspaceId)); setInvitations(await api.invitations(workspaceId)); }
   async function loadArtifacts() { setArtifacts(await api.artifacts(projectId)); }
 
-  /** Shows an artifact inside the page: image and PDF are rendered, text is loaded as plain text. */
-  async function openPreview(artifact: Artifact) {
+  /**
+   * Membuka atau menutup pratinjau satu artefak. Pemilihan penampil (docx/xlsx/pptx/md/html/csv/
+   * gambar/pdf/teks) dan pemuatan isinya ditangani `ArtifactPreview`, jadi di sini hanya perlu
+   * menyimpan id artefak yang sedang dibuka.
+   */
+  function openPreview(artifact: Artifact) {
     setPreviewId(previewId === artifact.id ? null : artifact.id);
-    setPreviewText('');
-    const type = artifact.mimeType || '';
-    if (type.startsWith('image/') || type === 'application/pdf') return;
-    try {
-      const response = await fetch(api.artifactRawUrl(artifact.id), { credentials: 'include' });
-      setPreviewText(response.ok ? (await response.text()).slice(0, 4000) : 'Gagal memuat pratinjau.');
-    } catch (error) {
-      setPreviewText(error instanceof Error ? error.message : String(error));
-    }
   }
 
   /** Removes one artifact after the user confirms. */
@@ -100,7 +99,7 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
     await guard(async () => {
       const hasil = await api.bulkDeleteArtifacts(pilihArtifact);
       setPilihArtifact([]);
-      if (previewId && !hasil.deleted) { setPreviewId(null); setPreviewText(''); }
+      if (previewId && !hasil.deleted) { setPreviewId(null); setEditId(null); }
       await loadArtifacts();
       setMessage(hasil.skipped.length
         ? `${hasil.deleted} artefak dihapus, ${hasil.skipped.length} dilewati karena bukan milik Anda.`
@@ -112,7 +111,8 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
     if (!window.confirm(`Hapus artifact "${artifact.name}"?`)) return;
     await guard(async () => {
       await api.deleteArtifact(artifact.id);
-      if (previewId === artifact.id) { setPreviewId(null); setPreviewText(''); }
+      if (previewId === artifact.id) setPreviewId(null);
+      if (editId === artifact.id) setEditId(null);
       await loadArtifacts();
       setMessage(`Artifact "${artifact.name}" sudah dihapus.`);
     });
@@ -445,15 +445,26 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
             <b>{artifact.name}</b>
             <small>{artifact.mimeType} · {(artifact.sizeBytes / 1024).toFixed(1)} KB · {artifact.sha256.slice(0, 10)}…</small>
             <a className="download" href={`/api/v1/artifacts/${artifact.id}/download`} target="_blank" rel="noreferrer">Unduh</a>
-            <button type="button" className="link-button" onClick={() => void openPreview(artifact)}>{previewId === artifact.id ? 'Tutup pratinjau' : 'Pratinjau'}</button>
+            <button type="button" className="link-button" onClick={() => openPreview(artifact)}>{previewId === artifact.id ? 'Tutup pratinjau' : 'Pratinjau'}</button>
+            <button type="button" className="link-button" data-testid={`artifact-edit-${artifact.id}`} onClick={() => setEditId(editId === artifact.id ? null : artifact.id)}>{editId === artifact.id ? 'Tutup sunting' : 'Sunting'}</button>
             <button type="button" className="link-button danger" onClick={() => void removeArtifact(artifact)}>Hapus</button>
             {previewId === artifact.id && (
               <div className="artifact-preview-box">
-                {(artifact.mimeType || '').startsWith('image/')
-                  ? <img className="artifact-preview" src={api.artifactRawUrl(artifact.id)} alt={artifact.name} />
-                  : artifact.mimeType === 'application/pdf'
-                    ? <iframe className="artifact-preview" src={api.artifactRawUrl(artifact.id)} title={artifact.name} />
-                    : <pre className="artifact-preview-text">{previewText || 'Memuat pratinjau…'}</pre>}
+                <ArtifactPreview
+                  artifact={{ id: artifact.id, name: artifact.name, mimeType: artifact.mimeType, sizeBytes: artifact.sizeBytes }}
+                  onError={setMessage}
+                />
+              </div>
+            )}
+            {editId === artifact.id && (
+              <div className="artifact-preview-box">
+                <ArtifactEditor
+                  artifactId={artifact.id}
+                  artifactName={artifact.name}
+                  onClose={() => setEditId(null)}
+                  onChanged={(info) => { setMessage(`Artefak "${artifact.name}" tersimpan sebagai revisi ${info.revision}.`); void loadArtifacts(); }}
+                  onError={setMessage}
+                />
               </div>
             )}
           </div>

@@ -5,6 +5,9 @@ WORKDIR /app
 COPY coder-platform/package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY coder-platform/dist/api ./dist/api
+# Butir 61: 10 soal benchmark tetap dibaca dari berkas ini saat berjalan; tanpa baris ini
+# image produksi tidak punya berkasnya dan benchmark gagal start.
+COPY coder-platform/apps/api/benchmark ./apps/api/benchmark
 COPY coder-platform/public ./public
 RUN mkdir -p /app/data /app/backups /app/engine-sessions
 ENV NODE_ENV=production HOST=0.0.0.0 PORT=3402 DATA_DIR=/app/data PUBLIC_DIR=/app/public PRIME_AGENT_BIN=prime-agent ENGINE_ROOT_DIR=/app/engine-sessions

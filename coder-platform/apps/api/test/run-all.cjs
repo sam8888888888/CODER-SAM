@@ -3,6 +3,9 @@
  * Suite yang butuh mesin AI nyata (real-ai, real-usage) TIDAK dijalankan di sini karena butuh
  * PRIME_AGENT_PROVIDER/PRIME_AGENT_MODEL; jalankan terpisah.
  *
+ * Suite yang MERAH menulis log utuhnya ke /tmp/verify-logs/<suite>.log (atau VERIFY_LOG_DIR),
+ * supaya kegagalan berbasis waktu bisa didiagnosis sesudahnya.
+ *
  * Pakai: node apps/api/test/run-all.cjs
  */
 const { spawnSync } = require("node:child_process");
@@ -49,6 +52,11 @@ let failed = 0;
 const results = [];
 if (!runTestTypeGate()) failed += 1;
 if (!runMigrationGate()) failed += 1;
+// Suite yang merah WAJIB meninggalkan log utuh: ringkasan tiga baris terakhir tidak cukup untuk
+// mendiagnosis kegagalan berbasis waktu (pelajaran 26 Sep 2026: suite wave11a.e2e.ts merah 7
+// pemeriksaan di gerbang penuh, tetapi log lengkapnya sudah hilang sehingga sebabnya tidak bisa
+// dipastikan). Log ditulis di luar repo supaya tidak ikut ke paket rilis.
+const logDir = process.env.VERIFY_LOG_DIR || "/tmp/verify-logs";
 for (const suite of suites) {
   const started = Date.now();
   const run = spawnSync(process.execPath, ["--import", "tsx", path.join(here, suite)], { cwd: root, encoding: "utf8", env: { ...process.env } });
@@ -56,9 +64,20 @@ for (const suite of suites) {
   const output = `${run.stdout || ""}${run.stderr || ""}`;
   const tail = output.trim().split("\n").slice(-3).join(" | ");
   const ok = run.status === 0;
-  if (!ok) failed += 1;
+  let jejak = "";
+  if (!ok) {
+    failed += 1;
+    try {
+      fs.mkdirSync(logDir, { recursive: true });
+      const berkas = path.join(logDir, `${suite}.log`);
+      fs.writeFileSync(berkas, output);
+      jejak = ` -> log utuh: ${berkas}`;
+    } catch (error) {
+      jejak = ` (gagal menulis log utuh: ${String(error)})`;
+    }
+  }
   results.push({ suite, ok, ms, tail });
-  console.log(`${ok ? "OK  " : "GAGAL"} ${suite.padEnd(28)} ${String(ms).padStart(6)}ms  ${tail.slice(0, 160)}`);
+  console.log(`${ok ? "OK  " : "GAGAL"} ${suite.padEnd(28)} ${String(ms).padStart(6)}ms  ${tail.slice(0, 160)}${jejak}`);
 }
 const total = suites.length + 2;
 console.log("");

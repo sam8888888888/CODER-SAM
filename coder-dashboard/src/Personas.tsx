@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from './api';
 import type { Persona, ThinkingLevel } from './api';
+import { PersonaTransfer } from './PersonaTransfer';
 
 /** Properti halaman "Persona agen": pelapor galat dari induk halaman. */
 type Props = {
@@ -392,6 +393,9 @@ export function Personas({ onError }: Props) {
       {notice ? (
         <p className="rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-slate-100">{notice}</p>
       ) : null}
+
+      {/* Butir 64: ekspor dan impor persona lewat berkas JSON. */}
+      <PersonaTransfer onError={onError} onDone={() => void loadPersonas()} />
 
       {/* 1. Form buat persona. */}
       <div className={CARD}>

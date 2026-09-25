@@ -3,7 +3,7 @@
 Dikumpulkan atas perintah Bapak: "SEMUA MASALAH DAN YANG BELUM BERES, DIKUMPULKAN,
 NANTI TERAKHIR KITA BERESKAN SATU PER SATU."
 
-Versi platform saat daftar ini diperbarui: **v0.20.1 (Wave 10 penuh + perbaikan dashboard butir 41)**. **LIVE di server Austria sejak 19 Sep 2026 12:38 UTC; smoke produksi 199 lulus, 0 gagal; uji UI peramban 33/33 lulus.** Rincian bukti: `docs/STATUS.md` bagian "Deploy & operasi produksi v0.20.1".
+Versi platform saat daftar ini diperbarui: **v0.20.1 (Wave 10 penuh + perbaikan dashboard butir 41)**. | CATATAN 26 Sep 2026: Wave 11A (butir 42-57, 79, 80) sudah **selesai di kode, BELUM di-deploy** (v0.21.0, skema 19). Lihat bagian "6. WAVE 11" di bawah.
 Legenda status: [BAPAK] butuh keputusan/izin Bapak · [TEKNIS] pekerjaan teknis yang bisa saya kerjakan ·
 [FITUR] fitur yang belum ada · [RISIKO] temuan yang berpotensi berbahaya.
 
@@ -241,7 +241,189 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
     (termasuk "halaman Kunci API menampilkan IP terakhir yang dicatat server"), produksi LIVE
     `0.20.1`, smoke produksi 199 lulus / 0 gagal, dan bundel LIVE memuat label kolom barunya.
 
----
+## 6. WAVE 11 (butir 42–83) — PRD `PRD_WAVE_11_EKSEKUSI_v5.md`
+
+Sumber: PRD Wave 11 versi 5 (25 Sep 2026), **42 butir** (42–83), dikerjakan bertahap:
+**11A → v0.21.0 · 11B → v0.22.0 · 11C → v0.23.0**. Bagian ini menggantikan cara nomor 42–83
+disebut satu per satu; rincian bukti ada di `docs/STATUS.md` bagian "Wave 11A".
+
+### 6.1 Wave 11A (v0.21.0) — SUDAH DI KODE, BELUM DI-DEPLOY (26 Sep 2026)
+
+18 butir: 42, 43, 44, 45, 46, 47, 48, 49, 51, 52, 53, 54, 55, 56, 57, 79, 80 — dan 50 TERTAHAN.
+Gerbang: `npm run verify` hijau (44/44 suite), skema 18 → 19, suite baru 176 + 127 + 84 + 187 =
+**574 pemeriksaan API**, uji UI peramban **97/97 lulus**.
+
+| # | Butir | Status | Bukti singkat |
+|---|-------|--------|---------------|
+| 42 | Mode diskusi/eksekusi | SELESAI (kode+uji); 1 bagian DoD butuh mesin nyata | `wave11a §1` 15; blok mode prioritas 0 terkirim ke mesin |
+| 43 | Enkripsi rahasia at-rest | SELESAI | `wave11a-rahasia §1+§2` 65; teks asli tidak ada di DB/jawaban |
+| 44 | Isolasi kredensial antar-sesi | SELESAI | `wave11a-rahasia §3` 20 + `wave11a §3b` 7 |
+| 45 | Filter anti prompt-hijack | SELESAI | `wave11a §4` 20; 10 serangan diblokir, 10 kalimat wajar lolos |
+| 46 | Guardrails | SELESAI | `wave11a §5` 24 + uji UI panel pelanggaran |
+| 47 | Kebijakan alat | SELESAI (bawaan kosong = semua alat, lihat catatan) | `wave11a §6` 14 + uji UI halaman |
+| 48 | Tulis-balik artefak + riwayat | SELESAI | `wave11a-artefak` 84 + uji UI 4 |
+| 49 | Preview Word/Excel/PowerPoint | SELESAI | uji UI 8 (docx/xlsx/pptx/md, >10 MB, docx rusak) |
+| 50 | Generasi & edit/gabung gambar | TERTAHAN sesuai PRD | — |
+| 51 | Skill pengguna | SELESAI | `wave11a §7` 18 |
+| 52 | Knowledge base platform | SELESAI | `wave11a §8` 15 |
+| 53 | Audit-diri kredensial | SELESAI | `wave11a-rahasia §4` 39 + uji UI kartu Kesehatan platform |
+| 54 | Hapus semua riwayat | SELESAI | `wave11a §10` 16 + uji UI 4 |
+| 55 | Tombol instal HP + panduan iOS | SELESAI | uji UI 6 |
+| 56 | Playground kalkulator biaya | SELESAI | `wave11a §11` 9 |
+| 57 | Fallback model otomatis | SELESAI | `wave11a §12` 16 |
+| 79 | CSP + netralisasi HTML | SELESAI | `wave11a-csp` 187 (naik 2 tiap halaman baru); header CSP di nginx = kode |
+| 80 | Pagar konteks total | SELESAI | `wave11a §13` 14 |
+
+Yang **belum** beres di 11A dan perlu perhatian Bapak:
+- **Deploy v0.21.0** belum dijalankan (butuh izin): skema naik ke 19, butuh gerbang migrasi di
+  salinan cadangan + `SECRETS_KEY` diisi di `.env` server. Tanpa `SECRETS_KEY`, rute rahasia
+  menjawab `503 SECRETS_KEY_MISSING`. Sembilan kunci baru sudah masuk `.env.austria.example` dan
+  `deploy/env.keys.txt`, jadi `env-sync.sh` akan menambahkannya sendiri saat deploy.
+- **Butir 42 bagian DoD** ("perintah tulis berkas tidak menghasilkan artefak saat mode diskusi")
+  belum bisa dibuktikan dengan mesin mock — butuh mesin AI nyata.
+- **Butir 48**: pagar anti-bentrok-tulis hanya berlaku di dalam satu proses; dua pekerja terpisah
+  tidak saling melihat.
+- **Butir 79**: gaya inline di dalam dokumen Word yang ditampilkan lewat `srcdoc` bisa hilang karena
+  mewarisi CSP halaman induk (isi tetap terbaca, skrip tetap diblokir).
+- **Butir 40 (dari daftar lama)**: direktori uji di `/tmp` masih menumpuk (~174 direktori, ~800 MB),
+  menunggu izin hapus.
+
+### 6.2 Wave 11B (v0.22.0) — SELESAI DI KODE, BELUM DI-DEPLOY (26 Sep 2026)
+
+Butir 58–67, 83, **plus butir 72** (ditarik dari 11C karena 83 memprasyaratkannya). Skema **19 → 20**.
+Gerbang: `npm run verify` **48/48 suite hijau** keluar 0; empat suite 11B (81/92/111/103 lulus, 0 gagal,
+**0 dilewati**) = **387 pemeriksaan API**; tsc 0 galat; gerbang migrasi OK; gerbang env 70/0; rincian di
+`docs/STATUS.md` bagian "Wave 11B (v0.22.0)".
+
+Yang perlu diketahui operator (bukan bug, tapi bisa mengejutkan):
+- Butir 58 (dewan juri): pemotongan kuota hanya berlaku **antar-gelombang** juri (paralel maksimum 2).
+- Butir 61 (benchmark): berkas `apps/api/benchmark/questions.json` **wajib ikut ke image**; kedua
+  Dockerfile sudah diberi baris `COPY`. Tanpa itu produksi gagal `BENCHMARK_QUESTIONS_MISSING`.
+- Butir 59 (uji bayangan): bawaan **mati**; admin boleh menyalakan lewat API; pencatatan gagal-aman.
+- Butir 63 (lanjutkan run): otomatis maksimum 1, manual maksimum 3, tanpa rantai lanjutan, dan
+  percakapan mode diskusi tidak pernah dilanjutkan otomatis.
+- Antarmuka 11B (halaman Jadwal, Benchmark, Timeline, Pemakaian/Aktivitas saya, laporan galat admin,
+  kartu mode bayangan & saldo token, tab Pelajaran, tombol dewan juri, tombol Lanjutkan, ekspor/impor
+  persona) dikerjakan agen dashboard; angka uji peramban diisi setelah gerbang peramban selesai.
+- **Menunggu keputusan Bapak sebelum rilis:** menyetel `APP_VERSION=0.23.0` di `.env` server saat
+  deploy, bersama `SECRETS_KEY` dan `CSP_ENABLED` (dua kunci terakhir wajib ada supaya fitur 11A hidup).
+
+### 6.3 Wave 11C (v0.23.0) — SELESAI DI KODE, BELUM DI-DEPLOY (13 butir, skema 20 → 21, port 7320–7349)
+
+68 Notion · 69 Bot Telegram · 70 Bot WhatsApp (Twilio) · 71 Katalog plugin & konektor ·
+72 Jadwal prompt (**sudah dikerjakan di Wave 11B**) · 73 Grup chat multi-agen · 74 Nominal unik 3 digit ·
+75 Kupon TRIAL · 76 Avatar agen & foto profil · 78 Periksa versi mesin (tahap 1 saja) ·
+81 Identitas & penagihan kanal bot · 82 Isolasi proses konektor · 77 ⏸ TERTAHAN (login Google).
+
+Keadaan 26 Sep 2026 — **kode selesai, gerbang hijau, belum ada deploy/restart/commit.** Skema
+**20 → 21** (`user_integrations`, `bot_channels`, `bot_identities`, `connectors`,
+`conversation_participants`, `conversations.kind`, `orders.unique_amount_idr`, `coupons.trial` +
+`coupons.trial_plan_code`, `users.avatar_path`), `config.ts` / `dataexport.ts` / `jobs.ts` diperbarui,
+kunci baru masuk `.env.austria.example` **dan** `deploy/env.keys.txt` (gerbang env 70/0).
+
+Gerbang: tipe 0 galat (dua tsconfig) · **459 pemeriksaan API Wave 11C, 0 gagal, 0 dilewati**
+(9 suite, dijalankan side lead) · uji sambung 23/23 (22 rute menjawab 401/403, rute palsu 404) ·
+`npm run verify` **57/57 suite hijau + `ALL_SUITES_PASSED`** · antarmuka dashboard Wave 11C (halaman Notion, Kanal bot, Konektor, nominal unik di Tagihan, foto profil/avatar, kartu versi mesin) build 0 galat + uji peramban **222/222 lulus, 0 gagal, 1 dilewati jujur** (naik 53 pemeriksaan dari 169; 3 jalan agen + 2 jalan lead, semua 222/222).
+Rincian per butir + 21 catatan jujur ada di `docs/STATUS.md` § "Wave 11C (v0.23.0)".
+
+Operator notes (penting sebelum rilis):
+- Paket rilis Wave 11 **wajib** menyetel `APP_VERSION=0.23.0` di `.env` peladen (sekarang masih `0.19.0`).
+- Butir 76: JPEG/WebP ditolak `503 IMAGE_PROCESSOR_UNAVAILABLE` sampai pemroses gambar dipasang.
+- Butir 78 **tahap 2** (perbarui + rollback mesin) tidak dibuat: menunggu keputusan **K5**.
+- Butir 74: pesanan yang sudah punya kode nominal dijawab 200 (bahkan setelah dibayar) supaya
+  rekonsiliasi bank tetap jalan; kalau Bapak ingin 409 untuk pesanan non-pending, itu satu baris.
+- Butir 73: giliran percakapan grup **SUDAH DIKUNCI** (26 Sep 2026). Penanda "satu giliran berjalan" diperiksa dan diklaim di dalam SATU transaksi tulis, jadi dua giliran bersamaan tidak mungkin membuat dua run; yang kalah dijawab `409 GROUP_TURN_BUSY` beserta `runId` pemenangnya (bukti dua proses: `wave11c-grup` 73 cek). Batas jujurnya: giliran yang macet akan dilepas oleh `run.reap` setelah ±45 menit.
+- Butir 74 **cabang `409 GATEWAY_EXACT_AMOUNT` belum bisa dicapai lewat API publik** (temuan agen UI, sudah saya periksa sendiri di kode): rute `POST /api/v1/billing/orders` hanya menerima `planCode`, `months`, `couponCode`, `note` — tidak ada `method` — sehingga `billing.ts` selalu memakai `method` = `free` (total 0) atau `manual`. Jadi penolakan nominal unik untuk pesanan gateway benar sebagai pengaman, tetapi belum ada alur pesanan gateway yang bisa memicunya. UI menuliskan kedua kode apa adanya dan uji memverifikasi `409 ORDER_NOT_PENDING` yang nyata. Tidak saya ubah karena keputusan butir 74 adalah "jangan diubah".
+
+Yang **tidak** bisa diuji penuh tanpa bahan dari Bapak (kode tetap dibuat, uji memakai hulu tiruan):
+- Butir 68: **SUDAH diuji nyata 26 Sep 2026** dengan token Bapak — lihat §6.5. Yang belum: integrasi Notion khusus produksi (Bapak akan membuatkannya).
+- Butir 69/81: **jalur KELUAR Telegram sudah diuji nyata 26 Sep 2026** (§6.5); yang belum diuji dengan layanan asli adalah pembaruan MASUK (`setWebhook` belum dipanggil) dan seluruh jalur Twilio/WhatsApp (butir 70) — kredensial Twilio sungguhan belum ada.
+- Butir 71: badan kiriman gaya Slack/Discord **sudah terbukti diterima penangkap webhook nyata** (§6.5), tetapi belum diterima Slack/Discord asli karena URL Incoming Webhook sungguhan belum ada.
+- Butir 78: mesin sungguhan tidak dijalankan; versi dibaca dari biner tiruan (`prime-agent --version`
+  mencetak `0.9.5` ke stderr — itu fakta dari luar suite, bukan dari uji).
+
+### 6.4 Keputusan Bapak 26 Sep 2026 (rencana rilis Wave 11) — dicatat apa adanya
+
+1. **Rilis v0.23.0 disetujui** dengan urutan: commit → tag → `.env` peladen diisi `APP_VERSION=0.23.0`,
+   `SECRETS_KEY` (dibuat dengan `openssl rand -base64 32`, disimpan), `CSP_ENABLED=true` → paket rilis →
+   deploy Austria → smoke. Alasan CSP aman dinyalakan: sudah diukur di peramban asli (0 galat); **tidak ada
+   mode report-only**, jadi bila halaman rusak satu-satunya jalan balik adalah menyetel `CSP_ENABLED=false`.
+   Recon 26 Sep 2026: `.env` peladen (83 baris) belum punya `SECRETS_KEY` maupun `CSP_ENABLED`;
+   `APP_VERSION` masih `0.20.2`; `MOCK_ENGINE=false` (mesin sungguhan, provider deepseek).
+2. **`sharp` TIDAK dipasang.** Butir 76 diselesaikan di sisi peramban: berkas JPEG/WebP diubah ke PNG
+   lewat `<canvas>` (`canvas.toBlob(..., "image/png")`, dipotong 512×512) SEBELUM diunggah. Unggahan
+   mentah JPEG/WebP langsung ke API tetap ditolak `503 IMAGE_PROCESSOR_UNAVAILABLE` — itu disengaja.
+   `sharp` hanya dipertimbangkan bila nanti ada kebutuhan unggah langsung lewat API.
+3. **Butir 78 tahap 2 (perbarui + rollback) TETAP DITANGGUHKAN.** Syarat membangunnya: v0.23.0 sudah stabil
+   DAN ada satu percobaan rollback paket yang terbukti.
+4. **Butir 74 tidak diubah** (keputusan Bapak: kode sudah benar). Catatan jujur hasil pemeriksaan saya:
+   yang idempoten lebih dulu adalah kasus "sudah punya kode" — pesanan **pending** yang sudah punya kode
+   dijawab 200 (klik ganda tidak mengubah nominal), dan pesanan **non-pending TANPA kode** dijawab
+   409 `ORDER_NOT_PENDING`. Kasus "non-pending DAN sudah punya kode" saat ini juga dijawab 200 (kode dibaca
+   lebih dulu), bukan 409 — itu yang menjaga rekonsiliasi bank. Bila Bapak mau varian ketat (409 untuk
+   semua non-pending), perubahannya satu baris di `wave11c/bayar.ts`.
+5. **Kunci giliran grup ditambahkan** (butir 73): satu percakapan grup hanya boleh punya satu giliran
+   berjalan; giliran kedua dijawab 409 `GROUP_TURN_BUSY`. Ini pengaman biaya, bukan fitur.
+6. **Kredensial nyata**: Bapak akan memberi token bot Telegram + satu webhook Slack/Discord; token Notion
+   sudah ada di penyimpanan Bapak. Uji jalur asli menunggu nilai itu (saya tidak menebak rahasia).
+7. **Bersih-bersih dijalankan 26 Sep 2026**: 498 folder `/tmp/coder-*` dihapus (`/tmp` 2,1 GB → 256 MB;
+   disk 86% → 84%, sisa 17 GB) dan proses sisa `vite --port 5199` (pid 6156/6170/6171 + esbuild 6179)
+   dihentikan — keempatnya sekarang zombie, tidak memakai CPU/RAM.
+
+### 6.5 Uji keluar SUNGGUHAN 26 Sep 2026 (Telegram, Notion, konektor) — hasil apa adanya
+
+Kredensial uji dari Bapak dipakai **hanya** untuk pengujian: berkasnya di luar repo (izin 600),
+**sudah dihapus (shred)** sesudah uji, tidak satu pun nilainya ditulis di dokumen ini atau di berkas repo.
+Skrip uji juga di luar repo (`/workspace/outputs/`), jadi `npm run verify` tidak pernah menyentuhnya.
+
+1. **Telegram (butir 69/81) — DITERIMA API ASLI.** Dari jalur kode kita sendiri: kanal bot dibuat lewat
+   rute admin (rahasia webhook tersegel) → penautan chat lewat kode sekali pakai → 200 pemilik benar →
+   webhook masuk (pembaruan disimulasikan) 200 `diterima:true` + run nyata → pekerja `bot.reply` status
+   `done` → `POST https://api.telegram.org/bot<token>/sendMessage` **200 `ok:true`, `message_id=4`**, pesan
+   benar-benar terbuat di DM Bapak. `getMe`/`getChat` juga 200. 11/11 periksa lulus, 0 gagal.
+2. **Notion (butir 68) — DITERIMA API ASLI.** `PUT /api/v1/integrations/notion` 200 dengan `users/me` nyata
+   (nama workspace terbaca) · `POST /api/v1/integrations/notion/pages` membuat halaman di bawah halaman induk
+   yang Notion wajibkan · halaman itu **diarsipkan** dan `GET /v1/pages/<id>` membalas `archived=true`
+   (bukti halamannya nyata, sekaligus bukti tidak ada sampah ditinggal di Notion Bapak) · `DELETE` integrasi 200 ·
+   token tersegel `enc:v1:` dan tidak pernah kembali lewat API · token asli tidak ditemukan di `coder.db`
+   maupun `coder.db-wal` (basis data memakai WAL — memeriksa `.db` saja tidak cukup, pelajaran nyata).
+3. **Konektor Slack/Discord (butir 71/82) — SAMPAI ke penangkap webhook nyata.** `POST /connectors/<id>/test`
+   mengirim gaya Slack `{text,username}` dan gaya Discord `{content,username}`; keduanya `hulu=200` di sisi kita
+   dan **tercatat di penangkap** dengan user-agent `node` + penanda uji unik. Baris konektor uji dibersihkan,
+   katalog kembali seperti semula.
+
+**Batas jujur yang belum terbukti:**
+- Slack/Discord **asli** belum mengesahkan payload (baru penangkap yang menerima) — butuh URL Incoming Webhook asli.
+- Pembaruan MASUK Telegram belum diuji dengan layanan asli: `setWebhook` sengaja tidak dipanggil karena alamat
+  kita masih `127.0.0.1` dan `BOT_WEBHOOK_BASE_URL` kosong; memanggilnya akan mengarahkan webhook bot Bapak ke
+  alamat tidak sah. Perlu keputusan Bapak (alamat publik) sebelum diuji.
+- Twilio/WhatsApp (butir 70) tidak diuji ke layanan asli: belum ada kredensial.
+- Batas laju (429) dan cabang cadangan "teks polos" Telegram belum terpicu di API asli.
+- Eksekusi mesin tetap mesin tiruan; yang nyata pada uji ini adalah jalur keluar, kanal, penautan, dan webhook.
+- Batas pribadi Bapak dihormati: uji Telegram dibatasi 2 pesan (terpakai 1).
+
+### 6.6 Kerapuhan gerbang rilis: port uji yang diblokir `fetch` — SUDAH DITUTUP (26 Sep 2026)
+
+Ini bukan cacat produk, tapi cacat **harness uji** yang bisa membuat gerbang rilis merah tanpa sebab produk:
+
+1. **Akar masalah (TERBUKTI, bukan dugaan).** `fetch()` Node menolak daftar "bad port" spesifikasi Fetch. Bila nomor
+   acak yang dipilih suite kebetulan ada di daftar itu, setiap `fetch` gagal seketika
+   (`TypeError: fetch failed`, cause `bad port`), sementara sambungan TCP biasa dan `node:http` ke port yang sama
+   menjawab normal — jadi suite melapor "server tidak siap" padahal peladen uji hidup. Bukti jejak:
+   `tcp=tersambung httpPolos=HTTP 200 ragamGalatFetch=160x ... bad port`. Ini yang menjatuhkan gerbang putaran 5
+   (`wave6.e2e.ts`, nomor 6566) dan sudah direproduksi 2 kali dari 24 putaran mandiri.
+2. **Daftar diukur, bukan dihafal**: pada rentang 3300–7599 nomor terblokir = 3659, 4045, 4190, 5060, 5061, 6000,
+   6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697.
+3. **Perbaikan**: berkas baru `apps/api/test/port-aman.ts` (`PORT_TERBLOKIR_FETCH` + `pilihPortUji()`), dipakai
+   `wave6.e2e.ts`, `csrf-limits.e2e.ts`, dan `outbox-mail.e2e.ts` (satu-satunya tiga suite yang rentang portnya kena).
+   Gerbang baru `port-uji-fetch-aman.e2e.ts` **20/20 hijau** memindai seluruh berkas uji agar tidak ada suite yang
+   kembali memakai rentang mentah berisi nomor terblokir.
+4. **Diagnosis dibuat permanen**: `wave11a.e2e.ts` dan `wave6.e2e.ts` mencetak jejak saat batas waktu habis, dan
+   `run-all.cjs` menyimpan log UTUH setiap suite merah. Tidak ada pemeriksaan yang dilemahkan.
+5. **Sisa yang jujur belum terbukti**: gerbang putaran 2 merah di `wave11a.e2e.ts` (169/176, 97,8 dtk). Dugaan
+   terkuat — suite berat lain (`paket_integritas`) berjalan di dalam jendela putaran itu, melanggar aturan "jangan
+   menjalankan dua gerbang node berat berbarengan" — belum direproduksi, jadi tidak dinyatakan sebagai sebab.
+   Aturan kerja yang saya pakai sekarang: dua putaran gerbang penuh berturut-turut harus hijau, tanpa beban paralel.
 
 ### Cara memakai daftar ini
 Bapak cukup menyebut NOMOR (mis. "bereskan 15, 17, 24"). Saya kerjakan satu per satu, dengan

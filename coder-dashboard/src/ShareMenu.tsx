@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
+import { api, failureOf, type NotionPage } from './api';
 
 // Menu bagikan/ekspor untuk satu jawaban.
-// Isi menu: salin teks, unduh berkas .md, dan cetak/simpan sebagai PDF.
+// Isi menu: salin teks, unduh berkas .md, cetak/simpan sebagai PDF, dan (butir 68) kirim ke Notion.
+// Pengiriman ke Notion memakai rute server yang sama seperti halaman Notion; jawaban server ditampilkan
+// apa adanya, termasuk kode galat seperti NOTION_NOT_CONNECTED.
 type Props = {
   title?: string;
   content: string;
@@ -15,7 +18,15 @@ const STATUS_SALIN = 'Tersalin';
 const STATUS_GAGAL_SALIN = 'Gagal menyalin';
 const STATUS_GAGAL_POPUP = 'Popup diblokir peramban';
 const STATUS_UNDUH = 'Berkas .md diunduh';
+const LABEL_NOTION = 'Kirim ke Notion';
+const STATUS_NOTION = 'Terkirim ke Notion';
 const STATUS_DURASI_MS = 2000;
+
+/** Server menolak halaman dengan judul kosong; judul bawaan dipakai kalau tidak ada judul jawaban. */
+function judulNotion(title?: string): string {
+  const bersih = (title ?? '').trim();
+  return bersih.length > 0 ? bersih.slice(0, 200) : 'Jawaban COBLAI';
+}
 
 // Ubah judul menjadi nama berkas yang aman: huruf kecil, spasi jadi '-', maksimal 48 karakter.
 function slugJudul(title?: string): string {
@@ -61,6 +72,11 @@ pre { white-space: pre-wrap; word-wrap: break-word; font-family: inherit; font-s
 export function ShareMenu({ title, content }: Props): JSX.Element {
   const [terbuka, setTerbuka] = useState<boolean>(false);
   const [status, setStatus] = useState<string>('');
+  // Butir 68: hasil kirim ke Notion. Disimpan terpisah dari status singkat supaya tautannya tetap
+  // bisa dibuka walau tulisan status sudah hilang.
+  const [notionSibuk, setNotionSibuk] = useState<boolean>(false);
+  const [notionHasil, setNotionHasil] = useState<NotionPage | null>(null);
+  const [notionGalat, setNotionGalat] = useState<string>('');
   const wadahRef = useRef<HTMLDivElement | null>(null);
   const tombolRef = useRef<HTMLButtonElement | null>(null);
   const timerRef = useRef<number | null>(null);
@@ -176,6 +192,29 @@ export function ShareMenu({ title, content }: Props): JSX.Element {
     }
   }
 
+  /**
+   * Butir 68: kirim isi jawaban ini ke Notion sebagai satu halaman.
+   * Server memakai token tersegel milik pengguna; kalau belum tersambung, jawabannya 409
+   * NOTION_NOT_CONNECTED dan kalimat itu ditampilkan apa adanya.
+   */
+  async function kirimNotion(): Promise<void> {
+    setTerbuka(false);
+    if (notionSibuk) return;
+    setNotionSibuk(true);
+    setNotionGalat('');
+    setNotionHasil(null);
+    try {
+      const jawaban = await api.notionCreatePage({ title: judulNotion(title), content });
+      setNotionHasil(jawaban.halaman);
+      tampilkanStatus(STATUS_NOTION);
+    } catch (error) {
+      const detail = failureOf(error);
+      setNotionGalat(`${detail.message || detail.code} [${detail.code}]`);
+    } finally {
+      setNotionSibuk(false);
+    }
+  }
+
   return (
     <div className="relative inline-block" ref={wadahRef}>
       <button
@@ -227,12 +266,36 @@ export function ShareMenu({ title, content }: Props): JSX.Element {
             <span aria-hidden="true">&#128424;</span>
             <span>{LABEL_CETAK}</span>
           </button>
+          <button
+            type="button"
+            role="menuitem"
+            data-testid="bagikan-notion"
+            className="flex items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
+            disabled={notionSibuk}
+            onClick={() => { void kirimNotion(); }}
+          >
+            <span aria-hidden="true">&#128193;</span>
+            <span>{notionSibuk ? 'Mengirim…' : LABEL_NOTION}</span>
+          </button>
         </div>
       )}
 
       <span role="status" aria-live="polite" className="ml-2 align-middle text-xs text-slate-400">
         {status}
       </span>
+
+      {notionGalat ? (
+        <p role="alert" className="mt-1 text-xs text-rose-300" data-testid="bagikan-notion-galat">{notionGalat}</p>
+      ) : null}
+
+      {notionHasil ? (
+        <span className="mt-1 block text-xs text-emerald-300" data-testid="bagikan-notion-hasil" data-url={notionHasil.url}>
+          Notion: {notionHasil.id ? `${notionHasil.id} · ` : ''}
+          {notionHasil.url
+            ? <a className="underline" data-testid="bagikan-notion-url" href={notionHasil.url} target="_blank" rel="noreferrer">{notionHasil.url}</a>
+            : 'hulu tidak mengirim tautan halaman'}
+        </span>
+      ) : null}
     </div>
   );
 }

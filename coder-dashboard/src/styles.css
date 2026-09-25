@@ -183,3 +183,51 @@
 [data-theme="terang"] .file-chip:hover{color:#111827;border-color:#8b5cf6aa}
 [data-theme="terang"] .empty-side,[data-theme="terang"] .settings-hint,[data-theme="terang"] small{color:#475569}
 [data-theme="terang"] input,[data-theme="terang"] select,[data-theme="terang"] textarea{color:#0f172a}
+
+
+/* ============ Wave 11A (v0.21.0): pratinjau artefak, mode diskusi, instal, riwayat ============ */
+/* Pratinjau artefak (butir 49). */
+.preview-panel{margin-top:10px;border:1px solid rgba(148,163,184,.25);border-radius:12px;padding:10px;background:rgba(15,23,42,.4);display:flex;flex-direction:column;gap:8px}
+.preview-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;font-size:12px;color:#cbd5e1}
+.preview-toolbar b{color:#f8fafc}
+.preview-kind{background:#8b5cf622;border:1px solid #8b5cf655;color:#ddd6fe;border-radius:999px;padding:2px 8px;font-size:10px;letter-spacing:.06em;font-weight:700}
+.preview-toolbar .download{margin-left:auto;color:#a5b4fc;text-decoration:underline}
+.preview-note{margin:0;font-size:12px;color:#94a3b8}
+.preview-warn{font-size:12px;color:#fcd34d}
+.preview-frame{width:100%;min-height:360px;border:1px solid rgba(148,163,184,.25);border-radius:10px;background:#fff}
+.preview-table-box{max-height:420px;overflow:auto;border:1px solid rgba(148,163,184,.2);border-radius:10px}
+.preview-table{width:100%;border-collapse:collapse;font-size:12px;color:#e2e8f0}
+.preview-table th,.preview-table td{border-bottom:1px solid rgba(148,163,184,.18);padding:6px 8px;text-align:left;vertical-align:top}
+.preview-table th{position:sticky;top:0;background:#0b1220;color:#94a3b8;font-size:10px;letter-spacing:.06em;text-transform:uppercase}
+.preview-tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.preview-tab{background:rgba(30,41,59,.7);border:1px solid rgba(148,163,184,.25);color:#cbd5e1;border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer}
+.preview-tab.active{background:#4f46e5;border-color:#6366f1;color:#fff}
+.preview-pptx{max-width:100%;overflow:auto;background:#fff;border-radius:10px}
+.preview-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+/* Sunting artefak + riwayat revisi (butir 48). */
+.preview-editor{margin-top:10px;border:1px solid rgba(99,102,241,.4);border-radius:12px;padding:10px;background:rgba(30,27,75,.35);display:flex;flex-direction:column;gap:8px}
+.preview-editor-grid{display:grid;gap:8px;grid-template-columns:1fr;min-width:0}
+.preview-editor-field{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#cbd5e1}
+.preview-editor-field textarea{width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:rgba(15,23,42,.7);border:1px solid rgba(148,163,184,.3);border-radius:10px;color:#e2e8f0;padding:8px;resize:vertical}
+.preview-conflict{border:1px solid rgba(245,158,11,.5);background:rgba(245,158,11,.12);border-radius:10px;padding:8px;font-size:12px;color:#fde68a;display:flex;flex-direction:column;gap:6px}
+.preview-conflict p{margin:0}
+.preview-history{display:flex;flex-direction:column;gap:6px}
+.preview-history h4{margin:0;font-size:13px;color:#e2e8f0}
+/* Mode diskusi/eksekusi (butir 42). */
+.mode-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;border:1px solid rgba(148,163,184,.25);border-radius:12px;padding:8px 10px;margin:0 0 10px;background:rgba(15,23,42,.45);font-size:12px;color:#cbd5e1}
+.mode-bar.diskusi{border-color:rgba(56,189,248,.5);background:rgba(8,47,73,.5)}
+.mode-bar.eksekusi{border-color:rgba(139,92,246,.45)}
+.mode-button{background:rgba(30,41,59,.75);border:1px solid rgba(148,163,184,.25);color:#cbd5e1;border-radius:999px;padding:4px 12px;font-size:12px;cursor:pointer}
+.mode-button.active{background:#4f46e5;border-color:#6366f1;color:#fff;font-weight:600}
+.mode-button:disabled{opacity:.5;cursor:not-allowed}
+.mode-note{margin:0;color:#94a3b8}
+/* Bilah instal aplikasi (butir 55). */
+.install-banner{display:flex;flex-wrap:wrap;align-items:center;gap:10px;border:1px solid rgba(56,189,248,.4);background:rgba(8,47,73,.45);border-radius:12px;padding:10px;font-size:13px;color:#e0f2fe}
+.install-guide{margin:0;font-size:12px;color:#bae6fd}
+/* Dialog hapus riwayat (butir 54). */
+.history-danger{border:1px solid rgba(244,63,94,.45);background:rgba(76,5,25,.35);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;font-size:13px;color:#fecdd3}
+.history-danger input{background:rgba(15,23,42,.7);border:1px solid rgba(244,63,94,.5);border-radius:8px;color:#ffe4e6;padding:6px 8px}
+.history-danger .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+
+/* Wave 11C (butir 76): pratinjau foto profil dan avatar agen. */
+.avatar-preview { display: block; margin: 6px 0; border: 1px solid var(--line, #2a2f3a); }

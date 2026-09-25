@@ -26,7 +26,7 @@ import { db } from "./db.js";
 export type JobStatus = "queued" | "running" | "done" | "failed";
 
 /** Jenis pekerjaan yang dikenal platform. Jenis lain tetap boleh (dipakai uji), tetapi bukan bawaan. */
-export const JOB_KINDS = ["run.execute", "email.deliver", "retention.run", "smoke.cleanup", "run.reap", "workflow.reap", "webhook.deliver", "ratelimit.sweep"] as const;
+export const JOB_KINDS = ["run.execute", "email.deliver", "retention.run", "smoke.cleanup", "run.reap", "workflow.reap", "webhook.deliver", "ratelimit.sweep", "schedule.run", "resume.scan", "connector.deliver", "bot.reply"] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 export type JobRow = {
@@ -239,6 +239,10 @@ export function ensureRecurringJobs(now: Date = new Date()): string[] {
     // bentrok dua penyapu tidak berbahaya.
     { kind: "ratelimit.sweep", intervalMs: RATE_LIMIT_SWEEP_INTERVAL_MS, enabled: true, maxAttempts: 1 },
     { kind: "run.reap", intervalMs: REAP_INTERVAL_MS, enabled: true, maxAttempts: 1 },
+    // Wave 11B (butir 72): jadwal prompt diperiksa tiap menit — presisi cron terkecil yang dipakai.
+    { kind: "schedule.run", intervalMs: 60_000, enabled: true, maxAttempts: 1 },
+    // Wave 11B (butir 63): pemindai run yang putus. Jendela penandaan sama dengan `run.reap`.
+    { kind: "resume.scan", intervalMs: REAP_INTERVAL_MS, enabled: true, maxAttempts: 1 },
     { kind: "workflow.reap", intervalMs: REAP_INTERVAL_MS, enabled: true, maxAttempts: 1 },
   ];
   const created: string[] = [];

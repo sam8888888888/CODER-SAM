@@ -327,12 +327,15 @@ export function chargeQuota(userId: string, tokens: number): { moved: number; ba
 export type CouponRow = {
   code: string; percent: number; amountIdr: number; maxUses: number; uses: number;
   expiresAt: string | null; active: boolean; createdAt: string;
+  /** Wave 11C butir 75: kupon percobaan hanya berlaku untuk satu paket dan satu kali pakai. */
+  trial: boolean; trialPlanCode: string | null;
 };
 
 function toCoupon(row: any): CouponRow {
   return {
     code: row.code, percent: row.percent, amountIdr: row.amount_idr, maxUses: row.max_uses, uses: row.uses,
     expiresAt: row.expires_at, active: row.active === 1, createdAt: row.created_at,
+    trial: row.trial === 1, trialPlanCode: row.trial_plan_code ?? null,
   };
 }
 
@@ -352,7 +355,7 @@ export function setCouponActive(code: string, active: boolean): boolean {
   return db.prepare("UPDATE coupons SET active=? WHERE code=?").run(active ? 1 : 0, code.trim().toUpperCase()).changes > 0;
 }
 
-export function validateCoupon(code: string, amountIdr: number): { ok: true; discountIdr: number; coupon: CouponRow } | { ok: false; error: string } {
+export function validateCoupon(code: string, amountIdr: number, planCode?: string): { ok: true; discountIdr: number; coupon: CouponRow } | { ok: false; error: string } {
   const normalized = (code || "").trim().toUpperCase();
   if (!normalized) return { ok: false, error: "COUPON_REQUIRED" };
   const row = db.prepare("SELECT * FROM coupons WHERE code=?").get(normalized);
@@ -361,6 +364,11 @@ export function validateCoupon(code: string, amountIdr: number): { ok: true; dis
   if (!coupon.active) return { ok: false, error: "COUPON_INACTIVE" };
   if (coupon.expiresAt && coupon.expiresAt < nowIso()) return { ok: false, error: "COUPON_EXPIRED" };
   if (coupon.maxUses > 0 && coupon.uses >= coupon.maxUses) return { ok: false, error: "COUPON_EXHAUSTED" };
+  // Wave 11C butir 75: kupon percobaan hanya sah untuk paket yang ditargetkan. Gerbang ini ditegakkan
+  // di sini (bukan hanya di rute kupon) supaya rute lama `POST /api/v1/billing/orders` pun patuh.
+  if (coupon.trial && planCode && coupon.trialPlanCode && coupon.trialPlanCode !== planCode) {
+    return { ok: false, error: "TRIAL_PLAN_ONLY" };
+  }
   const percent = coupon.percent > 0 ? Math.round((amountIdr * coupon.percent) / 100) : 0;
   const discountIdr = Math.min(amountIdr, percent + coupon.amountIdr);
   return { ok: true, discountIdr, coupon };
@@ -401,7 +409,7 @@ export function createOrder(input: { userId: string; planCode: string; months?: 
   let discountIdr = 0;
   const couponCode = (input.couponCode || "").trim().toUpperCase() || null;
   if (couponCode) {
-    const check = validateCoupon(couponCode, amountIdr);
+    const check = validateCoupon(couponCode, amountIdr, plan.code);
     if (!check.ok) return { ok: false, error: check.error };
     discountIdr = check.discountIdr;
   }

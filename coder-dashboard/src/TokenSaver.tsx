@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react';
 import { api } from './api';
-import type { AgentPreview, AgentSettings, CompactionResult, QuotaState, ThinkingLevel } from './api';
+import type { AgentPreview, AgentSettings, CompactionResult, FallbackModelsResponse, QuotaState, ThinkingLevel } from './api';
+
+/** Baris katalog model dari `/v1/models`, dipakai sebagai saran nama model cadangan. */
+type KatalogModel = { provider: string; model: string };
 
 /** Properti halaman "Penghemat token": pelapor galat dari induk. */
 type Props = {
@@ -104,6 +107,10 @@ function agentErrorMessage(error: unknown, fallback: string): string {
   if (code.includes('INVALID_AUTONOMOUS_TURNS')) return `Batas langkah harus antara ${TURNS_MIN} dan ${TURNS_MAX}.`;
   if (code.includes('INVALID_AUTONOMOUS_TOKENS'))
     return `Batas token harus antara ${numberText(TOKENS_MIN)} dan ${numberText(TOKENS_MAX)}.`;
+  // Wave 11A (butir 57): susunan model cadangan ditolak server (duplikat, sama dengan model utama,
+  // atau lebih dari tiga baris). Pesan asli dari server sudah berbahasa Indonesia.
+  if (code.includes('INVALID_FALLBACK_MODELS'))
+    return 'Susunan model cadangan ditolak: maksimal 3 model, tidak boleh sama satu sama lain, dan tidak boleh sama dengan model utama.';
   if (code.includes('CONVERSATION_NOT_FOUND')) return 'Percakapan tidak ditemukan atau bukan milik workspace Anda.';
   if (code.includes('VIEWER_READ_ONLY')) return 'Peran Anda di workspace ini hanya baca, jadi tidak boleh memadatkan percakapan.';
   if (code.includes('UNAUTHORIZED') || code.includes('FORBIDDEN') || code.includes('SESSION'))
@@ -147,6 +154,13 @@ export function TokenSaver({ onError }: Props) {
   const [saveError, setSaveError] = useState('');
   const [notice, setNotice] = useState('');
 
+  // Wave 11A (butir 57): urutan model cadangan + keterangan batas dari server.
+  const [fallback, setFallback] = useState<string[]>([]);
+  const [fallbackInfo, setFallbackInfo] = useState<FallbackModelsResponse | null>(null);
+  const [fallbackError, setFallbackError] = useState('');
+  const [katalog, setKatalog] = useState<string[]>([]);
+  const [modelUtama, setModelUtama] = useState('');
+
   // Panel pratinjau.
   const [previewId, setPreviewId] = useState('');
   const [preview, setPreview] = useState<AgentPreview | null>(null);
@@ -177,6 +191,68 @@ export function TokenSaver({ onError }: Props) {
     setAutonomousMaxTokens(String(num(row.autonomous_max_tokens)));
   }
 
+  /** Susun ulang satu baris model cadangan tanpa mengubah isi baris lain. */
+  function ubahBaris(index: number, value: string): void {
+    setFallback((daftar) => daftar.map((item, posisi) => (posisi === index ? value : item)));
+    setSaveError('');
+    setNotice('');
+  }
+
+  /** Tambah satu baris kosong di akhir; batas maksimum diambil dari server. */
+  function tambahBaris(): void {
+    const batas = fallbackInfo ? num(fallbackInfo.maxModels) : 3;
+    if (fallback.length >= batas) { setFallbackError(`Maksimal ${batas} model cadangan.`); return; }
+    setFallbackError('');
+    setFallback((daftar) => [...daftar, '']);
+  }
+
+  /** Buang satu baris model cadangan. */
+  function hapusBaris(index: number): void {
+    setFallback((daftar) => daftar.filter((_, posisi) => posisi !== index));
+    setFallbackError('');
+    setSaveError('');
+    setNotice('');
+  }
+
+  /** Geser satu baris naik atau turun; urutan menentukan urutan pemakaian saat galat sementara. */
+  function geserBaris(index: number, arah: -1 | 1): void {
+    const tujuan = index + arah;
+    if (tujuan < 0) return;
+    setFallback((daftar) => {
+      if (tujuan >= daftar.length) return daftar;
+      const salinan = [...daftar];
+      const sementara = salinan[index];
+      salinan[index] = salinan[tujuan];
+      salinan[tujuan] = sementara;
+      return salinan;
+    });
+    setFallbackError('');
+    setSaveError('');
+    setNotice('');
+  }
+
+  /** Muat batas fallback dari server plus katalog model untuk saran nama. */
+  async function loadFallbackInfo(): Promise<void> {
+    setFallbackError('');
+    try {
+      const data = await api.fallbackModels();
+      setFallbackInfo(data);
+      setFallback((daftar) => (daftar.length ? daftar : (Array.isArray(data.models) ? data.models : [])));
+    } catch (error) {
+      setFallbackInfo(null);
+      setFallbackError(agentErrorMessage(error, 'Batas model cadangan gagal dibaca dari server.'));
+    }
+    try {
+      const data = await api.models();
+      const baris: KatalogModel[] = Array.isArray(data?.models) ? data.models : [];
+      setKatalog(baris.map((row) => String(row.model ?? '')).filter(Boolean));
+      setModelUtama(String(data?.default?.model ?? ''));
+    } catch {
+      // Katalog hanya saran: tanpa katalog, nama model tetap bisa ditulis manual.
+      setKatalog([]);
+    }
+  }
+
   /** Muat pengaturan agen dari server. */
   async function loadSettings(): Promise<void> {
     setLoading(true);
@@ -184,6 +260,9 @@ export function TokenSaver({ onError }: Props) {
     try {
       const data = await api.agentSettings();
       applySettings(data.settings);
+      setFallback(Array.isArray(data.fallbackModels) ? data.fallbackModels : []);
+      if (data.fallbackHelp) setFallbackError('');
+      void loadFallbackInfo();
       setThinkingLevels(Array.isArray(data.thinkingLevels) ? data.thinkingLevels : []);
       setToolsAllowHelp(String(data.toolsAllowHelp ?? ''));
       setAutonomousHelp(String(data.autonomousHelp ?? ''));
@@ -253,6 +332,24 @@ export function TokenSaver({ onError }: Props) {
       if (after !== null) patch.compactAfterMessages = after;
       if (turns !== null) patch.autonomousMaxTurns = turns;
       if (tokens !== null) patch.autonomousMaxTokens = tokens;
+      // Wave 11A (butir 57): hanya nama yang terisi yang dikirim; server memeriksa duplikat,
+      // jumlah maksimum, dan bentrokan dengan model utama.
+      const cadangan = fallback.map((item) => item.trim()).filter(Boolean);
+      if (cadangan.length > 1 && new Set(cadangan).size !== cadangan.length) {
+        setSaveError('Model cadangan tidak boleh sama satu sama lain.');
+        return;
+      }
+      if (modelUtama && cadangan.includes(modelUtama)) {
+        setSaveError(`Model utama (${modelUtama}) tidak boleh dipakai sebagai model cadangan.`);
+        return;
+      }
+      const batasCadangan = fallbackInfo ? num(fallbackInfo.maxModels) : 3;
+      if (cadangan.length > batasCadangan) {
+        setSaveError(`Maksimal ${batasCadangan} model cadangan.`);
+        return;
+      }
+      patch.fallbackModels = cadangan;
+      if (modelUtama) patch.modelUtama = modelUtama;
       const result = await api.saveAgentSettings(patch);
       applySettings(result.settings);
       // Pesan jujur: baru ditulis setelah server membalas pengaturan tersimpan.
@@ -473,6 +570,50 @@ export function TokenSaver({ onError }: Props) {
                   }.`
                 : 'belum dilaporkan server.'}
             </p>
+
+            {/* Wave 11A (butir 57): urutan model cadangan. */}
+            <div className="mt-3 rounded-lg border border-slate-700 bg-slate-900/60 p-3" data-testid="fallback-models">
+              <h4 className="mb-1 text-sm font-semibold text-slate-100">Model cadangan (urutan pemakaian)</h4>
+              <p className="mb-2 text-xs text-slate-400">
+                {fallbackInfo
+                  ? fallbackInfo.help
+                  : 'Model cadangan dipakai berurutan hanya saat galat sementara (429, 5xx, timeout).'}
+                {fallbackInfo ? ` Maksimal ${num(fallbackInfo.maxModels)} model dan ${num(fallbackInfo.maxSwitchesPerRun)} perpindahan per run.` : ''}
+                {modelUtama ? ` Model utama saat ini: ${modelUtama}.` : ''}
+              </p>
+              {fallback.map((nama, index) => (
+                <div key={`fallback-${index}`} className="mb-2 flex flex-wrap items-center gap-2">
+                  <span className="w-16 text-xs text-slate-400">Urutan {index + 1}</span>
+                  <input
+                    className={FIELD}
+                    type="text"
+                    list="coblai-model-catalog"
+                    value={nama}
+                    placeholder="nama model, mis. openai/gpt-4o-mini"
+                    aria-label={`Model cadangan urutan ${index + 1}`}
+                    data-testid={`fallback-input-${index}`}
+                    onChange={(event) => ubahBaris(index, event.target.value)}
+                  />
+                  <button type="button" className={BTN} data-testid={`fallback-up-${index}`} disabled={index === 0} title="Naikkan urutan" onClick={() => geserBaris(index, -1)}>▲</button>
+                  <button type="button" className={BTN} data-testid={`fallback-down-${index}`} disabled={index >= fallback.length - 1} title="Turunkan urutan" onClick={() => geserBaris(index, 1)}>▼</button>
+                  <button type="button" className={BTN} data-testid={`fallback-remove-${index}`} title="Buang model cadangan ini" onClick={() => hapusBaris(index)}>✕</button>
+                </div>
+              ))}
+              <datalist id="coblai-model-catalog">
+                {katalog.filter((namaModel) => namaModel !== modelUtama).map((namaModel) => <option key={namaModel} value={namaModel} />)}
+              </datalist>
+              <button
+                type="button"
+                className={BTN}
+                data-testid="fallback-add"
+                disabled={fallbackInfo !== null && fallback.length >= num(fallbackInfo.maxModels)}
+                onClick={tambahBaris}
+              >
+                ＋ Tambah model cadangan
+              </button>
+              {!fallback.length ? <p className="mt-2 text-xs text-slate-400" data-testid="fallback-empty">Belum ada model cadangan: saat penyedia gagal permanen, run berhenti dengan galat jelas (ENGINE_UNAVAILABLE).</p> : null}
+              {fallbackError ? <p className="mt-2 text-xs text-slate-100">{fallbackError}</p> : null}
+            </div>
           </div>
 
           <div className="mt-4 rounded-lg border border-slate-700 bg-slate-800/60 p-3">

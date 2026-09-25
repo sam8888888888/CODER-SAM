@@ -19,6 +19,8 @@ WORKDIR /app
 COPY coder-platform/package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=api-build /build/api/dist/api ./dist/api
+# Butir 61: soal benchmark tetap harus ikut ke image (dibaca saat berjalan, bukan saat build).
+COPY --from=api-build /build/api/apps/api/benchmark ./apps/api/benchmark
 COPY --from=web-build /build/web/dist ./public
 RUN mkdir -p /app/data /app/backups && chown -R node:node /app
 USER node
