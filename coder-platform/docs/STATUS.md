@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 26 Sep 2026 (Wave 11A + 11B + 11C **selesai di kode, belum di-deploy**; produksi masih **0.20.2 LIVE** sejak 21 Sep 2026. Wave 11C menutup 13 butir (68–76, 78, 81, 82) dengan skema **21**; gate lengkap ada di bagian "Wave 11C (v0.23.0)" di bawah. Antarmuka Wave 11B ditutup pada gerbang peramban terakhir.)
+Terakhir diperbarui: 26 Sep 2026 (**v0.23.0 LIVE di produksi** — Wave 11A + 11B + 11C sudah di-commit, dipetikan, dideploy, dan diperiksa di peladen; sebelumnya produksi menjalankan 0.20.2 sejak 21 Sep 2026. Rincian deploy, bukti periksa, dan dua temuan nginx ada di bagian "Rilis v0.23.0 — LIVE DI PRODUKSI" di bawah. Wave 11C menutup 13 butir (68–76, 78, 81, 82) dengan skema **21**.)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -15,7 +15,67 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
 
-## Wave 11C (v0.23.0) — integrasi, bot, grup, bayar, media, versi mesin (13 butir: 68–76, 78, 81, 82) — SELESAI DI KODE, BELUM DI-DEPLOY
+## Rilis v0.23.0 — LIVE DI PRODUKSI (26 Sep 2026)
+
+Status: **LIVE**. Wave 11A + 11B + 11C dalam satu rilis. Commit `3ecfd46`, tag `v0.23.0`,
+paket `deploy/coder-sam-university-v0.23.0.tar.gz` (SHA256 `1b461c94f5d22f10fa18bbc2f05b1280743b944712ddb11445538b0c41a54a1c`).
+
+### Bukti deploy (dari `/workspace/outputs/deploy_v0230.log`)
+- `DEPLOY_EXIT=0`, `DEPLOY_OK coder-platform-app:0.23.0`.
+- Rehearsal migrasi di atas cadangan produksi terakhir: `MIGRATION_REHEARSAL_OK`,
+  `SCHEMA_VERSION_AFTER_MIGRATION 21 EXPECTED 21`, `ROW_COUNTS_PRESERVED true`,
+  `REOPEN_IDEMPOTENT true`, `INTEGRITY_CHECK ok FOREIGN_KEYS true`.
+- Cadangan sebelum migrasi: `/app/backups/coder-2026-09-25T01-17-02.098Z.db`.
+- env-sync: `ENV_MISSING_COUNT 38` (kunci kurang ditambahkan dari daftar resmi, bukan ditimpa),
+  `ENV_OBSOLETE_KEYS PLATFORM_WEBHOOK_URL` dan `ENV_UNKNOWN_KEYS DEEPSEEK_API_KEY` hanya dilaporkan.
+- Blue-green: wadah hijau (3403) dan wadah hidup (3402) sama-sama `READY`; nginx lolos `nginx -t`.
+- Wadah setelah rilis: `coder-platform-app:0.23.0 Up (healthy)` dan `coder-platform-worker:0.23.0 Up`.
+  `mailcow` tidak disentuh.
+
+### Bukti periksa produksi (tanpa kredensial, dari ruang kerja)
+- `/health` → 200; `/ready` → 200 `{status:ready, database:ok}`; `/` → 200; `/manifest.webmanifest` → 200.
+- `/api/v1/public/docs` → `"version":"0.23.0"` (bukti versi baru benar-benar berjalan).
+- Skema basis data produksi → `21` (dibaca langsung dari `coder.db` di dalam wadah).
+- `POST /api/v1/auth/login` dengan kredensial salah → 401 `INVALID_CREDENTIALS` (bukan 500);
+  rute tidak dikenal → 404 `NOT_FOUND`.
+- Header CSP terkirim di produksi (dua header: dari nginx dan dari aplikasi).
+- Log aplikasi 15 menit setelah rilis: **0 baris bertingkat galat**; pekerja antrean jalan
+  (2 pekerjaan selesai, 0 gagal).
+- Pemeriksaan peramban sungguhan (Chromium, halaman masuk produksi): halaman hidup,
+  `.profile-button` muncul, formulir masuk tampil, kolom email + sandi ada, gaya CSS terpasang
+  (`border-radius=12px`). Skrip: `/workspace/outputs/prod_csp_check.mjs`.
+
+### Dua temuan nginx di produksi (belum diperbaiki — menunggu izin Bapak)
+1. **Google Fonts diblokir di produksi** (terukur, kosmetik). nginx peladen masih memakai nilai CSP
+   lama (243 karakter, tanpa `fonts.googleapis.com`/`fonts.gstatic.com`, dengan
+   `style-src 'self' 'unsafe-inline'`). Peramban menegakkan irisan CSP nginx dan CSP aplikasi, jadi
+   irisan itu kehilangan kedua asal font: berkas gaya Google Fonts ditolak
+   (`Refused to load the stylesheet ... violates "style-src 'self' 'unsafe-inline'"`). Akibat:
+   dashboard jatuh ke font sistem. Kebijakan lama itu dipasang 13 Sep 2026 dan **sudah memblokir font
+   sebelum rilis ini**; rilis ini hanya menambahkan nilai yang benar di repo (aplikasi + salinan
+   rujukan nginx) tanpa menyentuh berkas nginx di peladen.
+2. **CSP nginx ikut menempel pada berkas artefak mentah** (perkiraan berdasar bukti, belum diuji
+   ujung-ke-ujung). `add_header` nginx dipasang di tingkat `server`, jadi berlaku juga untuk
+   `/api/v1/artifacts/:id/(raw|download)`; terukur dengan `curl` tanpa login: jawaban 401 jalur itu
+   memang membawa header CSP dari nginx. Aplikasi sengaja **menghapus** CSP untuk PDF (penampil PDF
+   bawaan Chrome kosong bila `object-src 'none'` berlaku), tetapi nginx menambahkannya lagi. Perlu
+   diuji dengan sesi nyata + berkas PDF untuk memastikan pratinjau PDF kosong atau tidak.
+
+Rencana perbaikan kedua temuan itu (satu perubahan berkas nginx + `reload` halus, ada cadangan dan
+`nginx -t` lebih dulu) sudah disiapkan sebagai `deploy/nginx-sync-csp.sh`. Mode bawaan hanya **cek**
+(tanpa sudo, tanpa tulis); perubahan hanya dilakukan dengan `--apply` setelah Bapak mengizinkan.
+
+### Gerbang rilis sebelum deploy
+- `npm run verify` dua kali berturut-turut: **59/59 suite hijau**, `ALL_SUITES_PASSED`,
+  `VERIFY_EXIT=0` (`wave11c_verify_run6.log`, `wave11c_verify_run7.log`).
+- Suite Wave 11C: 459 pemeriksaan API, 0 gagal, 0 lewat (integrasi 114, grup+bayar 154, media 100,
+  bot 91). Antarmuka dashboard: **222/222 lulus**, 0 gagal, 1 lewat beralasan, 0 galat konsol.
+- Suite baru: `deploy-paket-integritas.e2e.ts` 24/24; `port-uji-fetch-aman.e2e.ts` 20/20;
+  `deploy-env-sync.e2e.ts` 70 lulus / 0 gagal.
+- Verifikasi kredensial uji nyata (Telegram, Notion, konektor) lulus; berkas kredensial dihapus
+  (`shred -u`) dan tidak pernah masuk repo.
+
+## Wave 11C (v0.23.0) — integrasi, bot, grup, bayar, media, versi mesin (13 butir: 68–76, 78, 81, 82) — SELESAI DI KODE DAN SUDAH LIVE
 
 Sumber: `PRD_WAVE_11_EKSEKUSI_v5.md` butir 68–76, 78, 81, 82 (13 butir; butir 77 tetap TERTAHAN per PRD).
 Skema basis data: **20 → 21** (`SCHEMA_VERSION = 21`).
@@ -28,7 +88,7 @@ Skema basis data: **20 → 21** (`SCHEMA_VERSION = 21`).
 **jobs.ts:** jenis pekerjaan baru `connector.deliver`, `bot.reply`.
 **retention.ts:** tidak ada sasaran baru di Wave 11C.
 **Berkas lain yang disentuh lead:** `billing.ts` (pagar `TRIAL_PLAN_ONLY`), `server.ts` (penyambungan rute + handler pekerja), `apps/api/src/workspace-guard.ts` (penjaga biaya ruang kerja dipindah keluar dari `server.ts` supaya bisa dipakai ulang), `.env.austria.example` + `deploy/env.keys.txt`.
-Status: **kode selesai, gerbang hijau; BELUM di-deploy, belum di-restart, belum ada commit.**
+Status: **kode selesai, gerbang hijau, sudah di-commit (`3ecfd46`) dan LIVE di produksi sejak 26 Sep 2026** (lihat bagian "Rilis v0.23.0 — LIVE DI PRODUKSI").
 
 ### Gerbang
 - `npx tsc -p apps/api/tsconfig.json` → 0 galat. `npx tsc -p tsconfig.test.json` → 0 galat.
@@ -129,7 +189,7 @@ Status: **kode selesai, gerbang hijau; BELUM di-deploy, belum di-restart, belum 
     masih berjalan) dan "suite 11A mati 1 detik" (itu bug skrip driver saya sendiri: nama `wave11a.e2e` ditambah akhiran
     `.e2e.ts` → `ERR_MODULE_NOT_FOUND`).
 
-## Wave 11B (v0.22.0) — paritas lanjutan: 11 butir (58–67, 83, plus 72) — SELESAI DI KODE, BELUM DI-DEPLOY
+## Wave 11B (v0.22.0) — paritas lanjutan: 11 butir (58–67, 83, plus 72) — SELESAI DI KODE DAN SUDAH LIVE
 
 Sumber kerja: `PRD_WAVE_11_EKSEKUSI_v5.md`. Skema basis data naik **19 → 20** satu kali saja
 (`SCHEMA_VERSION = 20`), dengan ringkasan perubahan ditulis di `SCHEMA_VERSION_NOTE`. Skema baru:
@@ -224,7 +284,7 @@ tidak dihitung ke salah satu butir. Jumlah total 11B: 92 + 111 + 103 + 81 = **38
     pada pemeriksaan "hapus pelajaran" lalu diperbaiki di berkas uji (tunggu server DAN halaman).
     Rinciannya di catatan 19 bagian Wave 11C.
 
-## Wave 11A (v0.21.0) — paritas `chat.coblai.com`: 18 butir (42–57, 79, 80) — SELESAI DI KODE, BELUM DI-DEPLOY
+## Wave 11A (v0.21.0) — paritas `chat.coblai.com`: 18 butir (42–57, 79, 80) — SELESAI DI KODE DAN SUDAH LIVE
 
 Sumber kerja: `PRD_WAVE_11_EKSEKUSI_v5.md` (25 Sep 2026; 42 butir, nomor 42–83, lanjutan daftar
 masalah yang berakhir di 41). Wave 11A adalah gelombang pertama. Skema basis data naik **18 → 19**

@@ -84,6 +84,11 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
     di-push.
 14. [BAPAK] Batasi `mynetworks` relay mailcow (temuan 14 Sep: relay menerima surat tanpa
     autentikasi dari jaringan lokal host).
+15. [BAPAK] Samakan CSP nginx peladen dengan CSP aplikasi + tambahkan blok `location` untuk berkas
+    artefak mentah (`deploy/nginx-sync-csp.sh --apply`, ada cadangan + `nginx -t` + `reload` halus).
+    Naskahnya sudah siap dan mode bawaan hanya memeriksa. Rinciannya di §6.7.
+16. [BAPAK] Jalankan smoke produksi berkredensial (`apps/api/test/production-smoke.mjs`) — butuh
+    email + sandi akun uji produksi; belum tersedia di ruang kerja.
 
 ## 3. UTANG TEKNIS
 
@@ -424,6 +429,42 @@ Ini bukan cacat produk, tapi cacat **harness uji** yang bisa membuat gerbang ril
    terkuat — suite berat lain (`paket_integritas`) berjalan di dalam jendela putaran itu, melanggar aturan "jangan
    menjalankan dua gerbang node berat berbarengan" — belum direproduksi, jadi tidak dinyatakan sebagai sebab.
    Aturan kerja yang saya pakai sekarang: dua putaran gerbang penuh berturut-turut harus hijau, tanpa beban paralel.
+
+### 6.7 Dua temuan nginx di produksi v0.23.0 — MENUNGGU IZIN BAPAK (26 Sep 2026)
+
+Rilis v0.23.0 sudah LIVE dan sehat (lihat `docs/STATUS.md` bagian "Rilis v0.23.0 — LIVE DI
+PRODUKSI"). Dua hal di bawah ditemukan saat memeriksa produksi sesudah deploy. Keduanya berasal dari
+berkas nginx di peladen, bukan dari kode aplikasi, dan keduanya butuh satu perubahan berkas itu +
+`reload` halus. **Belum ada yang diubah di peladen.**
+
+**Temuan 1 — Google Fonts diblokir di produksi (terukur, akibat kosmetik).**
+Bagaimana terukur: peramban Chromium sungguhan memuat halaman masuk produksi; konsol mencatat
+`Refused to load the stylesheet 'https://fonts.googleapis.com/...' because it violates the following
+Content Security Policy directive: "style-src 'self' 'unsafe-inline'"`. Dashboard tetap hidup dan
+gayanya terpasang (`border-radius=12px`), hanya font khusus jatuh ke font sistem.
+Sebab: nginx peladen memakai nilai CSP lama (243 karakter) tanpa `fonts.googleapis.com` /
+`fonts.gstatic.com`; aplikasi memakai nilai baru (309 karakter) yang memuat keduanya. Peramban
+menegakkan irisan kedua kebijakan, jadi irisan itu kehilangan kedua asal font.
+Sejak kapan: kebijakan nginx itu dipasang 13 Sep 2026. Jadi font **sudah** diblokir sebelum rilis ini;
+rilis ini hanya menambahkan nilai yang benar di repo (aplikasi + salinan rujukan nginx) tanpa
+menyentuh berkas di peladen. Yang belum pernah ada sebelumnya: pengukuran di peramban produksi.
+Perbaikan yang disiapkan: `deploy/nginx-sync-csp.sh --apply` mengganti HANYA baris CSP di
+`/etc/nginx/sites-available/coder.sam.university.conf` dengan nilai dari salinan rujukan repo,
+mencadangkan berkas lebih dulu, lalu `nginx -t`; bila `nginx -t` gagal, berkas dipulihkan otomatis
+dan `reload` tidak dijalankan.
+
+**Temuan 2 — CSP nginx ikut menempel pada berkas artefak mentah (perkiraan, belum diuji ujung-ke-ujung).**
+Bukti yang sudah ada: `add_header` CSP di peladen dipasang di tingkat `server`, dan `curl` tanpa login
+ke `/api/v1/artifacts/<id>/raw` memang menerima header CSP dari nginx (dan satu lagi dari aplikasi).
+Kekhawatirannya: aplikasi sengaja **menghapus** CSP untuk jawaban PDF, karena penampil PDF bawaan
+Chrome kosong bila `object-src 'none'` berlaku (catatan itu ada di `apps/api/src/wave11a/csp.ts`).
+nginx menambahkan CSP-nya lagi, jadi pratinjau PDF di produksi bisa kosong.
+Yang belum dibuktikan: apakah pratinjau PDF benar-benar kosong di produksi. Itu butuh sesi login nyata
+plus satu berkas PDF di produksi. **Belum diuji, jadi belum boleh disebut bug** — hanya perkiraan
+berdasar dua bukti di atas.
+Perbaikan yang disiapkan: blok `location ~ ^/api/v1/artifacts/[^/]+/(raw|download)$` tanpa CSP (header
+keamanan lain dikembalikan manual, karena nginx menggugurkan seluruh `add_header` warisan begitu
+sebuah location punya `add_header` sendiri).
 
 ### Cara memakai daftar ini
 Bapak cukup menyebut NOMOR (mis. "bereskan 15, 17, 24"). Saya kerjakan satu per satu, dengan
