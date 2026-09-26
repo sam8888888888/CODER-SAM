@@ -85,9 +85,15 @@ menghapus model yang sudah dikenal), pencocokan juga lewat nama dasar tanpa awal
   **Pengerasan baru:** gerbang MENOLAK jalan bila ada berkas `src/**` lebih baru dari
   `dist/index.html` (`DIST_BASI` + exit 1) — ini menutup lubang nyata yang pada 26 Sep 2026 membuat
   gerbang "hijau" terhadap bundel 25 Sep.
-- Paket rilis: `deploy/coder-sam-university-v0.24.0.tar.gz` — dibangun SESUDAH seluruh perubahan
-  di-commit, jadi isinya sama dengan pohon yang diuji (SHA256 dicatat di berkas `.sha256` dan pada
-  commit berikutnya, karena berkas ini ikut masuk paket).
+- Paket rilis: `deploy/coder-sam-university-v0.24.0.tar.gz` — **322 entri, 1,5 MB**, dibangun SESUDAH
+  seluruh perubahan di-commit (`990799a`, tag `v0.24.0`), jadi isinya sama dengan pohon yang diuji.
+  SHA256 `10e1984128b830031bb9ef668733e1427d9b234c35c77f288021fa748e2b7673` (baris ini ditulis
+  SESUDAH paket dibangun, jadi berkas STATUS.md di dalam paket belum memuatnya — cara yang sama
+  dipakai pada rilis v0.23.0). Dua gerbang yang paling terkait versi dijalankan ulang sesudah kenaikan
+  versi: env `70 lulus/0 gagal` dan paket-integritas `24 lulus/0 gagal`, keduanya exit 0.
+- Isi paket diperiksa: memuat `wave11a-katalog.e2e.ts`, `wave11b-timeline-alat.e2e.ts`,
+  `fixtures/fake-prime-agent-katalog.mjs` (mode 755), `ArtifactEditor.tsx`, `Tools.tsx`;
+  **tidak** memuat `node_modules`/`dist`/`.env` (0 kecocokan).
 - **Belum**: push ke GitHub menunggu token Bapak; deploy ulang ke produksi belum dijalankan
   (produksi masih menjalankan v0.23.0).
 
