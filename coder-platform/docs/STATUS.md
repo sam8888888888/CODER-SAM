@@ -45,7 +45,7 @@ paket `deploy/coder-sam-university-v0.23.0.tar.gz` (SHA256 `1b461c94f5d22f10fa18
   `.profile-button` muncul, formulir masuk tampil, kolom email + sandi ada, gaya CSS terpasang
   (`border-radius=12px`). Skrip: `/workspace/outputs/prod_csp_check.mjs`.
 
-### Dua temuan nginx di produksi (belum diperbaiki — menunggu izin Bapak)
+### Dua temuan nginx — SUDAH DIPERBAIKI DAN DIVERIFIKASI (26 Sep 2026)
 1. **Google Fonts diblokir di produksi** (terukur, kosmetik). nginx peladen masih memakai nilai CSP
    lama (243 karakter, tanpa `fonts.googleapis.com`/`fonts.gstatic.com`, dengan
    `style-src 'self' 'unsafe-inline'`). Peramban menegakkan irisan CSP nginx dan CSP aplikasi, jadi
@@ -61,9 +61,44 @@ paket `deploy/coder-sam-university-v0.23.0.tar.gz` (SHA256 `1b461c94f5d22f10fa18
    bawaan Chrome kosong bila `object-src 'none'` berlaku), tetapi nginx menambahkannya lagi. Perlu
    diuji dengan sesi nyata + berkas PDF untuk memastikan pratinjau PDF kosong atau tidak.
 
-Rencana perbaikan kedua temuan itu (satu perubahan berkas nginx + `reload` halus, ada cadangan dan
-`nginx -t` lebih dulu) sudah disiapkan sebagai `deploy/nginx-sync-csp.sh`. Mode bawaan hanya **cek**
-(tanpa sudo, tanpa tulis); perubahan hanya dilakukan dengan `--apply` setelah Bapak mengizinkan.
+**Perbaikan dijalankan 26 Sep 2026 setelah Bapak mengizinkan** (`deploy/nginx-sync-csp.sh --apply`):
+cadangan `/etc/nginx/sites-available/coder.sam.university.conf.bak.20260926222321`,
+`BARIS_CSP_DIGANTI=1`, `BLOK_ARTEFAK_DITAMBAH=true`, `NGINX_T_OK=true`, `NGINX_RELOAD_SELESAI=true`.
+Golak-balik: salin berkas `.bak` itu kembali lalu `sudo -n nginx -t` dan `sudo -n systemctl reload nginx`.
+
+Hasil periksa sesudah perbaikan:
+- CSP aplikasi (langsung `127.0.0.1:3402`) dan CSP lewat nginx 443 kini **sama persis** (nilai 309
+  karakter, dibandingkan baris per baris) — irisan dua kebijakan tidak lagi mempersempit apa pun.
+- Jalur `/api/v1/artifacts/:id/raw` lewat nginx kini membawa **tepat satu** header CSP (milik aplikasi,
+  `default-src 'none'; script-src 'none'; ...`); header keamanan lain (HSTS, `X-Content-Type-Options`,
+  `Referrer-Policy`) tetap ada. Jadi nginx tidak lagi menempelkan `object-src 'none'` pada jawaban PDF.
+- Peramban Chromium sungguhan: **6/6 lulus** (sebelum perbaikan 4 lulus / 2 gagal). Font benar-benar
+  termuat: `document.fonts.check('400 16px "DM Sans"')` = true, `check('700 16px "Space Grotesk"')` =
+  true, `font-family` terhitung = `"DM Sans", sans-serif`.
+
+### Uji live produksi dengan akun uji (26 Sep 2026, atas izin Bapak)
+- Akun uji `dinda.uji.v0230@coblai.com` dibuat lewat API produksi (201) dengan kata sandi acak.
+- Surat verifikasi **tidak terkirim** (jujur): mailcow menolak alamat itu
+  (`RCPT 550 5.1.1 User unknown in virtual mailbox table`), jadi laporan pendaftaran menulis
+  `emailVerification.sent=false`. Karena surat tidak bisa dibaca, verifikasi dilakukan lewat **jalur
+  resmi aplikasi**: satu baris token `email_verify` disisipkan ke `auth_tokens` di basis data produksi,
+  lalu `POST /api/v1/auth/email/verify` dipanggil dengan token mentah → `{"verified":true}`.
+- `apps/api/test/production-smoke.mjs` dijalankan terhadap produksi:
+  **202 lulus, 0 gagal, `PRODUCTION_SMOKE_PASSED`, `EXIT=0`** (46 detik).
+  Log: `/workspace/outputs/prod_smoke_v0230.log`.
+- Akun uji kemudian **ditutup lewat jalur resmi aplikasi** (`DELETE /api/v1/auth/account` dengan ekspor
+  data lebih dulu): `{"ok":true,"deletedAt":"2026-09-26T20:26:02.059Z","purgeAfter":"2026-12-25T20:26:02.059Z","recoveryDays":90}`.
+  Setelah itu login akun itu menjawab 403 `ACCOUNT_DELETED`. Barisnya masih ada sebagai penutupan lunak
+  sampai penyapu retensi menghapusnya (2026-12-25).
+- Berkas kredensial sementara `/workspace/outputs/uji_live_akun.env` dihapus dengan `shred -u`; kata
+  sandi tidak pernah dicetak ke log.
+
+### Push ke GitHub — TERHAMBAT, butuh kredensial dari Bapak
+`git remote -v` → `https://github.com/sam8888888888/coblai-dinda`. Ruang kerja ini **tidak punya**
+kredensial GitHub: tidak ada `~/.git-credentials`, tidak ada `credential.helper`, tidak ada kunci SSH
+GitHub, dan `GIT_ASKPASS=true` (interaksi dimatikan). Bukti: `git ls-remote origin` menjawab
+`remote: Repository not found.` + `fatal: Authentication failed`. Jadi remote tidak bisa dibaca maupun
+ditulis tanpa token. Sambil menunggu, cadangan luring dibuat: `git bundle` (lihat laporan lisan).
 
 ### Gerbang rilis sebelum deploy
 - `npm run verify` dua kali berturut-turut: **59/59 suite hijau**, `ALL_SUITES_PASSED`,

@@ -81,14 +81,17 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
 12. [BAPAK] Hapus 561 baris `audit_events` jejak uji di workspace Bapak (jejak audit, jadi
     menunggu izin).
 13. [BAPAK] Push repository ke GitHub (`github.com/sam8888888888/coblai-dinda`) — belum pernah
-    di-push.
+    di-push. **Diperiksa 26 Sep 2026:** ruang kerja tidak punya kredensial GitHub (tidak ada
+    `~/.git-credentials`, tidak ada `credential.helper`, tidak ada kunci SSH GitHub,
+    `GIT_ASKPASS=true`). `git ls-remote origin` menjawab `remote: Repository not found.` +
+    `fatal: Authentication failed`. Butuh token akses (Personal Access Token) dari Bapak; sesudah itu
+    push hanya satu perintah.
 14. [BAPAK] Batasi `mynetworks` relay mailcow (temuan 14 Sep: relay menerima surat tanpa
     autentikasi dari jaringan lokal host).
-15. [BAPAK] Samakan CSP nginx peladen dengan CSP aplikasi + tambahkan blok `location` untuk berkas
-    artefak mentah (`deploy/nginx-sync-csp.sh --apply`, ada cadangan + `nginx -t` + `reload` halus).
-    Naskahnya sudah siap dan mode bawaan hanya memeriksa. Rinciannya di §6.7.
-16. [BAPAK] Jalankan smoke produksi berkredensial (`apps/api/test/production-smoke.mjs`) — butuh
-    email + sandi akun uji produksi; belum tersedia di ruang kerja.
+15. [SELESAI 26 Sep 2026] Samakan CSP nginx peladen dengan CSP aplikasi + blok `location` artefak —
+    dijalankan setelah Bapak mengizinkan; hasil dan buktinya di §6.7.
+16. [SELESAI 26 Sep 2026] Smoke produksi berkredensial — akun uji dibuat sendiri atas izin Bapak,
+    **202 lulus / 0 gagal**, lalu akun ditutup lewat jalur resmi. Rincian di §6.7.
 
 ## 3. UTANG TEKNIS
 
@@ -430,7 +433,7 @@ Ini bukan cacat produk, tapi cacat **harness uji** yang bisa membuat gerbang ril
    menjalankan dua gerbang node berat berbarengan" — belum direproduksi, jadi tidak dinyatakan sebagai sebab.
    Aturan kerja yang saya pakai sekarang: dua putaran gerbang penuh berturut-turut harus hijau, tanpa beban paralel.
 
-### 6.7 Dua temuan nginx di produksi v0.23.0 — MENUNGGU IZIN BAPAK (26 Sep 2026)
+### 6.7 Dua temuan nginx di produksi v0.23.0 — SUDAH DIPERBAIKI DAN DIVERIFIKASI (26 Sep 2026)
 
 Rilis v0.23.0 sudah LIVE dan sehat (lihat `docs/STATUS.md` bagian "Rilis v0.23.0 — LIVE DI
 PRODUKSI"). Dua hal di bawah ditemukan saat memeriksa produksi sesudah deploy. Keduanya berasal dari
@@ -465,6 +468,20 @@ berdasar dua bukti di atas.
 Perbaikan yang disiapkan: blok `location ~ ^/api/v1/artifacts/[^/]+/(raw|download)$` tanpa CSP (header
 keamanan lain dikembalikan manual, karena nginx menggugurkan seluruh `add_header` warisan begitu
 sebuah location punya `add_header` sendiri).
+
+**Hasil sesudah izin Bapak (26 Sep 2026).** `deploy/nginx-sync-csp.sh --apply` dijalankan:
+`BARIS_CSP_DIGANTI=1`, `BLOK_ARTEFAK_DITAMBAH=true`, `NGINX_T_OK=true`, `NGINX_RELOAD_SELESAI=true`;
+cadangan `/etc/nginx/sites-available/coder.sam.university.conf.bak.20260926222321`.
+Bukti temuan 1 tertutup: CSP aplikasi dan CSP lewat nginx kini sama persis (309 karakter), dan di
+peramban sungguhan berkas gaya Google Fonts tidak lagi ditolak — `document.fonts.check` true untuk
+"DM Sans" dan "Space Grotesk"; skrip pemeriksa produksi naik dari 4 lulus / 2 gagal menjadi **6/6**.
+Bukti temuan 2 tertutup sebagian: jalur `/api/v1/artifacts/:id/raw` lewat nginx sekarang membawa tepat
+satu header CSP (milik aplikasi), jadi nginx tidak lagi menempelkan `object-src 'none'` pada jawaban
+PDF. **Yang masih belum diuji:** pratinjau PDF di UI dengan sesi login nyata + berkas PDF. Jadi
+temuan 2 masih berupa perbaikan yang masuk akal, belum hasil uji ujung-ke-ujung.
+Catatan tambahan (jujur, di luar cakupan PRD): blok `location /apk/` milik aplikasi Personal Life OS
+punya `add_header` sendiri, sehingga header keamanan warisan tidak berlaku di jalur itu. Tidak diubah
+pada rilis ini.
 
 ### Cara memakai daftar ini
 Bapak cukup menyebut NOMOR (mis. "bereskan 15, 17, 24"). Saya kerjakan satu per satu, dengan
