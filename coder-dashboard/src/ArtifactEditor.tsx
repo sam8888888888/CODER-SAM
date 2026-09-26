@@ -11,9 +11,18 @@
  *
  * Berkas yang tampak biner atau lebih besar dari batas server tidak bisa disunting di peramban:
  * server menandainya `editable: false` dan UI hanya menampilkan alasannya.
+ *
+ * Tombol `🔄 Render` (DoD butir 48) menampilkan pratinjau INLINE di dalam modal yang sama:
+ *  - iframe memakai `sandbox="allow-scripts"` SAJA; `allow-same-origin` tidak pernah ditambahkan,
+ *    sehingga skrip di dalam artefak tidak bisa membaca sesi, cookie, atau DOM halaman ini;
+ *  - HTML/SVG dipasang apa adanya lewat `srcDoc`, teks biasa dibungkus `<pre>` yang di-escape,
+ *    gambar base64 lewat data URL;
+ *  - jenis berkas yang tidak bisa dirender (docx/xlsx/pptx/pdf/biner) ditolak dengan catatan jujur,
+ *    bukan pratinjau palsu yang tampak kosong.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { api, failureOf, type ArtifactContentResponse, type ArtifactRevision, type ArtifactRevisionList } from './api';
+import { previewKindOf, type PreviewArtifact } from './ArtifactPreview';
 
 type Props = {
   artifactId: string;
@@ -39,6 +48,56 @@ function timeText(value: string | null | undefined): string {
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('id-ID');
 }
 
+/** Catatan wajib saat jenis berkas tidak bisa dipratinjau: apa adanya, tanpa berpura-pura. */
+export const RENDER_CANNOT = 'Jenis berkas ini tidak bisa dipratinjau di sini.';
+/** Penjelasan bahwa iframe disandbox tanpa akses same-origin. */
+export const RENDER_SANDBOX_NOTE =
+  'Pratinjau dijalankan di iframe bersandbox "allow-scripts" tanpa "allow-same-origin": skrip di dalam berkas tidak bisa menyentuh sesi, cookie, atau data Anda.';
+
+/** Rencana pratinjau: `srcDoc` untuk HTML/SVG/teks, `url` untuk gambar base64, atau alasan penolakan. */
+export type RenderPlan =
+  | { ok: true; mode: 'srcDoc'; html: string }
+  | { ok: true; mode: 'url'; url: string }
+  | { ok: false; reason: string };
+
+/** Buang karakter berbahaya HTML supaya teks biasa tampil sebagai teks, bukan sebagai markup. */
+export function escapeHtmlText(raw: string): string {
+  return String(raw ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * Tentukan isi iframe pratinjau dari jenis berkas + teks yang sedang dibuka.
+ * Fungsi ini murni (tanpa efek samping) supaya keputusan render bisa dibaca ulang dengan tenang.
+ */
+export function renderPlanOf(artifact: PreviewArtifact | null, source: string): RenderPlan {
+  const text = String(source ?? '');
+  if (!artifact) return { ok: false, reason: `${RENDER_CANNOT} Data artefak belum termuat.` };
+  if (!text.trim()) return { ok: false, reason: `${RENDER_CANNOT} Isinya kosong atau tidak tersedia sebagai teks (berkas biner).` };
+  const kind = previewKindOf(artifact);
+  const mime = String(artifact.mimeType ?? '').toLowerCase();
+  // HTML dan SVG dipasang apa adanya: keamanannya dipegang sandbox iframe, bukan penghapusan tag.
+  if (kind === 'html' || mime.includes('svg')) return { ok: true, mode: 'srcDoc', html: text };
+  if (kind === 'markdown' || kind === 'csv' || kind === 'text') {
+    const body = escapeHtmlText(text);
+    return {
+      ok: true,
+      mode: 'srcDoc',
+      html: `<pre style="white-space:pre-wrap;word-break:break-word;margin:0;padding:12px;background:#fff;color:#0f172a;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace">${body}</pre>`,
+    };
+  }
+  if (kind === 'image') {
+    const compact = text.replace(/\s+/g, '');
+    const looksBase64 = compact.length > 0 && compact.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(compact);
+    if (looksBase64) return { ok: true, mode: 'url', url: `data:${mime || 'image/png'};base64,${compact}` };
+    return { ok: false, reason: `${RENDER_CANNOT} Isi gambar tidak dikenali sebagai data base64.` };
+  }
+  return { ok: false, reason: RENDER_CANNOT };
+}
+
 export function ArtifactEditor({ artifactId, artifactName, onClose, onChanged, onError }: Props) {
   const [info, setInfo] = useState<ArtifactContentResponse | null>(null);
   const [text, setText] = useState('');
@@ -54,6 +113,10 @@ export function ArtifactEditor({ artifactId, artifactName, onClose, onChanged, o
   const [revisionText, setRevisionText] = useState('');
   const [revisionError, setRevisionError] = useState('');
   const [busyRevision, setBusyRevision] = useState(0);
+  /** Pratinjau inline (DoD butir 48). `null` berarti modal belum menampilkan pratinjau sama sekali. */
+  const [renderPlan, setRenderPlan] = useState<RenderPlan | null>(null);
+  const [renderSource, setRenderSource] = useState('');
+  const [renderNonce, setRenderNonce] = useState(0);
 
   const fail = useCallback((message: string) => {
     setProblem(message);
@@ -91,6 +154,9 @@ export function ArtifactEditor({ artifactId, artifactName, onClose, onChanged, o
   }, [artifactId, fail]);
 
   useEffect(() => { void load(); }, [load]);
+
+  /** Ganti artefak = pratinjau lama tidak lagi mewakili berkas yang dibuka, jadi ditutup. */
+  useEffect(() => { setRenderPlan(null); setRenderSource(''); }, [artifactId]);
 
   /** Simpan isi baru di atas revisi terakhir yang diketahui. */
   async function save(): Promise<void> {
@@ -184,6 +250,17 @@ export function ArtifactEditor({ artifactId, artifactName, onClose, onChanged, o
     setConflict(null);
   }
 
+  /**
+   * Buka atau tutup pratinjau inline. Isi yang dipratinjau = isi kotak kode saat tombol ditekan,
+   * supaya yang terlihat di pratinjau sama dengan yang akan disimpan pengguna.
+   */
+  function toggleRender(): void {
+    if (renderPlan?.ok) { setRenderPlan(null); return; }
+    setRenderSource(text);
+    setRenderNonce((value) => value + 1);
+    setRenderPlan(renderPlanOf(info?.artifact ?? null, text));
+  }
+
   const editable = info ? info.editable !== false && info.content !== null : false;
   const limitBytes = Number(info?.maxBytes ?? 0);
   const sizeBytes = Number(info?.bytes ?? new TextEncoder().encode(text).length);
@@ -232,10 +309,40 @@ export function ArtifactEditor({ artifactId, artifactName, onClose, onChanged, o
             <button type="button" className="primary" data-testid="artifact-editor-save" disabled={!editable || saving} onClick={() => void save()}>
               {saving ? 'Menyimpan…' : 'Simpan revisi baru'}
             </button>
+            <button type="button" data-testid="artifact-render" onClick={toggleRender}>
+              {renderPlan?.ok ? '🔄 Sembunyikan pratinjau' : '🔄 Render'}
+            </button>
             <button type="button" onClick={() => void load()} disabled={loading}>Muat ulang dari server</button>
             {info.sha256Matches === false && <span className="preview-warn">Peringatan: sidik jari berkas di disk berbeda dari catatan basis data.</span>}
           </div>
         </div>
+      )}
+
+      {renderPlan?.ok && (
+        <div className="preview-panel" data-testid="artifact-render-box">
+          <div className="preview-toolbar">
+            <b>Pratinjau artefak</b>
+            <span className="preview-kind">SANDBOX</span>
+            {renderSource !== text && (
+              <span className="preview-warn" data-testid="artifact-render-basi">Teks di kotak kode sudah berubah setelah pratinjau dibuka; tekan Render lagi untuk memperbarui.</span>
+            )}
+            <button type="button" className="link-button" data-testid="artifact-render-tutup" onClick={() => setRenderPlan(null)}>Tutup pratinjau</button>
+          </div>
+          <iframe
+            className="preview-frame"
+            data-testid="artifact-render-frame"
+            key={renderNonce}
+            title={`Pratinjau ${artifactName || info?.artifact?.name || artifactId}`}
+            sandbox="allow-scripts"
+            referrerPolicy="no-referrer"
+            {...(renderPlan.mode === 'srcDoc' ? { srcDoc: renderPlan.html } : { src: renderPlan.url })}
+          />
+          <p className="preview-note" data-testid="artifact-render-catatan">{RENDER_SANDBOX_NOTE}</p>
+        </div>
+      )}
+
+      {renderPlan && !renderPlan.ok && (
+        <p className="preview-note" data-testid="artifact-render-catatan">{renderPlan.reason}</p>
       )}
 
       <div className="preview-history" data-testid="artifact-editor-revisions">

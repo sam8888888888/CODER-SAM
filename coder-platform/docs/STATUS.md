@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 26 Sep 2026 (**v0.23.0 LIVE di produksi** — Wave 11A + 11B + 11C sudah di-commit, dipetikan, dideploy, dan diperiksa di peladen; sebelumnya produksi menjalankan 0.20.2 sejak 21 Sep 2026. Rincian deploy, bukti periksa, dan dua temuan nginx ada di bagian "Rilis v0.23.0 — LIVE DI PRODUKSI" di bawah. Wave 11C menutup 13 butir (68–76, 78, 81, 82) dengan skema **21**.)
+Terakhir diperbarui: 26 Sep 2026 (**v0.23.0 LIVE di produksi; v0.24.0 siap dipetikan, menunggu izin deploy** — Wave 11A + 11B + 11C sudah di-commit, dipetikan, dideploy, dan diperiksa di peladen; sebelumnya produksi menjalankan 0.20.2 sejak 21 Sep 2026. Rincian deploy, bukti periksa, dan dua temuan nginx ada di bagian "Rilis v0.23.0 — LIVE DI PRODUKSI" di bawah. Wave 11C menutup 13 butir (68–76, 78, 81, 82) dengan skema **21**.)
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -14,6 +14,82 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - DNS `coblai.com` belum dipasang (MX/SPF/DKIM); rinciannya di `docs/DNS_COBLAI_COM.md`.
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
+
+## Audit menyeluruh Wave 11 + perbaikan (26 Sep 2026) — persiapan rilis v0.24.0
+
+Bapak meminta: "cek dulu pekerjaan mana saja yang belum selesai dan belum diuji, tuntaskan semuanya,
+lalu rebuild kalau sudah diperbaiki, baru push." Bagian ini mencatat hasilnya apa adanya.
+Daftar temuan lengkap (temuan → perbaikan → bukti, termasuk temuan yang gugur) ada di
+`docs/DAFTAR_MASALAH_TERTUNDA.md` §6.8.
+
+### Cara audit
+Tiga agen audit membaca KODE (bukan laporan lama) di tiga wilayah dan menulis temuan dengan
+`berkas:baris` + kutipan asli: `/workspace/outputs/audit/audit_11ab.md`,
+`/workspace/outputs/audit/audit_ui.md`, `/workspace/outputs/audit/audit_11c.md`.
+Setiap temuan diuji ulang oleh lead; temuan yang tidak terbukti TIDAK diperbaiki.
+
+### Temuan berat yang sudah diperbaiki (ringkas)
+- **Butir 42** mode diskusi kini benar-benar ditegakkan di pintu artefak: run harus milik proyek itu
+  (`400 RUN_NOT_IN_PROJECT`) dan percakapan mode diskusi ditolak (`409 DISKUSI_MODE_NO_EXECUTE` +
+  audit `artifact.blocked_diskusi`). Sebelumnya penegakan hanya lewat blok prompt.
+- **Butir 45/46** tiga jalan pintas yang lolos penyaring prompt ditutup: jadwal (`schedule.blocked`),
+  Playground (`400 GUARDRAIL_BLOCKED`), dan jalur lanjutkan-run (`409 RESUME_PROMPT_BLOCKED` /
+  `RESUME_GUARDRAIL_BLOCKED`).
+- **Butir 56** perkiraan biaya memakai satu sumber tarif (`quoteCosts()`) termasuk tarif puncak;
+  sebelumnya harga luar-jam-puncak dipakai untuk model vendor (terukur 232 vs 465 mikro-dolar).
+- **Butir 61** biaya benchmark dihitung per baris (sebelumnya 5690 vs 404 = ±14x terlalu besar).
+- **Butir 62** `run_events` jenis `tool` akhirnya benar-benar ditulis jalur produksi
+  (`prime-rpc-engine.ts`), dengan suite baru yang menjalankan mesin tiruan bentuk mesin nyata.
+- **Butir 63** pekerja `resume.scan` kini memanggil `attemptAutoResumes` (kebijakan lanjut-otomatis
+  sebelumnya tidak pernah jalan karena fungsinya tanpa pemanggil).
+- **Butir 57** klasifikasi galat mesin: kode mesin nyata (`ENGINE_EXITED`, `ENGINE_START_FAILED`)
+  dianggap sementara, `RPC_FRAME_TOO_LARGE` permanen (permanen menang), dan galat asli dilaporkan
+  bila perpindahan terakhir gagal permanen. Sebelumnya kode mesin tidak diklasifikasi sama sekali dan
+  galat permanen sesudah satu perpindahan dilaporkan sebagai `ENGINE_UNAVAILABLE`.
+- **Butir 71** daftar putih alat MCP punya penulis (rute admin + panel UI).
+- **Butir 69** tombol uji kirim kanal bot (UI + rute yang benar).
+- **Butir 48** tombol **Render** artefak di editor: iframe `sandbox="allow-scripts"` (tanpa
+  `allow-same-origin`), HTML/SVG/teks lewat `srcDoc`, gambar lewat data URL, dan **penolakan jujur**
+  untuk docx/xlsx/pptx/pdf ("Jenis berkas ini tidak bisa dipratinjau di sini.").
+- **Butir 80** kartu **pagar konteks** di halaman Pemakaian: angka pemotongan dibandingkan dengan
+  jawaban server + kalimat jujur bila tidak ada yang dipotong + galat ditampilkan apa adanya.
+- **Uji palsu** di tujuh berkas uji dihapus (tidak ada lagi cek yang selalu hijau).
+- **Gerbang antarmuka** diperkeras: `SKIP-RUTE` (rute belum ada ≠ bukti), aturan 5xx deklaratif,
+  cek tautologi diganti, 7 `checkApi` yang argumennya bergeser diperbaiki.
+
+### Temuan BARU yang ditemukan saat memperbaiki butir 57 — dan diperbaiki
+Katalog model dari `prime-agent model list` bisa menjawab **tidak lengkap** (penyedia lambat/mesin
+sibuk). Jawaban pendek dulu **menimpa** daftar lama, sehingga model yang SAH ditolak
+`400 UNKNOWN_MODEL`. Kejadian nyata: satu jalan `wave11a.e2e.ts` (`/workspace/outputs/w11a_57_run.log`,
+cek 12h dan 12n) merah saat gerbang peramban berjalan bersamaan, lalu hijau tanpa perubahan kode.
+Perbaikan di `apps/api/src/server.ts`: ingatan nama model hanya BERTAMBAH (jawaban pendek tidak
+menghapus model yang sudah dikenal), pencocokan juga lewat nama dasar tanpa awalan penyedia, dan
+`GET /api/v1/models?refresh=1` menyegarkan ingatan itu.
+
+### Gerbang rilis (pada pohon yang sama dengan paket rilis)
+- `npx tsc -p apps/api/tsconfig.json` → 0 galat; `npx tsc -p tsconfig.test.json` → 0 galat;
+  `npx tsc -b` (dashboard) → 0 galat.
+- `npm run verify` → **61/61 suite hijau, `ALL_SUITES_PASSED`, exit 0**
+  (`/workspace/outputs/verify_audit_run2.log` dan `verify_audit_run3.log` — dua putaran penuh berturut-turut, keduanya 61/61 dan exit 0). Termasuk gerbang tipe uji dan gerbang migrasi (`MIGRATION_REHEARSAL_OK`,
+  `ROW_COUNTS_PRESERVED true`, `REOPEN_IDEMPOTENT true`, `INTEGRITY_CHECK ok`).
+  Dua suite baru masuk hitungan: `wave11a-katalog.e2e.ts` (10 cek) dan
+  `wave11b-timeline-alat.e2e.ts` (19 cek), sebabnya 59 → 61.
+- **Uji mutasi** (bukti uji baru benar-benar menangkap bug, bukan selalu hijau):
+  `wave11a-katalog` → kode lama 4 gagal termasuk `400 UNKNOWN_MODEL`;
+  `wave11b-timeline-alat` → 9 lulus/10 gagal; `wave11b-council` → 91/3 gagal;
+  `wave11a` §12 → 186/4 gagal.
+- Angka suite utama: `wave11a` **208/0/0**, `wave11b` **109/0/0**, `wave11c*` 459/0, council 94/0,
+  metrik 111/0, riwayat 103/0, konektor 53/0, timeline-alat 19/0, katalog 10/0.
+- Gerbang antarmuka `node e2e/ui.e2e.mjs`: **236 lulus / 0 gagal / 1 dilewati dari 237 titik**,
+  `consoleErrors=0`, `SKIP-RUTE 0`, `UI_E2E_PASSED`, exit 0 (`fix_ui_uji_run7.log`).
+  **Pengerasan baru:** gerbang MENOLAK jalan bila ada berkas `src/**` lebih baru dari
+  `dist/index.html` (`DIST_BASI` + exit 1) — ini menutup lubang nyata yang pada 26 Sep 2026 membuat
+  gerbang "hijau" terhadap bundel 25 Sep.
+- Paket rilis: `deploy/coder-sam-university-v0.24.0.tar.gz` — dibangun SESUDAH seluruh perubahan
+  di-commit, jadi isinya sama dengan pohon yang diuji (SHA256 dicatat di berkas `.sha256` dan pada
+  commit berikutnya, karena berkas ini ikut masuk paket).
+- **Belum**: push ke GitHub menunggu token Bapak; deploy ulang ke produksi belum dijalankan
+  (produksi masih menjalankan v0.23.0).
 
 ## Rilis v0.23.0 — LIVE DI PRODUKSI (26 Sep 2026)
 
@@ -233,7 +309,9 @@ kolom `agent_memories.kind` ('memory'|'learning'), kolom `runs.resume_state` / `
 `benchmark_runs`, `benchmark_results`, `error_events`, `prompt_schedules`. `config.ts`, `retention.ts`
 (dua sasaran baru: `error_events`, `shadow_measurements`), `dataexport.ts` (tujuh bagian baru) dan
 `jobs.ts` (jenis pekerjaan `schedule.run`, `resume.scan`) ikut diperbarui.
-**Belum ada deploy, belum ada restart, belum ada commit.**
+Catatan (26 Sep 2026): kalimat "belum ada deploy" di paragraf ini SUDAH TIDAK BERLAKU. Wave 11B
+menyusul masuk rilis **v0.23.0** (commit `3ecfd46`, tag `v0.23.0`) dan sudah LIVE di produksi —
+lihat bagian "Rilis v0.23.0 — LIVE DI PRODUKSI".
 
 Gerbang yang dijalankan sendiri (26 Sep 2026, di mesin ini, berurutan satu per satu):
 - `npm run verify` → **48/48 suite hijau** (sebelumnya 44; bertambah 4 suite Wave 11B), keluar kode **0**,
@@ -324,8 +402,9 @@ tidak dihitung ke salah satu butir. Jumlah total 11B: 92 + 111 + 103 + 81 = **38
 Sumber kerja: `PRD_WAVE_11_EKSEKUSI_v5.md` (25 Sep 2026; 42 butir, nomor 42–83, lanjutan daftar
 masalah yang berakhir di 41). Wave 11A adalah gelombang pertama. Skema basis data naik **18 → 19**
 satu kali saja (`SCHEMA_VERSION = 19`, ringkasan perubahan ditulis di `SCHEMA_VERSION_NOTE`),
-`retention.ts` dan `dataexport.ts` ikut diperbarui. **Belum ada deploy, belum ada restart, belum ada
-commit.**
+`retention.ts` dan `dataexport.ts` ikut diperbarui. Catatan (26 Sep 2026): kalimat "belum ada deploy"
+di paragraf ini SUDAH TIDAK BERLAKU — Wave 11A ikut masuk rilis **v0.23.0** (commit `3ecfd46`) yang
+sudah LIVE di produksi.
 
 Gerbang yang dijalankan sendiri (26 Sep 2026, semua di mesin ini):
 - `npm run verify` → **44/44 suite hijau** (gerbang tipe uji `tsconfig.test.json` → gerbang migrasi
@@ -439,7 +518,11 @@ jumlahnya bertambah 2 setiap halaman baru ditambahkan (185 sebelum halaman "Kebi
    permintaan SEBELUM run dibuat, jadi baris pelanggaran tidak punya `run_id`. Jejak lengkap per akun ada
    di `GET /api/v1/safety` (halaman Guardrail). Panel hanya muncul bila ada isinya.
 16. **Dashboard adalah repo terpisah** (`/workspace/coblai-dinda/coder-dashboard`) di dalam satu repo git
-   `/workspace/coblai-dinda`. Belum ada deploy dashboard maupun API.
+   `/workspace/coblai-dinda`. *Catatan (26 Sep 2026): kalimat "belum ada deploy dashboard maupun API" di
+   sini SUDAH TIDAK BERLAKU — sejak rilis v0.23.0 dashboard DAN API berjalan di
+   `https://coder.sam.university` (bukti: `prod_smoke_v0230.log` 202 lulus/0 gagal, uji antarmuka
+   Chromium 223/224). Yang masih berlaku: keduanya satu repo git, dan paket rilis hanya memuat berkas
+   `git ls-files` — jadi commit wajib lebih dulu sebelum memetikan.*
 
 ## Beres-beres sertifikat & rotasi sandi akun uji (21 Sep 2026 malam) — atas izin Bapak
 

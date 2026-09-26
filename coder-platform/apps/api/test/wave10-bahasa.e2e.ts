@@ -40,12 +40,18 @@ await import("../src/server.js");
 await new Promise((resolve) => setTimeout(resolve, 800));
 const base = `http://127.0.0.1:${port}`;
 
-let passed = 0; let failed = 0;
+let passed = 0; let failed = 0; let skipped = 0;
 const failedNames: string[] = [];
 function check(name: string, ok: boolean, detail = "") {
   if (ok) { passed += 1; console.log(`PASS ${name}`); return; }
   failed += 1; failedNames.push(name); console.log(`FAIL ${name} ${detail}`);
 }
+/**
+ * Satu-satunya jalan melewati pemeriksaan. Ringkasan berkas ini dulu mencetak `skip=0` secara
+ * HARFIAH, jadi pemeriksaan yang dilewati tidak akan terlihat sama sekali. Sekarang jumlahnya
+ * dihitung sungguhan dan dilaporkan juga sebagai `SKIP-TOTAL`.
+ */
+function skip(name: string, reason: string) { skipped += 1; console.log(`SKIP ${name} · ${reason}`); }
 
 function client() {
   let cookie = "";
@@ -121,6 +127,9 @@ check("2) webhook yang tidak ada dijawab 404 dengan kalimat Indonesia",
   hook.status === 404 && String(hook.json?.error ?? "").startsWith("WEBHOOK") && kalimatIndonesia(hook.json?.message), JSON.stringify(hook.json)?.slice(0, 160));
 
 // ------------------------------------------------------------------ 3) aturan umum
+// Penjaga panjang (sejenis temuan B9 di wave11c-bayar): dua saringan di bawah memakai `.filter()`,
+// jadi daftar `jawaban` yang kosong akan lulus tanpa membuktikan apa pun. Jumlahnya diperiksa dulu.
+check("3) daftar jawaban yang disaring tidak kosong (penjaga anti-lulus-vakum)", jawaban.length >= 5, `jumlah=${jawaban.length}`);
 const tanpaPesan = jawaban.filter((item) => !kalimatIndonesia(item.message));
 check("3) semua jawaban galat rute baru memakai kalimat Indonesia",
   tanpaPesan.length === 0, JSON.stringify(tanpaPesan).slice(0, 300));
@@ -143,7 +152,8 @@ check("4) /metrics dengan token menjawab teks Prometheus, bukan galat",
   metrikBenar.status === 200 && /^# HELP /m.test(metrikBenar.text) && /coder_schema_version/.test(metrikBenar.text), metrikBenar.text.slice(0, 80));
 
 // ------------------------------------------------------------------ ringkasan
-console.log(`RINGKASAN cek: lulus=${passed} gagal=${failed} skip=0`);
+console.log(`RINGKASAN cek: lulus=${passed} gagal=${failed} skip=${skipped}`);
+if (skipped > 0) console.log(`SKIP-TOTAL ${skipped}`);
 console.log(`RINGKASAN: ${passed}/${passed + failed} lulus`);
 if (failed === 0) {
   console.log("ALL_WAVE10_BAHASA_TESTS_PASSED");

@@ -9,7 +9,10 @@ if (!EMAIL || !PASSWORD) { console.log("SKIP missing credentials in env"); proce
 
 let cookie = "";
 let failures = 0;
+let skips = 0;
 function check(name, ok, detail = "") { console.log(`${ok ? "PASS" : "FAIL"} ${name}${ok ? "" : ` ${detail}`}`); if (!ok) failures += 1; }
+/** Pemeriksaan yang benar-benar dilewati selalu dihitung, supaya jumlahnya tidak bisa disembunyikan. */
+function skip(name, reason) { skips += 1; console.log(`SKIP ${name} :: ${reason}`); }
 
 async function call(method, path, body) {
   const response = await fetch(`${BASE}${path}`, {
@@ -166,18 +169,32 @@ check("mfa status responds", mfaStatus.status === 200 && typeof mfaStatus.json.e
 
 const catalogue = await call("GET", "/api/v1/models");
 check("model catalogue responds", catalogue.status === 200 && Array.isArray(catalogue.json.models), JSON.stringify(catalogue.json)?.slice(0, 120));
-if (catalogue.json.models.length > 0) {
-  check("model catalogue lists engine models", true, "");
+// Diperbaiki 26 Sep 2026 (audit cek vakum): cabang "katalog tidak kosong" dulu hanya memanggil
+// `check(..., true)`, jadi ia tidak membuktikan apa pun. Sekarang setiap baris katalog diperiksa
+// bentuknya: id model dan penyedia terisi, kolom keluaran terisi, dan penanda kemampuan boolean
+// (bentuk baris yang dirakit server.ts:1758 dari keluaran `prime-agent model list`).
+const catalogueRows = Array.isArray(catalogue.json.models) ? catalogue.json.models : [];
+if (catalogueRows.length > 0) {
+  check("model catalogue lists engine models",
+    catalogueRows.every((row) => typeof row?.model === "string" && row.model.trim() !== "" && typeof row?.provider === "string" && row.provider.trim() !== ""
+      && String(row?.context ?? "").trim() !== "" && String(row?.maxOutput ?? "").trim() !== ""
+      && typeof row?.thinking === "boolean" && typeof row?.images === "boolean"),
+    JSON.stringify(catalogueRows.slice(0, 2)));
 } else {
   // The engine only lists models when a provider credential exists; report it instead of failing.
-  console.log(`SKIP model catalogue empty: ${catalogue.json.note ?? catalogue.json.error ?? "no details"}`);
+  skip("model catalogue lists engine models", `katalog kosong: ${catalogue.json.note ?? catalogue.json.error ?? "no details"}`);
 }
-const sampleModel = catalogue.json.models[0]?.model;
+const sampleModel = catalogueRows[0]?.model;
 if (sampleModel) {
   const modelRun = await call("POST", `/api/v1/projects/${projectId}/runs`, { prompt: "ping model", model: sampleModel });
   check("run accepts a known model", modelRun.status === 202 && modelRun.json.model === sampleModel, JSON.stringify(modelRun.json)?.slice(0, 160));
   const badModel = await call("POST", `/api/v1/projects/${projectId}/runs`, { prompt: "ping", model: "model-palsu-xyz" });
   check("run rejects an unknown model", badModel.status === 400 && badModel.json.error === "UNKNOWN_MODEL", JSON.stringify(badModel.json));
+} else {
+  // Temuan audit 26 Sep 2026: tanpa katalog, kedua pemeriksaan di atas HILANG diam-diam dari
+  // hitungan (tidak ada SKIP, tidak ada angka apa pun). Sekarang dilaporkan sebagai SKIP terhitung.
+  skip("run accepts a known model", "katalog model kosong: tidak ada model yang bisa dipakai");
+  skip("run rejects an unknown model", "katalog model kosong: pemeriksaan ini ikut tidak dijalankan");
 }
 
 // ------------------------------------------------- account recovery, notifications, admin, metrics
@@ -188,11 +205,18 @@ check("notifications can be marked read", readAll.status === 200 && typeof readA
 
 const forgot = await call("POST", "/api/v1/auth/password/forgot", { email: `tidak-ada-${Date.now()}@example.test` });
 check("forgot password answers for any address", forgot.status === 200 && forgot.json.ok === true, JSON.stringify(forgot.json));
+// Diperbaiki 26 Sep 2026 (audit cek vakum): cabang "delivery = email" dulu hanya `check(..., true)`.
+// Yang dibuktikan sekarang: alamat yang tidak ada pun dijawab dengan bentuk yang sama seperti alamat
+// yang ada, yaitu hanya `{ ok, delivery }` -- tanpa catatan tambahan dan tanpa token reset, jadi
+// keberadaan sebuah akun tidak bisa dibocorkan lewat rute ini (server.ts:553).
+const forgotFields = Object.keys(forgot.json ?? {}).sort().join(",");
 if (forgot.json.delivery === "email") {
-  check("forgot password reports email delivery", true, "");
+  check("forgot password reports email delivery",
+    forgot.json.ok === true && forgotFields === "delivery,ok" && !/token/i.test(JSON.stringify(forgot.json ?? {})),
+    `bidang=${forgotFields} ${JSON.stringify(forgot.json)?.slice(0, 160)}`);
 } else {
   // No SMTP credential is configured yet, so no mail can leave the platform. Reported, not hidden.
-  console.log(`SKIP password reset email delivery: ${forgot.json.note ?? forgot.json.delivery}`);
+  skip("password reset email delivery", `surat tidak keluar: ${forgot.json.note ?? forgot.json.delivery}`);
 }
 const badReset = await call("POST", "/api/v1/auth/password/reset", { token: "token-palsu", password: "PanjangSekali123!" });
 check("password reset rejects an invalid token", badReset.status === 400 && badReset.json.error === "TOKEN_INVALID_OR_EXPIRED", JSON.stringify(badReset.json));
@@ -688,5 +712,6 @@ check("wave10 the status hub says how long the clean up keeps webhook history",
   JSON.stringify(hub10.json?.housekeeping));
 console.log(`INFO wave10 searchIndexed=${hub10.json?.search?.indexedMessages}/${hub10.json?.search?.messages} pushConfigured=${hub10.json?.push?.configured} pushSubs=${hub10.json?.push?.activeSubscriptions} devices=${hub10.json?.devices?.devices} verifyMode=${hub10.json?.devices?.mode} reservedTokens=${hub10.json?.housekeeping?.reservedTokensWaiting} growthSources=${JSON.stringify(hub10.json?.openPlatform?.growthSources)}`);
 
+console.log(`SKIP-TOTAL ${skips}`);
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);
 process.exit(failures === 0 ? 0 : 1);

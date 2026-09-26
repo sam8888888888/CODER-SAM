@@ -21,6 +21,8 @@
  *  ③ galat: BENCHMARK_MODEL_LIMIT, INVALID_MODEL, MODEL_REQUIRED, BENCHMARK_NOT_FOUND.
  *  ④ tiap pasangan (model, soal) menyimpan satu baris `benchmark_results` beserta biaya dan waktu;
  *    model yang gagal ditandai `error_code` dan tidak menghentikan model lain.
+ *    Biaya satu pasangan = biaya baris `run_usage` PASANGAN ITU (B15/B16/B16b/B16c), bukan
+ *    `SUM` seluruh run yang menumpuk biaya pasangan sebelumnya (temuan audit F7 butir 61).
  *  ⑤ skor kesepakatan antar model dihitung dan disimpan; isi formulanya diuji langsung.
  *
  * Jalankan: cd /workspace/coblai-dinda/coder-platform && npx tsx apps/api/test/wave11b-council.e2e.ts
@@ -33,6 +35,9 @@
  *  • Batas paralel diuji pada helper `jalankanBerurutanBersamaan`; lewat HTTP, mock selesai terlalu
  *    cepat untuk bisa mengukur tumpang tindih waktu secara jujur.
  * Berkas ini hanya menambah berkas uji baru. Tidak ada berkas lain milik agen lain yang diubah.
+ * Perbaikan audit Wave 11 (agen `fix-biaya-benchmark`): bagian B15/B16 diperkuat dan
+ * `apps/api/src/wave11b/benchmark.ts` diperbaiki (biaya per pasangan dibaca dari baris run_usage
+ * pasangan itu). Perubahan itu hanya menyentuh berkas butir 61.
  */
 import { createServer as createTcpServer } from "node:net";
 import { readFileSync } from "node:fs";
@@ -87,7 +92,7 @@ await import("../src/server.js");
 const { db, SCHEMA_VERSION } = await import("../src/db.js");
 const { config } = await import("../src/config.js");
 const { quotaState } = await import("../src/billing.js");
-const { quoteCosts, priceView } = await import("../src/pricing.js");
+const { quoteCosts, priceView, sellForBaseMicros } = await import("../src/pricing.js");
 const councilMod: any = await import("../src/wave11b/council.js");
 const benchMod: any = await import("../src/wave11b/benchmark.js");
 
@@ -490,16 +495,87 @@ check("B13. setiap hasil terisi jawaban, skor, waktu, dan biaya lebih dari nol",
   short(hasilBench.slice(0, 2)));
 check("B14. skor kesepakatan 100 karena dua model mock menerima prompt yang sama", hasilBench.every((row) => row.score === 100), short(hasilBench.map((row) => row.score).slice(0, 5)));
 
-const satuRunBenchmark = hitung("SELECT COUNT(*) AS n FROM runs WHERE prompt LIKE ?", `Benchmark ${benchmarkRunId} - %`);
-const usageBenchmark = satu(`SELECT COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(cost_micros),0) AS biayaDasar, COALESCE(SUM(sell_cost_micros),0) AS biayaJual,
-    COUNT(*) AS baris FROM run_usage WHERE run_id=(SELECT id FROM runs WHERE prompt LIKE ?)`, `Benchmark ${benchmarkRunId} - %`);
-check("B15. satu run induk menampung seluruh pemakaian token benchmark", satuRunBenchmark === 1 && Number(usageBenchmark.baris) === 20
-  && Number(usageBenchmark.inputTokens) > 0 && Number(usageBenchmark.biayaJual) > 0, short({ satuRunBenchmark, usageBenchmark }));
+const polaRunBenchmark = `Benchmark ${benchmarkRunId} - %`;
+const satuRunBenchmark = hitung("SELECT COUNT(*) AS n FROM runs WHERE prompt LIKE ?", polaRunBenchmark);
+
+// Baris `run_usage` benchmark ini dalam URUTAN TULIS (rowid). Urutannya sama dengan urutan pasangan
+// pada `benchmark_results`: dua `for` bersarang (model lalu soal) menulis baris kedua tabel, jadi
+// baris ke-i pada dua daftar di bawah menunjuk pasangan yang sama.
+const usagePerPasangan = semua(`SELECT rowid AS urut, model, input_tokens AS inputTokens, output_tokens AS outputTokens,
+    cost_micros AS baseMicros, sell_cost_micros AS sellMicros, estimated AS estimated
+  FROM run_usage WHERE run_id=(SELECT id FROM runs WHERE prompt LIKE ?) ORDER BY rowid`, polaRunBenchmark);
+
+/**
+ * Angka PASTI yang diharapkan untuk tiap pasangan (bukti berdiri sendiri, bukan sekadar "> 0").
+ * Mesin MOCK melaporkan ceil(panjang prompt / 4) token masukan dan 8 token jawaban; biayanya
+ * dihitung di uji dengan helper harga yang sama seperti server.
+ */
+const soalTetap = benchMod.loadBenchmarkQuestions() as { id: string; text: string }[];
+const modelDiuji = [MODEL_A, MODEL_B];
+const harapanPerPasangan = modelDiuji.flatMap((nama) => soalTetap.map((satu) => {
+  const inputTokens = Math.ceil(benchMod.promptSoal(satu.text).length / 4);
+  const outputTokens = 8;
+  const quote = quoteCosts(nama, { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
+  const baseMicros = Number(quote.baseMicros ?? 0);
+  const sellMicros = Number(sellForBaseMicros(baseMicros, quote.markup) ?? 0);
+  return { model: nama, questionId: satu.id, inputTokens, outputTokens, baseMicros, sellMicros };
+}));
+const jum = (daftar: number[]) => daftar.reduce((total, angka) => total + angka, 0);
+const jumlahPasangan = harapanPerPasangan.length;
+const angkaPemakaianCocok = usagePerPasangan.length === jumlahPasangan && usagePerPasangan.every((row, i) => row.model === harapanPerPasangan[i].model
+  && Number(row.inputTokens) === harapanPerPasangan[i].inputTokens && Number(row.outputTokens) === harapanPerPasangan[i].outputTokens
+  && Number(row.baseMicros) === harapanPerPasangan[i].baseMicros && Number(row.sellMicros) === harapanPerPasangan[i].sellMicros
+  && Number(row.estimated) === 0);
+const harapanInputTokens = jum(harapanPerPasangan.map((row) => row.inputTokens));
+const harapanOutputTokens = jum(harapanPerPasangan.map((row) => row.outputTokens));
+const harapanBiayaDasar = jum(harapanPerPasangan.map((row) => row.baseMicros));
+const harapanBiayaJual = jum(harapanPerPasangan.map((row) => row.sellMicros));
+const usageBenchmark = satu(`SELECT COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens,
+    COALESCE(SUM(cost_micros),0) AS biayaDasar, COALESCE(SUM(sell_cost_micros),0) AS biayaJual, COUNT(*) AS baris
+  FROM run_usage WHERE run_id=(SELECT id FROM runs WHERE prompt LIKE ?)`, polaRunBenchmark);
+check("B15. satu run induk menampung seluruh pemakaian token benchmark dengan ANGKA PASTI (20 baris, token + biaya persis, bukan sekadar > 0)",
+  satuRunBenchmark === 1 && jumlahPasangan === 20 && Number(usageBenchmark.baris) === jumlahPasangan && angkaPemakaianCocok
+  && Number(usageBenchmark.inputTokens) === harapanInputTokens && Number(usageBenchmark.outputTokens) === harapanOutputTokens
+  && Number(usageBenchmark.biayaDasar) === harapanBiayaDasar && Number(usageBenchmark.biayaJual) === harapanBiayaJual && harapanBiayaJual > 0,
+  short({ satuRunBenchmark, usageBenchmark, harapanInputTokens, harapanOutputTokens, harapanBiayaDasar, harapanBiayaJual, angkaPemakaianCocok }));
 
 const detailBench = await owner.call("GET", `/api/v1/benchmark/runs/${benchmarkRunId}`);
-const totalBiayaHasil = hasilBench.reduce((total, row) => total + Number(row.costMicros), 0);
-check("B16. GET hasil benchmark -> 200 dengan biaya sama dengan jumlah biaya tiap pasangan", detailBench.status === 200
-  && Number(detailBench.json?.costMicros) === totalBiayaHasil && detailBench.json?.results?.length === 20, short({ status: detailBench.status, costMicros: detailBench.json?.costMicros, totalBiayaHasil }));
+
+/*
+ * Sumber BENAR biaya satu pasangan = baris `run_usage` milik pasangan itu sendiri.
+ * Sumber SALAH (bug lama, temuan audit F7 butir 61) = `SUM(...)` atas SATU `run_id` bersama, yang
+ * menumpuk biaya pasangan sebelumnya ke pasangan berikutnya lalu dijumlahkan lagi ke ringkasan.
+ * Karena itu pembanding di bawah diambil dari baris per pasangan, dan ditambah penjaga regresi
+ * eksplisit: total laporan harus sama dengan penjumlahan per pasangan dan BUKAN angka menumpuk.
+ */
+const hasilPerPasangan = semua(`SELECT rowid AS urut, model, question_id AS questionId, cost_micros AS costMicros
+  FROM benchmark_results WHERE benchmark_run_id=? ORDER BY rowid`, benchmarkRunId);
+const biayaPasanganDariUsage = usagePerPasangan.map((row) => Number(row.sellMicros));
+const biayaPerPasangan = harapanPerPasangan.map((row) => row.sellMicros);
+const totalBiayaPasangan = jum(biayaPerPasangan);
+// Angka yang DULU tersimpan per pasangan (kumulatif) dan total yang DULU dilaporkan; hanya dipakai
+// sebagai pembanding supaya uji ini benar-benar GAGAL bila bug lama kembali.
+const kumulatifUsage = biayaPasanganDariUsage.map((_, i) => jum(biayaPasanganDariUsage.slice(0, i + 1)));
+const totalKumulatifLama = jum(kumulatifUsage);
+const barisSamaDenganUsage = hasilPerPasangan.length === biayaPasanganDariUsage.length
+  && hasilPerPasangan.every((row, i) => Number(row.costMicros) === biayaPasanganDariUsage[i]);
+check("B16. biaya tiap baris hasil = biaya baris `run_usage` pasangan itu (bukan biaya menumpuk)",
+  detailBench.status === 200 && hasilPerPasangan.length === 20 && barisSamaDenganUsage
+  && hasilPerPasangan.every((row, i) => Number(row.costMicros) === biayaPerPasangan[i]
+    && row.model === harapanPerPasangan[i].model && row.questionId === harapanPerPasangan[i].questionId),
+  short({ status: detailBench.status, barisSamaDenganUsage, biayaPerPasangan, dariUsage: biayaPasanganDariUsage, kumulatifUsage }));
+check("B16b. laporan GET = penjumlahan biaya per pasangan dan TIDAK sama dengan angka menumpuk (penjaga regresi F7)",
+  detailBench.status === 200 && Number(detailBench.json?.costMicros) === totalBiayaPasangan
+  && Number(detailBench.json?.costMicros) === jum(biayaPasanganDariUsage)
+  && totalKumulatifLama !== totalBiayaPasangan && Number(detailBench.json?.costMicros) !== totalKumulatifLama
+  && detailBench.json?.results?.length === 20,
+  short({ status: detailBench.status, laporan: detailBench.json?.costMicros, totalBiayaPasangan, dariUsage: jum(biayaPasanganDariUsage), totalKumulatifLama }));
+const harapanBiayaPerModel = new Map(modelDiuji.map((nama) => [nama, jum(harapanPerPasangan.filter((row) => row.model === nama).map((row) => row.sellMicros))]));
+const perModelLaporan: any[] = Array.isArray(detailBench.json?.ringkasan?.perModel) ? detailBench.json.ringkasan.perModel : [];
+check("B16c. ringkasan biaya per model = jumlah biaya pasangan model itu (bukan angka menumpuk)",
+  perModelLaporan.length === 2 && perModelLaporan.every((row) => Number(row.biayaMicros) === harapanBiayaPerModel.get(String(row.model)))
+  && jum(perModelLaporan.map((row) => Number(row.biayaMicros))) === totalBiayaPasangan,
+  short({ perModelLaporan, harapanBiayaPerModel: [...harapanBiayaPerModel.entries()] }));
 check("B17. ringkasan per model memuat jumlah dijawab, gagal, biaya, dan rata-rata waktu", detailBench.status === 200
   && Array.isArray(detailBench.json?.ringkasan?.perModel) && detailBench.json.ringkasan.perModel.length === 2
   && detailBench.json.ringkasan.perModel.every((row: any) => row.dijawab === 10 && row.gagal === 0 && row.biayaMicros > 0 && typeof row.rataLatencyMs === "number"),

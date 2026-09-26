@@ -47,6 +47,12 @@ export function scrubErrorSecrets(input: string): string {
   teks = teks.replace(/enc:v1:[A-Za-z0-9+/=_-]+/gi, `enc:v1:${ERROR_REDACTION}`);
   // 4) Awalan kunci gaya OpenAI.
   teks = teks.replace(/\bsk-[A-Za-z0-9._\-]{6,}/g, `sk-${ERROR_REDACTION}`);
+  // 4b) Kunci API platform `ck_<40 heksadesimal>` (apikeys.ts). Pola 5 di bawah TIDAK menangkapnya:
+  // garis bawah adalah karakter kata, jadi batas kata tidak ada di antara `ck_` dan heksadesimalnya.
+  // Tanpa langkah ini kunci API utuh bocor ke `error_events` dan ke ekspor CSV (temuan audit).
+  teks = teks.replace(/\bck_[0-9a-f]{16,}\b/gi, `ck_${ERROR_REDACTION}`);
+  // 4c) Kunci lain yang memakai awalan bergaris bawah (mis. `wh_`, `api_`) dengan badan panjang.
+  teks = teks.replace(/\b[a-z]{2,6}_[0-9a-f]{24,}\b/gi, (_all, awalan: string) => `${awalan}_${ERROR_REDACTION}`);
   // 5) Token panjang yang berdiri sendiri: >= 20 karakter alfanumerik DAN bercampur huruf+angka.
   teks = teks.replace(/\b[A-Za-z0-9]{20,}\b/g, (token: string) => (/[0-9]/.test(token) && /[A-Za-z]/.test(token) ? ERROR_REDACTION : token));
   return teks.slice(0, ERROR_MESSAGE_MAX);

@@ -297,17 +297,17 @@ check("3) pengiriman tetap dikirim walau pendahulunya masih macet",
   patienceReport?.status === "delivered" && String(blockerRow?.status) === "queued", short({ report: patienceReport, blocker: blockerRow?.status }));
 check("3) baris pengikut tercatat delivered", String(followerRow?.status) === "delivered", short(followerRow?.status));
 const outOfOrderNote = String(followerRow?.lastError ?? "");
-if (outOfOrderNote.includes("mendahului") && outOfOrderNote.includes(`#${blocker.sequence}`)) {
-  check("3) last_error menyebut pengiriman di luar urutan", true, short(outOfOrderNote));
-} else {
-  const noteAt = sqlTrace.findIndex((line) => line.includes("mendahului"));
-  const deliveredAt = sqlTrace.findIndex((line) => line.includes("status='delivered'"));
-  const traceNote = noteAt >= 0 && deliveredAt > noteAt
-    ? `jejak SQL: catatan ditulis pada langkah ke-${noteAt + 1} lalu ditimpa last_error=NULL oleh UPDATE sukses pada langkah ke-${deliveredAt + 1}`
-    : `jejak SQL tidak lengkap (catatan=${noteAt}, sukses=${deliveredAt})`;
-  check("3) last_error menyebut pengiriman di luar urutan", false,
-    `baris dikirim di luar urutan (deferrals=${followerRow?.deferrals}, status=${followerRow?.status}) tetapi last_error=${JSON.stringify(followerRow?.lastError)}; ${traceNote}. Berkas: apps/api/src/webhooks.ts:327 menulis catatan, apps/api/src/webhooks.ts:371 menghapusnya (last_error=NULL) saat kiriman berhasil`);
-}
+// Diperbaiki 26 Sep 2026 (audit cek vakum): dulu syaratnya ditulis `if (syarat) check(..., true)`,
+// sehingga cabang "lulus" hanya mencetak true tanpa memeriksa apa pun lagi. Sekarang syarat itu
+// sendiri yang menjadi argumen `check`, sedangkan jejak SQL tetap ikut dilaporkan saat gagal.
+const catatanSesuai = outOfOrderNote.includes("mendahului") && outOfOrderNote.includes(`#${blocker.sequence}`);
+const noteAt = sqlTrace.findIndex((line) => line.includes("mendahului"));
+const deliveredAt = sqlTrace.findIndex((line) => line.includes("status='delivered'"));
+const traceNote = noteAt >= 0 && deliveredAt > noteAt
+  ? `jejak SQL: catatan ditulis pada langkah ke-${noteAt + 1} lalu ditimpa last_error=NULL oleh UPDATE sukses pada langkah ke-${deliveredAt + 1}`
+  : `jejak SQL tidak lengkap (catatan=${noteAt}, sukses=${deliveredAt})`;
+check("3) last_error menyebut pengiriman di luar urutan", catatanSesuai,
+  `last_error=${JSON.stringify(followerRow?.lastError)} (deferrals=${followerRow?.deferrals}, status=${followerRow?.status}); ${traceNote}. Berkas: apps/api/src/webhooks.ts:327 menulis catatan, apps/api/src/webhooks.ts:371 menghapusnya (last_error=NULL) saat kiriman berhasil`);
 // noteDeferral menaikkan penghitung SEBELUM batas diperiksa, jadi penundaan terakhir ikut dihitung
 // walau kiriman pada percobaan itu langsung dikirim.
 // Penghitung TIDAK menambah percobaan yang menyerah dan langsung mengirim, jadi angkanya sama

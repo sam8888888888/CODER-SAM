@@ -1,8 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, failureOf, type BotChannel, type BotLinkCode } from './api';
+import { api, failureOf, type BotChannel, type BotLinkCode, type BotTestResponse } from './api';
 import { BTN, BTN_UTAMA, CARD, FIELD, LABEL, TABEL, SEL, angka, waktu } from './w11b';
 
 type Props = { isAdmin?: boolean; onError?: (message: string) => void };
+
+/**
+ * Hasil satu "uji kirim". Cabang `ok: true` HANYA dipakai saat server menjawab 2xx, yaitu saat hulu
+ * Telegram benar-benar menerima pesan; kegagalan hulu (502) selalu mendarat di cabang `ok: false`
+ * dengan teks jawaban Telegram apa adanya.
+ */
+type HasilUji =
+  | { ok: true; jawaban: BotTestResponse }
+  | { ok: false; kode: string; pesan: string; status: number; pesanHulu: string };
 
 /**
  * Halaman "Kanal bot" (butir 69 + 81).
@@ -11,10 +20,13 @@ type Props = { isAdmin?: boolean; onError?: (message: string) => void };
  *  1. Admin platform: kanal Telegram/WhatsApp (nama, nama agen, tagline, aktif, token tersegel).
  *  2. Pengguna: kode pemasangan akun ke bot dan daftar tautan yang sudah dipasang.
  *
- * CATATAN JUJUR (wajib tampil di layar): TIDAK ADA rute "uji kirim" untuk bot. Tindakan nyatanya
- * adalah SIMPAN: saat kanal Telegram disimpan dengan token dan alamat publik terisi, server benar-benar
- * memanggil `setWebhook` ke Telegram. Karena itu hasil simpan menampilkan jawaban hulu APA ADANYA —
- * kalau Telegram menolak, layar menampilkan penolakan itu dan tidak pernah menulis "berhasil terkirim".
+ * Dua tindakan NYATA (bukan pura-pura), dan keduanya menampilkan jawaban hulu APA ADANYA:
+ *  1. SIMPAN: saat kanal Telegram disimpan dengan token dan alamat publik terisi, server benar-benar
+ *     memanggil `setWebhook` ke Telegram.
+ *  2. UJI KIRIM (butir 69, v0.23.1): tombol per kanal memanggil
+ *     `POST /api/v1/admin/bot-channels/:id/test`; server benar-benar mengirim SATU pesan uji lewat kanal
+ *     yang tersimpan, memakai pemanggil yang sama dengan balasan sungguhan.
+ * Kalau Telegram menolak, layar menampilkan penolakan itu dan tidak pernah menulis "berhasil".
  */
 export function BotChannels({ isAdmin = false, onError }: Props) {
   const [channels, setChannels] = useState<BotChannel[]>([]);
@@ -31,6 +43,9 @@ export function BotChannels({ isAdmin = false, onError }: Props) {
   const [tagline, setTagline] = useState('Asisten COBLAI');
   const [enabled, setEnabled] = useState(true);
   const [hasilSimpan, setHasilSimpan] = useState<BotChannel | null>(null);
+  // Tujuan uji kirim: kosong = server memakai tautan paling baru di kanal itu.
+  const [chatIdUji, setChatIdUji] = useState('');
+  const [hasilUji, setHasilUji] = useState<Record<string, HasilUji>>({});
 
   // Bagian pengguna
   const [kode, setKode] = useState<BotLinkCode | null>(null);
@@ -85,6 +100,34 @@ export function BotChannels({ isAdmin = false, onError }: Props) {
     } catch (error) {
       const detail = failureOf(error);
       gagal(`${detail.message || detail.code} [${detail.code}]`);
+    } finally {
+      setSibuk(false);
+    }
+  }
+
+  /**
+   * Uji kirim (butir 69). Hasilnya disimpan per kanal supaya bisa dibandingkan dengan tabel di atas,
+   * dan pesan galat server (kode + `detail.pesanHulu`) ditampilkan apa adanya — termasuk saat hulu
+   * Telegram menolak pesan uji.
+   */
+  async function ujiKanal(kanalId: string): Promise<void> {
+    if (!isAdmin) { gagal('Hanya admin platform yang boleh mengirim pesan uji.'); return; }
+    setSibuk(true); setGalat(''); setPesan('');
+    try {
+      const jawaban = await api.botTestChannel(kanalId, chatIdUji.trim() ? { chatId: chatIdUji.trim() } : {});
+      setHasilUji((lama) => ({ ...lama, [kanalId]: { ok: true, jawaban } }));
+      setPesan(`Pesan uji terkirim ke ${jawaban.tujuan} lewat ${jawaban.jalur} (hulu HTTP ${jawaban.statusHulu.join(', ') || '—'}).`);
+    } catch (error) {
+      const detail = failureOf(error);
+      const badan = (detail.body ?? {}) as { detail?: { pesanHulu?: unknown } };
+      setHasilUji((lama) => ({
+        ...lama,
+        [kanalId]: {
+          ok: false, kode: detail.code, pesan: detail.message, status: detail.status,
+          pesanHulu: String(badan.detail?.pesanHulu ?? ''),
+        },
+      }));
+      gagal(`Uji kirim gagal: ${detail.message || detail.code} [${detail.code}]`);
     } finally {
       setSibuk(false);
     }
@@ -146,10 +189,12 @@ export function BotChannels({ isAdmin = false, onError }: Props) {
       </header>
 
       <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200" data-testid="bot-catatan-honest">
-        Tidak ada rute "uji kirim" untuk bot. Tindakan nyatanya adalah <b>Simpan</b>: kalau kanal Telegram
-        disimpan dengan token dan alamat publik platform terisi, server langsung memanggil
-        <code> setWebhook </code> ke Telegram. Karena itu kolom hasil di bawah memuat jawaban hulu apa adanya —
-        penolakan Telegram ditampilkan sebagai penolakan, bukan sebagai keberhasilan.
+        Dua tindakan nyata di halaman ini. <b>Simpan</b>: kalau kanal Telegram disimpan dengan token dan
+        alamat publik platform terisi, server langsung memanggil <code> setWebhook </code> ke Telegram.
+        <b>Uji kirim</b>: server benar-benar mengirim SATU pesan uji lewat kanal tersimpan
+        (<code>POST /api/v1/admin/bot-channels/:id/test</code>, batas 3 percobaan / 10 menit per kanal).
+        Keduanya memuat jawaban hulu apa adanya — penolakan Telegram ditampilkan sebagai penolakan,
+        bukan sebagai keberhasilan.
       </p>
 
       {galat ? <p role="alert" className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-rose-300" data-testid="bot-galat">{galat}</p> : null}
@@ -187,6 +232,11 @@ export function BotChannels({ isAdmin = false, onError }: Props) {
             </label>
             <label className="flex items-center gap-2 text-xs text-slate-300">
               <input type="checkbox" data-testid="bot-enabled" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> aktif
+            </label>
+            <label className={LABEL}>
+              Tujuan uji kirim (chat id, opsional)
+              <input className={`${FIELD} w-48`} data-testid="bot-chat-uji" value={chatIdUji}
+                placeholder="kosong = tautan terbaru di kanal" onChange={(event) => setChatIdUji(event.target.value)} />
             </label>
             <button type="button" className={BTN_UTAMA} data-testid="bot-simpan" disabled={sibuk} onClick={() => { void simpanKanal(); }}>
               {sibuk ? 'Menyimpan…' : 'Simpan & daftarkan webhook'}
@@ -254,11 +304,47 @@ export function BotChannels({ isAdmin = false, onError }: Props) {
                       }}>
                       Muat ke isian
                     </button>
+                    <button type="button" className={`${BTN} ml-1`} data-testid={`bot-uji-${kanal.id}`} disabled={sibuk}
+                      onClick={() => { void ujiKanal(kanal.id); }}>
+                      Uji kirim
+                    </button>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+
+          {/* Hasil uji kirim per kanal, apa adanya dari server. Blok ini hanya muncul SESUDAH admin
+              menekan tombol, jadi layar tidak pernah mengarang hasil. */}
+          {Object.keys(hasilUji).length ? (
+            <div className="space-y-1 rounded-lg border border-slate-700 bg-slate-900/60 px-2 py-2 text-xs" data-testid="bot-uji-daftar">
+              <b className="text-slate-100">Hasil uji kirim</b>
+              {Object.entries(hasilUji).map(([kanalId, hasil]) => (
+                <div key={kanalId} className="rounded-lg border border-slate-700 px-2 py-1"
+                  data-testid={`bot-uji-hasil-${kanalId}`}
+                  data-terkirim={hasil.ok && hasil.jawaban.terkirim ? 'true' : 'false'}
+                  data-kode={hasil.ok ? '' : hasil.kode}
+                  data-status={hasil.ok ? hasil.jawaban.statusHulu.join(',') : String(hasil.status)}>
+                  {hasil.ok ? (
+                    <>
+                      <p data-testid={`bot-uji-ringkas-${kanalId}`} className={kategori('aktif')}>
+                        Terkirim: ya · kanal {kanalId} · tujuan {hasil.jawaban.tujuan} · jalur {hasil.jawaban.jalur} · hulu HTTP {hasil.jawaban.statusHulu.join(', ') || '—'} · {angka(hasil.jawaban.panjangTeks)} karakter
+                      </p>
+                      <p data-testid={`bot-uji-hulu-${kanalId}`}>Jawaban hulu apa adanya: {hasil.jawaban.pesanHulu || '(hulu tidak mengirim pesan)'}</p>
+                    </>
+                  ) : (
+                    <>
+                      <p data-testid={`bot-uji-ringkas-${kanalId}`} className={kategori('gagal')}>
+                        TIDAK terkirim · kanal {kanalId} · {hasil.kode} (HTTP {hasil.status})
+                      </p>
+                      <p data-testid={`bot-uji-galat-${kanalId}`}>{hasil.pesan}</p>
+                      <p data-testid={`bot-uji-hulu-${kanalId}`}>Jawaban hulu apa adanya: {hasil.pesanHulu || '(tidak ada teks hulu pada galat ini)'}</p>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : (
         <p className="rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-xs text-slate-400" data-testid="bot-admin-tertutup">

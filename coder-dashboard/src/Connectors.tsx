@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, failureOf, type ConnectorKind, type ConnectorTestResponse, type ConnectorView, type ConnectorsResponse } from './api';
 import { BTN, BTN_UTAMA, CARD, FIELD, LABEL, TABEL, SEL, angka, waktu } from './w11b';
 
-type Props = { onError?: (message: string) => void };
+type Props = { onError?: (message: string) => void; isAdmin?: boolean };
 
 /**
  * Halaman "Konektor" (butir 71).
@@ -14,7 +14,7 @@ type Props = { onError?: (message: string) => void };
  *    adalah tombol "Uji" yang menjalankan pengiriman nyata.
  *  - Rahasia tidak pernah ditampilkan: hanya host, penanda terpasang, dan empat karakter terakhir.
  */
-export function Connectors({ onError }: Props) {
+export function Connectors({ onError, isAdmin = false }: Props) {
   const [data, setData] = useState<ConnectorsResponse | null>(null);
   const [galat, setGalat] = useState('');
   const [pesan, setPesan] = useState('');
@@ -26,6 +26,11 @@ export function Connectors({ onError }: Props) {
   const [nama, setNama] = useState('');
   const [alat, setAlat] = useState('');
   const [hasilUji, setHasilUji] = useState<Record<string, ConnectorTestResponse>>({});
+  // Butir 71 (admin): daftar putih alat MCP. Sebelum ini `mcp_allowed_tools` tidak punya penulis di
+  // produksi, jadi halaman hanya bisa MENAMPILKAN daftar kosong dan konektor MCP selalu 403.
+  const [alatMcp, setAlatMcp] = useState('');
+  const [pesanMcp, setPesanMcp] = useState('');
+  const [galatMcp, setGalatMcp] = useState('');
 
   const gagal = useCallback((message: string) => { setGalat(message); onError?.(message); }, [onError]);
 
@@ -43,6 +48,22 @@ export function Connectors({ onError }: Props) {
   useEffect(() => { void muat(); }, [muat]);
 
   const daftar: ConnectorView[] = data?.konektor ?? [];
+
+  /** Butir 71 (admin): simpan daftar putih alat MCP. Server yang menormalkan dan menyegel nilainya. */
+  async function simpanAlatMcp(): Promise<void> {
+    setSibuk(true); setGalatMcp(''); setPesanMcp('');
+    try {
+      const jawaban = await api.saveMcpAllowedTools(alatMcp.split(',').map((item) => item.trim()).filter(Boolean));
+      setAlatMcp(jawaban.alat.join(', '));
+      setPesanMcp(jawaban.pesan ?? `Tersimpan: ${jawaban.alat.length} alat.`);
+      await muat();
+    } catch (error) {
+      const detail = failureOf(error);
+      setGalatMcp(`${detail.message || detail.code} [${detail.code}]`);
+    } finally {
+      setSibuk(false);
+    }
+  }
 
   /** Tambah konektor. Jenis MCP hanya boleh memakai alat yang diizinkan admin platform. */
   async function tambah(): Promise<void> {
@@ -164,6 +185,38 @@ export function Connectors({ onError }: Props) {
           </p>
         ) : null}
       </div>
+
+      {isAdmin ? (
+        <div className={`${CARD} space-y-2`} data-testid="connector-mcp-admin">
+          <b className="text-slate-100">Daftar putih alat MCP (admin platform)</b>
+          <p className="text-xs text-slate-400">
+            Konektor MCP hanya boleh memakai alat di daftar ini. Daftar kosong berarti MCP tertutup
+            (pembuatan konektor MCP dijawab 403). Server yang menormalkan nama, jadi tulis dipisah koma.
+          </p>
+          <div className="flex flex-wrap items-end gap-2">
+            <label className={LABEL}>
+              Alat MCP diizinkan
+              <input
+                className={`${FIELD} w-96`}
+                type="text"
+                data-testid="connector-mcp-alat"
+                aria-label="Daftar putih alat MCP"
+                value={alatMcp}
+                onChange={(event) => { setAlatMcp(event.target.value); setPesanMcp(''); setGalatMcp(''); }}
+                placeholder="Contoh: search, fetch_url"
+              />
+            </label>
+            <button type="button" className={BTN_UTAMA} data-testid="connector-mcp-simpan" disabled={sibuk} onClick={() => { void simpanAlatMcp(); }}>
+              Simpan daftar putih
+            </button>
+          </div>
+          <p className="text-xs text-slate-300" data-testid="connector-mcp-status" data-terbuka={data?.pengaturan.mcpTerbuka ? 'ya' : 'tidak'}>
+            Tersimpan di server: {data?.pengaturan.mcpAllowedTools.join(', ') || '(kosong)'} · MCP {data?.pengaturan.mcpTerbuka ? 'terbuka' : 'tertutup'}
+          </p>
+          {pesanMcp ? <p className="text-xs text-emerald-300" data-testid="connector-mcp-pesan">{pesanMcp}</p> : null}
+          {galatMcp ? <p className="text-xs text-rose-300" data-testid="connector-mcp-galat">{galatMcp}</p> : null}
+        </div>
+      ) : null}
 
       <div className={`${CARD} space-y-2`} data-testid="connector-tambah-kartu">
         <b className="text-slate-100">Tambah konektor</b>

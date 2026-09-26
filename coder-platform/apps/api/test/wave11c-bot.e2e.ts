@@ -6,7 +6,9 @@
  *       petunjuk pemasangan, kode sekali pakai, jalur run yang SAMA dengan web (pagar email, kuota token
  *       per pengguna, filter hijack butir 45, larangan butir 46), jawaban sampai ke hulu tiruan,
  *       nama agen mengikuti konfigurasi admin, fallback teks polos saat Markdown ditolak, sendPhoto,
- *       batas panjang, mode diskusi (butir 42), penolakan grup, batas laju per chat.
+ *       batas panjang, mode diskusi (butir 42), penolakan grup, batas laju per chat, dan UJI KIRIM ke
+ *       kanal tersimpan (401 tanpa sesi, 403 bukan admin, 404 kanal asing, 409 tanpa tujuan/token atau
+ *       penyedia lain, 429 batas per kanal, 502 dengan teks hulu apa adanya).
  *   §2  butir 70 (min. 16): webhook WhatsApp — HMAC-SHA1 Twilio atas URL + parameter form, titik akhir
  *       publik tidak bisa dipakai tanpa tanda tangan yang sah, alur pesan identik, batas laju per nomor,
  *       jawaban lewat API Messages Twilio dengan Basic auth kanal.
@@ -32,6 +34,14 @@
  *   lewat `runJobCycleOnce`, sama seperti suite Wave 11B.
  * - Kode pemasangan yang belum dipakai disimpan pada baris `bot_identities` dengan
  *   `external_id='pending:<uuid>'` karena skema v21 tidak punya kolom status. Hal ini dilaporkan.
+ * - Pengerasan 1w2-1w4: knob uji (`BOT_REPLY_MAX_CHARS`, `BOT_GROUP_ENABLED`) TIDAK berlaku saat
+ *   `NODE_ENV=production` (yang dipakai `config`); di luar produksi jalur env-first tetap hidup, jadi
+ *   pemeriksaan 1w/1x di atas tetap sah.
+ * - Pengerasan 3t-3v: `POST /api/v1/bots/:channelId/link` juga dibatasi per ALAMAT pemanggil
+ *   (`BOT_LINK_IP_MAX_FAILURES` = 20 kegagalan / 15 menit, kode 429 `BOT_LINK_RATE_LIMITED`), karena
+ *   pembatas per (kanal, `external_id`) bisa dilewati dengan mengganti `external_id` setiap percobaan.
+ *   Alamat dipalsukan lewat `x-forwarded-for` di suite ini; peladen uji memakai `trustProxy` seperti
+ *   produksi di belakang nginx, jadi `request.ip` mengikuti header itu.
  * - Peladen uji `src/server.ts` tidak mengekspor instans Fastify, jadi penutupannya lewat
  *   `process.exit()` di blok `finally` (setelah peladen hulu tiruan ditutup dan DATA_DIR dihapus).
  */
@@ -88,6 +98,9 @@ const TOKEN_TG = "123456789:TOKEN-UJI-WAVE11C";
 const SID_TWILIO = "ACujiwave11c0000000000000000000001";
 const AUTH_TWILIO = "auth-token-uji-wave11c-shhh";
 const NOMOR_TWILIO = "whatsapp:+14155238886";
+/** Tujuan uji kirim yang selalu DITOLAK hulu tiruan: jawabannya harus diteruskan apa adanya. */
+const CHAT_UJI_TOLAK = "900100032";
+const ISI_HULU_TOLAK = { ok: false, error_code: 400, description: "Bad Request: chat not found" };
 let urutanPesanTg = 0;
 
 const huluTg = await buatHulu((isi) => {
@@ -99,6 +112,11 @@ const huluTg = await buatHulu((isi) => {
   const teks = String(isi.body?.text ?? isi.body?.caption ?? "");
   if (isi.body?.parse_mode && teks.includes("PECAH_MARKDOWN")) {
     return { status: 400, body: { ok: false, error_code: 400, description: "Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 12" } };
+  }
+  // Uji kirim ke tujuan ini selalu ditolak hulu. Teksnya sengaja TIDAK memuat kata "parse"/"entity"
+  // supaya fallback teks-polos tidak ikut jalan: satu panggilan hulu saja, jawaban diteruskan apa adanya.
+  if (String(isi.body?.chat_id ?? "") === CHAT_UJI_TOLAK) {
+    return { status: 400, body: ISI_HULU_TOLAK };
   }
   urutanPesanTg += 1;
   return { status: 200, body: { ok: true, result: { message_id: urutanPesanTg, chat: { id: isi.body?.chat_id } } } };
@@ -565,6 +583,19 @@ check("1w. BOT_REPLY_MAX_CHARS=300 -> jawaban panjang dipotong dengan penanda je
   && String(balasanPotong[0]?.body?.text ?? "").length <= 300 + "Agen Uji Baru — tagline baru 11C".length + 60,
   `panjang=${String(balasanPotong[0]?.body?.text ?? "").length}`);
 
+/* --- pengerasan knob uji: DI PRODUKSI nilai `process.env` tidak boleh menang atas `config` */
+const envProduksi = { ...process.env, NODE_ENV: "production", BOT_REPLY_MAX_CHARS: "300", BOT_GROUP_ENABLED: "true" };
+const batasProduksi = coreMod.botReplyMaxChars(envProduksi);
+check("1w2. NODE_ENV=production: BOT_REPLY_MAX_CHARS dari lingkungan DIABAIKAN, yang dipakai nilai config",
+  batasProduksi === config.BOT_REPLY_MAX_CHARS && batasProduksi !== 300,
+  `produksi=${batasProduksi} config=${config.BOT_REPLY_MAX_CHARS}`);
+const batasUji = coreMod.botReplyMaxChars({ ...process.env, NODE_ENV: "test", BOT_REPLY_MAX_CHARS: "300" });
+check("1w3. di luar produksi jalur env-first tetap hidup: BOT_REPLY_MAX_CHARS=300 dipakai apa adanya (suite lama)", batasUji === 300, `uji=${batasUji}`);
+const grupProduksi = coreMod.botGroupEnabled(envProduksi);
+check("1w4. NODE_ENV=production: BOT_GROUP_ENABLED dari lingkungan DIABAIKAN (config tetap false)",
+  grupProduksi === config.BOT_GROUP_ENABLED && grupProduksi === false && coreMod.botGroupEnabled({ ...process.env, NODE_ENV: "test", BOT_GROUP_ENABLED: "true" }) === true,
+  `produksi=${grupProduksi} config=${config.BOT_GROUP_ENABLED}`);
+
 /* --- grup: mati secara bawaan, menyala bila diaktifkan */
 resetBatasMasuk(channelTelegramId, tgChat.grupDari);
 const runsSebelumGrup = count("SELECT COUNT(*) AS n FROM runs");
@@ -650,6 +681,123 @@ check("1ad. kanal dimatikan admin -> 403 CHANNEL_DISABLED meski rahasia benar, l
   matikanTg.status === 200 && pesanKanalMati.status === 403 && pesanKanalMati.json?.error === "CHANNEL_DISABLED"
   && hidupkanTg.status === 200 && hidupkanTg.json?.channel?.enabled === true,
   `${matikanTg.status}/${pesanKanalMati.status}/${hidupkanTg.status}`);
+
+/* =====================================================================================
+ * Butir 69 lanjutan: UJI KIRIM ke kanal bot yang TERSIMPAN
+ * (POST /api/v1/admin/bot-channels/:id/test).
+ * Rutenya memakai pemanggil Telegram yang SAMA dengan balasan sungguhan, jadi buktinya diambil dari
+ * hulu tiruan — bukan hanya dari nilai kembalian API. Pesan yang dikirim memang pesan sungguhan.
+ * ===================================================================================== */
+const kanalMod: any = await import("../src/wave11c/bot-channels.js");
+const ruteUjiKirim = (channelId: string) => `/api/v1/admin/bot-channels/${channelId}/test`;
+const tgUji = "900100031";
+const isiHuluTolakMentah = JSON.stringify(ISI_HULU_TOLAK);
+kanalMod.testSendLimiter.reset();
+
+const catatanUjiAwal = huluTg.catatan.length;
+const ujiTanpaSesi = await fetch(`${base}${ruteUjiKirim(channelTelegramId)}`, {
+  method: "POST", headers: { "content-type": "application/json", origin: base }, body: JSON.stringify({ chatId: tgUji }),
+});
+const ujiTanpaSesiJson: any = await ujiTanpaSesi.json().catch(() => null);
+check("1ae. uji kirim tanpa sesi -> 401 AUTH_REQUIRED dan hulu tidak dipanggil",
+  ujiTanpaSesi.status === 401 && ujiTanpaSesiJson?.error === "AUTH_REQUIRED" && huluTg.catatan.length === catatanUjiAwal,
+  `${ujiTanpaSesi.status} ${short(ujiTanpaSesiJson)} hulu=${huluTg.catatan.length - catatanUjiAwal}`);
+
+const ujiBukanAdmin = await akunA.call("POST", ruteUjiKirim(channelTelegramId), { chatId: tgUji });
+check("1af. uji kirim oleh pengguna biasa (bukan admin platform) -> 403 ADMIN_REQUIRED dan hulu tidak dipanggil",
+  ujiBukanAdmin.status === 403 && ujiBukanAdmin.json?.error === "ADMIN_REQUIRED" && huluTg.catatan.length === catatanUjiAwal,
+  `${ujiBukanAdmin.status} ${short(ujiBukanAdmin.json)} hulu=${huluTg.catatan.length - catatanUjiAwal}`);
+
+const teksUjiKirim = "Uji kirim dari admin Wave 11C";
+const ujiSukses = await akunAdmin.call("POST", ruteUjiKirim(channelTelegramId), { chatId: tgUji, teks: teksUjiKirim });
+const kirimanKeTgUji = tgUntukChat(tgUji);
+const kirimanUjiTerakhir = kirimanKeTgUji[kirimanKeTgUji.length - 1];
+check("1ag. admin + kanal Telegram lengkap -> 200 terkirim:true dan pesan uji SUNGGUHAN sampai ke hulu",
+  ujiSukses.status === 200 && ujiSukses.json?.terkirim === true && ujiSukses.json?.tujuan === tgUji
+  && ujiSukses.json?.jalur === "markdown" && (ujiSukses.json?.statusHulu ?? []).includes(200)
+  && String(kirimanUjiTerakhir?.body?.chat_id ?? "") === tgUji && String(kirimanUjiTerakhir?.body?.text ?? "") === teksUjiKirim
+  && String(kirimanUjiTerakhir?.url ?? "").includes(`/bot${TOKEN_TG}/sendMessage`),
+  `${ujiSukses.status} ${short(ujiSukses.json)} ${short(kirimanUjiTerakhir?.body)}`);
+
+check("1ah. jawaban uji kirim tidak memuat token bot (hanya bentuk tersamar, sama seperti daftar kanal)",
+  !ujiSukses.text.includes(TOKEN_TG) && !ujiSukses.text.includes("TOKEN-UJI")
+  && ujiSukses.json?.kanal?.rahasia?.terpasang === true && String(ujiSukses.json?.kanal?.rahasia?.ekor ?? "") === `\u2026${TOKEN_TG.slice(-4)}`,
+  short(ujiSukses.json?.kanal?.rahasia));
+
+check("1ai. uji kirim tercatat di audit (bot_channel.tested, terkirim:true) dengan admin sebagai pelaku",
+  count("SELECT COUNT(*) AS n FROM audit_events WHERE action='bot_channel.tested' AND actor_user_id=? AND metadata_json LIKE ?", adminUserId, '%"terkirim":true%') >= 1,
+  String(count("SELECT COUNT(*) AS n FROM audit_events WHERE action='bot_channel.tested'")));
+
+// Tanpa chat id, tujuan diambil dari tautan yang sudah tersimpan di kanal itu (bukan dikarang).
+kanalMod.testSendLimiter.reset(channelTelegramId);
+const tautanTersimpan = (db.prepare("SELECT external_id AS externalId FROM bot_identities WHERE channel_id=? AND external_id NOT LIKE 'pending:%'").all(channelTelegramId) as Array<{ externalId: string }>).map((baris) => String(baris.externalId));
+const ujiTanpaChatId = await akunAdmin.call("POST", ruteUjiKirim(channelTelegramId), {});
+const tujuanTerpilih = String(ujiTanpaChatId.json?.tujuan ?? "");
+check("1aj. tanpa chat id, tujuan uji diambil dari tautan yang tersimpan di kanal itu (bukan dikarang)",
+  ujiTanpaChatId.status === 200 && ujiTanpaChatId.json?.terkirim === true && tautanTersimpan.includes(tujuanTerpilih)
+  && tgUntukChat(tujuanTerpilih).length >= 1,
+  `${ujiTanpaChatId.status} ${short(ujiTanpaChatId.json)} tautan=${tautanTersimpan.length}`);
+
+const ujiKanalSalah = await akunAdmin.call("POST", ruteUjiKirim("kanal-tidak-ada-11c"), { chatId: tgUji });
+check("1ak. kanal bot tidak dikenal -> 404 CHANNEL_NOT_FOUND (bukan 200 pura-pura)",
+  ujiKanalSalah.status === 404 && ujiKanalSalah.json?.error === "CHANNEL_NOT_FOUND", `${ujiKanalSalah.status} ${short(ujiKanalSalah.json)}`);
+
+const catatanWaAwal = huluTwilio.catatan.length;
+const ujiKanalWa = await akunAdmin.call("POST", ruteUjiKirim(channelWhatsappId), { chatId: waNomor.utama });
+check("1al. kanal WhatsApp -> 409 BOT_TEST_UNSUPPORTED_PROVIDER tanpa memanggil hulu Twilio (tidak pura-pura berhasil)",
+  ujiKanalWa.status === 409 && ujiKanalWa.json?.error === "BOT_TEST_UNSUPPORTED_PROVIDER"
+  && ujiKanalWa.json?.detail?.provider === "whatsapp" && huluTwilio.catatan.length === catatanWaAwal,
+  `${ujiKanalWa.status} ${short(ujiKanalWa.json)} hulu=${huluTwilio.catatan.length - catatanWaAwal}`);
+
+// Kanal Telegram kedua (lengkap, tanpa tautan): dipakai membuktikan 409 tanpa tujuan dan batas laju
+// PER KANAL. Dibuat lewat rute admin yang sama dengan kanal produksi, bukan disisipkan ke DB.
+const buatTgKedua = await akunAdmin.call("PUT", "/api/v1/admin/bot-channels", {
+  provider: "telegram", name: "Bot Telegram uji kanal kedua", token: TOKEN_TG, enabled: true,
+  agentName: "Dinda", tagline: "kanal uji batas per kanal", webhookSecret: "rahasia-uji-11c-kedua",
+});
+const kanalKeduaId = String(buatTgKedua.json?.channel?.id ?? "");
+const ujiTanpaTujuan = await akunAdmin.call("POST", ruteUjiKirim(kanalKeduaId), {});
+check("1am. kanal Telegram tanpa tautan dan tanpa chat id -> 409 BOT_TEST_TARGET_MISSING (kekurangan: tujuan)",
+  buatTgKedua.status === 200 && Boolean(kanalKeduaId) && ujiTanpaTujuan.status === 409
+  && ujiTanpaTujuan.json?.error === "BOT_TEST_TARGET_MISSING" && (ujiTanpaTujuan.json?.detail?.kekurangan ?? []).includes("tujuan"),
+  `${ujiTanpaTujuan.status} ${short(ujiTanpaTujuan.json)}`);
+
+const catatanTolakAwal = huluTg.catatan.length;
+const ujiHuluTolak = await akunAdmin.call("POST", ruteUjiKirim(channelTelegramId), { chatId: CHAT_UJI_TOLAK, teks: "pesan uji yang ditolak hulu" });
+check("1an. hulu menolak pesan uji -> 502 TELEGRAM_UPSTREAM_ERROR dengan teks hulu APA ADANYA (satu panggilan saja)",
+  ujiHuluTolak.status === 502 && ujiHuluTolak.json?.error === "TELEGRAM_UPSTREAM_ERROR"
+  && ujiHuluTolak.json?.detail?.pesanHulu === isiHuluTolakMentah && ujiHuluTolak.json?.terkirim === undefined
+  && huluTg.catatan.length === catatanTolakAwal + 1
+  && count("SELECT COUNT(*) AS n FROM audit_events WHERE action='bot_channel.tested' AND metadata_json LIKE ?", "%chat not found%") >= 1,
+  `${ujiHuluTolak.status} ${short(ujiHuluTolak.json)} hulu=${huluTg.catatan.length - catatanTolakAwal}`);
+
+// Batas laju: 3 percobaan / 10 menit per KANAL (bak dikosongkan dulu supaya hitungannya bersih).
+const ujiKeduaSebelum = await akunAdmin.call("POST", ruteUjiKirim(kanalKeduaId), { chatId: tgUji, teks: "kanal kedua sebelum kanal pertama penuh" });
+kanalMod.testSendLimiter.reset(channelTelegramId);
+const catatanLajuAwal = huluTg.catatan.length;
+const percobaanLaju: any[] = [];
+for (let i = 0; i < 4; i += 1) percobaanLaju.push(await akunAdmin.call("POST", ruteUjiKirim(channelTelegramId), { chatId: tgUji, teks: `uji batas laju ${i + 1}` }));
+const statusLaju = percobaanLaju.map((hasil) => hasil.status);
+check("1ao. batas laju 3 percobaan / 10 menit per kanal: tiga lolos, percobaan ke-4 -> 429 BOT_TEST_RATE_LIMITED",
+  statusLaju.slice(0, 3).every((status) => status === 200) && percobaanLaju[3].status === 429
+  && percobaanLaju[3].json?.error === "BOT_TEST_RATE_LIMITED" && Number(percobaanLaju[3].json?.detail?.max ?? 0) === 3
+  && Number(percobaanLaju[3].json?.detail?.retryAfter ?? 0) > 0 && huluTg.catatan.length === catatanLajuAwal + 3,
+  `${statusLaju.join("/")} ${short(percobaanLaju[3].json)} hulu=${huluTg.catatan.length - catatanLajuAwal}`);
+
+const ujiKeduaSesudah = await akunAdmin.call("POST", ruteUjiKirim(kanalKeduaId), { chatId: tgUji, teks: "kanal kedua saat kanal pertama penuh" });
+check("1ap. batas laju dihitung PER KANAL: kanal lain tetap 200 saat kanal pertama sudah kena 429",
+  ujiKeduaSebelum.status === 200 && ujiKeduaSesudah.status === 200
+  && ujiKeduaSesudah.json?.terkirim === true && ujiKeduaSesudah.json?.tujuan === tgUji,
+  `${ujiKeduaSebelum.status}/${ujiKeduaSesudah.status} ${short(ujiKeduaSesudah.json)}`);
+
+// Kanal terakhir hanya untuk cabang galat: dibuat lewat API, lalu rahasianya dikosongkan langsung di DB
+// untuk meniru kanal yang belum lengkap (token belum tersimpan). Itu satu-satunya cara jujur membuktikannya.
+db.prepare("UPDATE bot_channels SET config_ciphertext='' WHERE id=?").run(kanalKeduaId);
+const ujiTanpaToken = await akunAdmin.call("POST", ruteUjiKirim(kanalKeduaId), { chatId: tgUji });
+check("1aq. kanal Telegram tanpa token -> 409 BOT_TEST_TARGET_MISSING (kekurangan: token), bukan galat hulu",
+  ujiTanpaToken.status === 409 && ujiTanpaToken.json?.error === "BOT_TEST_TARGET_MISSING"
+  && (ujiTanpaToken.json?.detail?.kekurangan ?? []).includes("token"),
+  `${ujiTanpaToken.status} ${short(ujiTanpaToken.json)}`);
 
 /* =====================================================================================
  * Bagian 2: butir 70 — bot WhatsApp lewat Twilio.
@@ -938,6 +1086,39 @@ check("3s. identitas tersimpan dengan pemilik + waktu pemasangan yang bisa diaud
   count("SELECT COUNT(*) AS n FROM bot_identities WHERE user_id=? AND external_id NOT LIKE 'pending:%' AND linked_at IS NOT NULL AND linked_at != ''", userAId) >= 3
   && count("SELECT COUNT(*) AS n FROM audit_events WHERE action='bot_identity.linked'") >= 4,
   `penautanAudit=${count("SELECT COUNT(*) AS n FROM audit_events WHERE action='bot_identity.linked'")}`);
+
+/* --- pengerasan pembatas taut: pembatas KEDUA per ALAMAT pemanggil (bukan per external_id) */
+coreMod.linkIpFailureLimiter.reset();
+const alamatUji = "203.0.113.77";
+const batasAlamat = Number(coreMod.BOT_LINK_IP_MAX_FAILURES);
+const tautDariAlamat = (ip: string | null, externalId: string, code: string) => fetch(`${base}/api/v1/bots/${channelTelegramId}/link`, {
+  method: "POST",
+  headers: { "content-type": "application/json", ...(ip ? { "x-forwarded-for": ip } : {}) },
+  body: JSON.stringify({ external_id: externalId, code }),
+});
+const gagalAlamat: Array<{ status: number; error: string }> = [];
+for (let i = 0; i < batasAlamat; i += 1) {
+  const hasil = await isiJson(await tautDariAlamat(alamatUji, `9003001${String(i).padStart(2, "0")}`, "000000"));
+  gagalAlamat.push({ status: hasil.status, error: String(hasil.json?.error ?? "") });
+}
+const sesudahBatasAlamat = await isiJson(await tautDariAlamat(alamatUji, "900300199", "000000"));
+check("3t. pembatas per ALAMAT: 20 percobaan gagal dengan external_id BERBEDA-BEDA berakhir 429 BOT_LINK_RATE_LIMITED (bukan TOO_MANY_LINK_ATTEMPTS)",
+  batasAlamat === 20 && gagalAlamat.length === 20
+  && gagalAlamat.every((item) => item.status === 400 && item.error === "LINK_CODE_INVALID")
+  && sesudahBatasAlamat.status === 429 && sesudahBatasAlamat.json?.error === "BOT_LINK_RATE_LIMITED",
+  `batas=${batasAlamat} terakhir=${short(sesudahBatasAlamat.json)}`);
+
+const kodeAlamatLain = String((await akunA.call("POST", "/api/v1/bot-identities/link-code", { channelId: channelTelegramId })).json?.kode?.kode ?? "");
+const tautAlamatLain = await isiJson(await taut(channelTelegramId, "900300198", kodeAlamatLain));
+check("3u. pembatas alamat tidak memblokir alamat lain: dari 127.0.0.1 pemasangan berkode benar tetap 200",
+  tautAlamatLain.status === 200 && Boolean(tautAlamatLain.json?.identitas?.id), `${tautAlamatLain.status} ${short(tautAlamatLain.json)}`);
+
+coreMod.linkIpFailureLimiter.reset(alamatUji);
+const kodeAlamatUji = String((await akunA.call("POST", "/api/v1/bot-identities/link-code", { channelId: channelTelegramId })).json?.kode?.kode ?? "");
+const tautSesudahReset = await isiJson(await tautDariAlamat(alamatUji, "900300197", kodeAlamatUji));
+check("3v. sesudah bak alamat itu dikosongkan, alamat yang sama bisa memasang lagi (bukti 429 tadi berasal dari pembatas alamat)",
+  tautSesudahReset.status === 200 && Boolean(tautSesudahReset.json?.identitas?.id), `${tautSesudahReset.status} ${short(tautSesudahReset.json)}`);
+coreMod.linkIpFailureLimiter.reset();
 
 } catch (error) {
   failed += 1;

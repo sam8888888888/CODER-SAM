@@ -8,18 +8,46 @@
  * Saat kanal Telegram disimpan dengan token bot dan `BOT_WEBHOOK_BASE_URL` terisi, modul ini juga
  * mendaftarkan webhook ke Telegram (`setWebhook`) dengan rahasia yang sama seperti yang dibandingkan
  * rute webhook. Alamat hulu memakai `config.TELEGRAM_API_BASE`, jadi bisa dialihkan di uji.
+ *
+ * Butir 69 (v0.23.1): `POST /api/v1/admin/bot-channels/:id/test` mengirim SATU pesan uji lewat kanal
+ * yang TERSIMPAN, memakai pemanggil Telegram yang sama dengan balasan sungguhan (`kirimTelegram`,
+ * termasuk jatuh ke teks polos saat Markdown ditolak). Rute ini hanya untuk admin platform, dibatasi
+ * 3 percobaan / 10 menit per kanal, dan TIDAK PERNAH mengembalikan token bot. Kegagalan hulu dijawab
+ * apa adanya: 502 TELEGRAM_UPSTREAM_ERROR dengan teks jawaban Telegram di `detail.pesanHulu`.
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { db } from "../db.js";
 import { requireUser } from "../auth.js";
 import { SecretsKeyError, maskSecret, tryOpenSecret } from "../secrets.js";
+import { createRateLimiter } from "../ratelimit.js";
 import { adminRequired, audit, fail, isPlatformAdmin } from "../wave11a/shared.js";
 import {
-  channelById, channelConfig, channelSecret, dasarWebhookPublik, panggilTelegram, sealForStorage, type BotChannelRow, type BotProvider, webhookPath,
+  channelById, channelConfig, channelSecret, dasarWebhookPublik, kirimTelegram, panggilTelegram, sealForStorage, type BotChannelRow, type BotProvider, webhookPath,
 } from "./bot-core.js";
 
 const PROVIDERS: BotProvider[] = ["telegram", "whatsapp"];
 
+/**
+ * Batas laju "uji kirim": 3 percobaan / 10 menit per KANAL (bukan per admin), supaya satu kanal yang
+ * bermasalah tidak bisa dihujani percobaan berulang dari banyak tab. Bisa dinaikkan lewat
+ * `BOT_TEST_PER_10MIN` bila operator memang butuh lebih.
+ */
+const BOT_TEST_PER_WINDOW = Math.max(1, Math.floor(Number(process.env.BOT_TEST_PER_10MIN ?? "") || 3));
+const BOT_TEST_WINDOW_MS = 10 * 60 * 1000;
+/** Diekspor supaya suite bisa mengosongkan baknya sebelum membuktikan batas laju benar-benar bekerja. */
+export const testSendLimiter = createRateLimiter({ windowMs: BOT_TEST_WINDOW_MS, max: BOT_TEST_PER_WINDOW }, "bot-test");
+
+/**
+ * Tujuan uji: chat id yang dikirim admin, atau - bila admin tidak mengisi - external_id yang paling
+ * baru dipasang ke kanal ini. Baris `pending:` tidak dihitung karena belum tentu chat nyata.
+ * Hasil kosong berarti tidak ada tujuan yang bisa dibuktikan, jadi rute menjawab 409 BOT_TEST_TARGET_MISSING.
+ */
+function tujuanUji(channelId: string, dariBadan: string): string {
+  if (dariBadan) return dariBadan;
+  const baris = db.prepare(`SELECT external_id AS externalId FROM bot_identities
+    WHERE channel_id=? AND external_id NOT LIKE 'pending:%' ORDER BY linked_at DESC LIMIT 1`).get(channelId) as { externalId?: string } | undefined;
+  return String(baris?.externalId ?? "").trim();
+}
 
 /** Bentuk kanal untuk API: tanpa rahasia, hanya penanda terpasang dan ekornya. */
 function channelView(channel: BotChannelRow, tambahan: Record<string, unknown> = {}) {
@@ -138,5 +166,75 @@ export function registerBotChannelRoutes(app: any): void {
       agentName, tagline, webhookTerdaftar: Boolean(info.terdaftar),
     });
     return { channel: channelView(kanal, info) };
+  });
+
+  /**
+   * Butir 69 (v0.23.1): kirim SATU pesan uji ke kanal bot yang tersimpan.
+   * Urutan pemeriksaan: sesi (`requireUser`) -> admin platform -> kanal ada -> kanal Telegram ->
+   * tujuan ada -> token ada -> batas laju -> hulu. Batas laju diperiksa SESUDAH pemeriksaan bentuk
+   * supaya kanal yang belum lengkap tidak memakan jatah percobaan admin.
+   */
+  app.post("/api/v1/admin/bot-channels/:id/test", { preHandler: requireUser }, async (request: any, reply: any) => {
+    if (!isPlatformAdmin(request.user!)) return adminRequired(reply);
+    const kanal = channelById(String(request.params?.id ?? ""));
+    if (!kanal) return fail(reply, 404, "CHANNEL_NOT_FOUND", "Kanal bot tidak ditemukan.");
+    if (kanal.provider !== "telegram") {
+      // Kanal WhatsApp belum punya jalur uji yang jujur, jadi permintaannya ditolak alih-alih
+      // berpura-pura berhasil. Alasannya ikut di `detail` supaya bisa dibaca mesin.
+      return fail(reply, 409, "BOT_TEST_UNSUPPORTED_PROVIDER", "Uji kirim baru tersedia untuk kanal Telegram.", {
+        detail: { provider: kanal.provider, penyediaDidukung: ["telegram"] },
+      });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const tujuan = tujuanUji(kanal.id, String(body.chatId ?? body.ke ?? "").trim());
+    const token = String((channelConfig(kanal) as { token?: unknown }).token ?? "").trim();
+    if (!tujuan || !token) {
+      return fail(reply, 409, "BOT_TEST_TARGET_MISSING", !token
+        ? "Kanal Telegram ini belum lengkap: token bot belum tersimpan, jadi pesan uji tidak bisa dikirim."
+        : "Tidak ada tujuan uji. Isi chat id, atau pasang satu akun ke kanal ini lebih dulu supaya ada tujuan yang tersimpan.", {
+        detail: { kekurangan: [!token ? "token" : null, !tujuan ? "tujuan" : null].filter(Boolean), kanal: kanal.id },
+      });
+    }
+    if (!testSendLimiter.allow(kanal.id)) {
+      const tunggu = testSendLimiter.retryAfterSeconds(kanal.id);
+      return fail(reply, 429, "BOT_TEST_RATE_LIMITED", `Maksimal ${BOT_TEST_PER_WINDOW} uji kirim per 10 menit untuk satu kanal. Coba lagi setelah ${tunggu} detik.`, {
+        detail: { max: BOT_TEST_PER_WINDOW, windowMs: BOT_TEST_WINDOW_MS, retryAfter: tunggu, kanal: kanal.id },
+      });
+    }
+    const teks = String(body.teks ?? "").trim().slice(0, 3000) || "Uji kirim dari COBLAI Coder.";
+    let hasil;
+    try {
+      // Pemanggil yang sama dengan balasan sungguhan: Markdown lebih dulu, lalu teks polos.
+      hasil = await kirimTelegram(kanal, tujuan, teks);
+    } catch (error) {
+      const pesanHulu = String((error as Error)?.message ?? error);
+      audit(request.user!.id, "bot_channel.tested", {
+        channelId: kanal.id, provider: kanal.provider, tujuanEkor: tujuan.slice(-4), terkirim: false, jalur: "koneksi", galat: pesanHulu,
+      });
+      return fail(reply, 502, "TELEGRAM_UPSTREAM_ERROR", "Telegram tidak bisa dihubungi dari platform.", {
+        detail: { pesanHulu, statusHulu: [], jalur: "koneksi" },
+      });
+    }
+    if (!hasil.ok) {
+      // Alasan hulu ikut dicatat di audit (`galat`) supaya penolakan bisa DITELUSURI, bukan hanya dilihat
+      // sekali di layar. Ini juga jejak yang dibutuhkan admin saat Telegram mengganti pesan galatnya.
+      audit(request.user!.id, "bot_channel.tested", {
+        channelId: kanal.id, provider: kanal.provider, tujuanEkor: tujuan.slice(-4), terkirim: false,
+        jalur: hasil.jalur, statusHulu: hasil.statuses, galat: hasil.pesan,
+      });
+      // Jawaban hulu diteruskan APA ADANYA di `detail.pesanHulu`; layar tidak pernah menulis "berhasil".
+      return fail(reply, 502, "TELEGRAM_UPSTREAM_ERROR", `Telegram menolak pesan uji (HTTP ${hasil.statuses.join(",") || "tanpa jawaban"}).`, {
+        detail: { pesanHulu: hasil.pesan, statusHulu: hasil.statuses, jalur: hasil.jalur },
+      });
+    }
+    audit(request.user!.id, "bot_channel.tested", {
+      channelId: kanal.id, provider: kanal.provider, tujuanEkor: tujuan.slice(-4), terkirim: true,
+      jalur: hasil.jalur, statusHulu: hasil.statuses, panjangTeks: teks.length,
+    });
+    // Jawaban sukses tidak memuat rahasia: hanya bentuk kanal yang sudah tersamar (`channelView`).
+    return {
+      terkirim: true, jalur: hasil.jalur, statusHulu: hasil.statuses, tujuan,
+      panjangTeks: teks.length, pesanHulu: hasil.pesan, kanal: channelView(kanal),
+    };
   });
 }

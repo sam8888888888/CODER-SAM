@@ -20,23 +20,83 @@
  *   npm run build            # parent yang menjalankan ini (uji ini memakai dist/)
  *   node e2e/ui.e2e.mjs
  *
+ * `UI_DIST_DIR=/direktori/lain node e2e/ui.e2e.mjs` menjalankan berkas uji yang SAMA terhadap hasil
+ * build di direktori lain (dipakai untuk membuktikan pemeriksaan baru lulus tanpa menyentuh dist/).
+ *
  * Keluar 2 dengan UI_E2E_SKIPPED bila `dist/index.html` belum ada, supaya uji tidak berbohong.
  */
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { createServer as buatServerHttp } from "node:http";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative } from "node:path";
 import { writeFile } from "node:fs/promises";
 
 const dashboardDir = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const platformDir = `${dashboardDir}/../coder-platform`;
-const distDir = `${dashboardDir}/dist`;
+// Bawaan: SPA hasil `npm run build` di dalam repo. `UI_DIST_DIR` boleh diisi supaya berkas uji yang
+// SAMA bisa dijalankan terhadap hasil build di direktori lain (mis. hasil build sementara di /tmp
+// untuk membuktikan pemeriksaan baru lulus) TANPA mengubah `dist/` milik repo. Tidak ada pemeriksaan
+// yang dilonggarkan oleh penggantian ini: yang berubah hanya direktori berkas yang disajikan.
+const distDir = process.env.UI_DIST_DIR ? process.env.UI_DIST_DIR : `${dashboardDir}/dist`;
 const shots = "/tmp/w10_ui_shots";
 
 if (!existsSync(`${distDir}/index.html`)) {
   console.log("UI_E2E_SKIPPED dist/index.html belum ada — jalankan `npm run build` dulu.");
   process.exit(2);
+}
+
+/* ---------------- Penjaga bundel basi (akar masalah 26 Sep 2026) ----------------
+ * Berkas uji ini menyajikan `dist/` apa adanya dan TIDAK membangunnya sendiri. Kalau ada berkas
+ * sumber yang lebih baru dari `dist/index.html`, hasil uji jadi menyesatkan: pemeriksaan fitur baru
+ * gagal jujur terhadap bundel lama, sementara pemeriksaan lama bisa hijau palsu (gerbang "hijau"
+ * padahal bundel basi — persis yang menipu kami sebelum ini).
+ * Penjaga ini membandingkan waktu ubah `dist/index.html` dengan seluruh berkas di `src/**` plus
+ * `index.html`, `vite.config.ts`, dan `tailwind.config.js`, lalu KELUAR kode 1 SEBELUM server uji
+ * dan peramban dijalankan. Satu-satunya jalan melewatinya: `UI_ALLOW_STALE_DIST=1` — dan saat itu
+ * hasil ujinya TIDAK SAH untuk rilis maupun bukti.
+ */
+const waktuUbahAman = (berkas) => {
+  try { return statSync(berkas).mtimeMs; } catch { return null; }
+};
+const berkasSumber = [];
+{
+  const telusuri = (dir) => {
+    if (!existsSync(dir)) return;
+    for (const entri of readdirSync(dir, { withFileTypes: true })) {
+      if (entri.name === "node_modules") continue;
+      const jalur = join(dir, entri.name);
+      if (entri.isDirectory()) telusuri(jalur);
+      else berkasSumber.push(jalur);
+    }
+  };
+  telusuri(`${dashboardDir}/src`);
+  for (const tambahan of ["index.html", "vite.config.ts", "tailwind.config.js"]) {
+    if (existsSync(`${dashboardDir}/${tambahan}`)) berkasSumber.push(`${dashboardDir}/${tambahan}`);
+  }
+}
+const berkasDistIndex = `${distDir}/index.html`;
+const labelDist = distDir === `${dashboardDir}/dist` ? "dist/index.html" : berkasDistIndex;
+const waktuDist = waktuUbahAman(berkasDistIndex);
+const sumberLebihBaru = berkasSumber
+  .map((berkas) => ({ berkas, waktu: waktuUbahAman(berkas) ?? 0 }))
+  .filter((item) => waktuDist !== null && item.waktu > waktuDist)
+  .sort((a, b) => b.waktu - a.waktu);
+if (sumberLebihBaru.length > 0) {
+  for (const item of sumberLebihBaru.slice(0, 10)) {
+    const namaBerkas = relative(dashboardDir, item.berkas) || item.berkas;
+    console.log(`DIST_BASI: ${namaBerkas} lebih baru dari ${labelDist} — jalankan \`npm run build\` lebih dulu.`);
+  }
+  if (sumberLebihBaru.length > 10) {
+    console.log(`DIST_BASI: ... dan ${sumberLebihBaru.length - 10} berkas sumber lain yang juga lebih baru.`);
+  }
+  if (process.env.UI_ALLOW_STALE_DIST !== "1") {
+    console.log(`DIST_BASI: gerbang TIDAK dijalankan (${sumberLebihBaru.length} berkas sumber lebih baru dari bundel).`);
+    process.exit(1);
+  }
+  console.log("PERINGATAN BESAR: UI_ALLOW_STALE_DIST=1 diisi padahal berkas sumber lebih baru dari bundel.");
+  console.log("PERINGATAN BESAR: hasil uji ini TIDAK SAH untuk rilis maupun bukti — yang diuji BUKAN kode terbaru.");
 }
 mkdirSync(shots, { recursive: true });
 
@@ -108,6 +168,18 @@ const stubServer = buatServerHttp((request, response) => {
       if (String(telegram[1]).includes("gagal")) return kirim(400, { ok: false, error_code: 400, description: "Bad Request: webhook gagal dipasang oleh hulu" });
       return kirim(200, { ok: true, result: true, description: "Webhook was set" });
     }
+    // Uji kirim kanal bot (butir 69, v0.23.1): hulu menerima `/bot<token>/sendMessage`. Tujuan
+    // "tolak-uji" sengaja DITOLAK hulu supaya jalur "penolakan hulu ditampilkan apa adanya" bisa
+    // dibuktikan; tujuan lain dijawab 200 seperti Telegram sungguhan.
+    const telegramKirim = /^\/bot([^/]+)\/sendMessage$/.exec(jalur);
+    if (telegramKirim) {
+      let isi = {};
+      try { isi = JSON.parse(badan || "{}"); } catch { isi = {}; }
+      if (String(isi.chat_id ?? "").includes("tolak-uji")) {
+        return kirim(400, { ok: false, error_code: 400, description: "Bad Request: chat not found (ditolak hulu tiruan)" });
+      }
+      return kirim(200, { ok: true, result: { message_id: 1000 + stubRequests.filter((item) => item.path === jalur).length, date: Math.floor(Date.now() / 1000), chat: { id: isi.chat_id ?? null }, text: String(isi.text ?? "") } });
+    }
     if (jalur.startsWith("/slack/ok")) return kirim(200, { ok: true, diterima: true });
     if (jalur.startsWith("/slack/gagal")) return kirim(500, { ok: false, error: "stub menolak" });
     return kirim(404, { ok: false, error: `stub belum mengenal jalur ${jalur}` });
@@ -145,12 +217,26 @@ const base = `http://127.0.0.1:${port}`;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let passed = 0; let failed = 0; const skips = []; const failures = [];
+// Pemeriksaan yang ditunda karena rute API-nya dijawab 404/405/501 dicatat TERPISAH dari `skips` biasa.
+// "Lulus karena rutenya tidak ada" bukan bukti rute itu ada: daftar ini dicetak di akhir laporan
+// bersama jumlahnya, supaya jalur yang belum ada terlihat apa adanya.
+const skipRute = [];
 function check(name, ok, detail = "") {
   if (ok) { passed += 1; console.log(`PASS ${name}`); return; }
   failed += 1; failures.push(name);
   console.log(`FAIL ${name} ${String(detail).slice(0, 300)}`);
 }
-function skip(name, reason) { skips.push(`${name} — ${reason}`); console.log(`SKIP ${name} ${reason}`); }
+// Skip WAJIB punya alasan jujur yang bisa dibaca manusia. Alasan kosong/terlalu pendek dicatat sebagai
+// "skip tanpa alasan" dan MEMERAHKAN gerbang di akhir laporan, supaya pemeriksaan yang dilewati tidak
+// pernah terbaca seperti pemeriksaan yang lulus.
+const skipsTanpaAlasan = [];
+const ALASAN_SKIP_MIN = 12;
+function skip(name, reason) {
+  const alasan = String(reason ?? "").trim();
+  skips.push(`${name} — ${alasan}`);
+  if (alasan.length < ALASAN_SKIP_MIN) skipsTanpaAlasan.push(name);
+  console.log(`SKIP ${name} ${alasan}`);
+}
 
 async function waitForHealth() {
   for (let attempt = 0; attempt < 120; attempt += 1) {
@@ -172,6 +258,12 @@ if (!healthy) { child.kill("SIGKILL"); console.log("UI_E2E_FAILED"); process.exi
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 const context = await browser.newContext({ viewport: { width: 1360, height: 900 } });
 const page = await context.newPage();
+// Batas bawaan Playwright adalah 30 detik untuk SETIAP pencarian elemen. Bila elemennya memang tidak
+// ada, gelung tunggu Wave 11C menunggu 30 detik lebih dulu pada setiap percobaan, sehingga uji bisa
+// DIAM sepuluh menit tanpa satu baris keluaran (kejadian nyata 26 Sep 2026, run ke-3: diam 21:44-21:55
+// pada elemen `bot-uji-ringkas-*` yang tidak ada di dist lama). Batas 4 detik tetap longgar untuk SPA
+// lokal; setiap gelung yang memang butuh lebih lama memakai batas sendiri yang eksplisit.
+page.setDefaultTimeout(4000);
 const consoleErrors = [];
 // Sebelum masuk, server wajar menjawab 401 untuk pemeriksaan sesi. Galat itu dicatat terpisah supaya
 // pemeriksaan "tidak ada galat konsol" tidak menyalahkan perilaku yang memang benar.
@@ -182,26 +274,77 @@ const expectedSignedOut = [];
 const expectedApiErrors = [];
 // Wave 11C: pemeriksaan butir 68/69/71/74/76 SENGAJA memancing jawaban galat dari server (token Notion
 // tidak sah, hulu Notion menolak, host konektor di luar daftar putih, gambar JPEG ditolak, dsb). Peramban
-// mencatat jawaban 4xx/5xx itu sebagai galat konsol, jadi catatannya dipisahkan per jalur — TIDAK
-// dilebur ke dalam `expectedApiErrors` supaya pemeriksaan lama (tepat 2 kali, khusus tools-policy) tetap
-// utuh. Jalur di bawah hanya berisi rute yang memang dipakai uji 11C untuk memancing galat.
+// mencatat jawaban 4xx/5xx itu sebagai galat konsol, jadi catatannya dipisahkan — TIDAK dilebur ke dalam
+// `expectedApiErrors` supaya pemeriksaan lama (tepat 2 kali, khusus tools-policy) tetap utuh.
+//
+// PERBAIKAN KEJUJURAN (26 Sep 2026): daftar putih TIDAK LAGI memaafkan SEMUA 4xx/5xx pada sebuah jalur.
+// Yang dimaafkan hanya KODE yang benar-benar dipancing dan ditegaskan pemeriksaan bagian 11C di berkas ini.
+// Setiap kode 5xx wajib ditulis terpisah di `kode5xx` + `jalur5xx` + `bukti5xx`, dan pemakaiannya harus
+// punya jawaban jaringan nyata (lihat pemeriksaan akhir 11C). Kode lain — termasuk 5xx yang tidak
+// terdaftar — masuk `consoleErrors` dan menggagalkan pemeriksaan "tidak ada galat konsol".
 const expectedApiErrors11C = [];
-const jalurGalat11C = ["/api/v1/integrations/notion", "/api/v1/connectors", "/api/v1/media/avatar", "/api/v1/media/agent-avatar", "/api/v1/account/avatar", "/api/v1/admin/avatar", "/api/v1/admin/engine/version", "/api/v1/billing/orders", "/api/v1/billing/manual-orders", "/api/v1/bot-identities", "/api/v1/admin/bot-channels", "/api/v1/admin/agent-avatar"];
+const pancing11C = []; // catatan terstruktur tiap galat yang dimaafkan: { kode, jalur, aturan }
+const galat11CDisengaja = [
+  {
+    jalur: "/api/v1/integrations/notion",
+    kode: [400, 409, 429],
+    kode5xx: [502],
+    jalur5xx: "/api/v1/integrations/notion/pages",
+    bukti5xx: "e2e/ui.e2e.mjs:2294 — hulu Notion tiruan dijawab 500, server meneruskan 502 NOTION_UPSTREAM_ERROR, dan uji menegaskan jawaban itu memang benar",
+    alasan: "400 NOTION_TOKEN_INVALID :2161 dan NOTION_PAGE_TITLE_REQUIRED :2204; 409 NOTION_NOT_CONNECTED :2149; 429 NOTION_PAGE_RATE_LIMITED :2306",
+  },
+  { jalur: "/api/v1/connectors", kode: [400], kode5xx: [], alasan: "400 CONNECTOR_HOST_NOT_ALLOWED — alamat di luar daftar putih memang ditolak :2498" },
+  { jalur: "/api/v1/media/avatar", kode: [404], kode5xx: [], alasan: "404 foto profil yang sudah dihapus memang jawaban benar :2917" },
+  { jalur: "/api/v1/media/agent-avatar", kode: [404], kode5xx: [], alasan: "404 avatar agen yang sudah dihapus memang jawaban benar :2900" },
+  {
+    jalur: "/api/v1/account/avatar",
+    kode: [413, 429],
+    kode5xx: [503],
+    jalur5xx: "/api/v1/account/avatar",
+    bukti5xx: "e2e/ui.e2e.mjs:2824 — JPEG mentah dijawab 503 IMAGE_PROCESSOR_UNAVAILABLE, dan uji menegaskan itu jawaban benar untuk lingkungan tanpa pengolah gambar",
+    alasan: "413 AVATAR_TOO_LARGE :2839; 429 AVATAR_RATE_LIMITED disadap uji sendiri :2768",
+  },
+  { jalur: "/api/v1/billing/orders", kode: [409], kode5xx: [], alasan: "409 ORDER_NOT_PENDING untuk pesanan yang tidak menunggu bayar :2657" },
+  { jalur: "/api/v1/bot-identities", kode: [404], kode5xx: [], alasan: "404 CHANNEL_NOT_FOUND untuk kanal yang tidak ada :2342" },
+  { jalur: "/api/v1/admin/bot-channels", kode: [400, 409], kode5xx: [], alasan: "400 WHATSAPP_CONFIG_INCOMPLETE saat konfigurasi WhatsApp belum lengkap :2407; 409 BOT_TEST_TARGET_MISSING saat uji kirim tanpa tujuan — ditegaskan pemeriksaan di blok butir 69 (uji kirim)" },
+];
+// Empat jalur lama DIBUANG dari daftar putih (26 Sep 2026) karena uji ini tidak pernah memancing galat di
+// sana: `/api/v1/admin/avatar` (tidak dipanggil `src/` maupun uji ini), `/api/v1/admin/agent-avatar`,
+// `/api/v1/admin/engine/version`, dan `/api/v1/billing/manual-orders` (semuanya dipanggil dan dijawab 2xx).
+// Galat 4xx/5xx tak terduga pada jalur-jalur itu sekarang muncul sebagai galat konsol.
+const ruteDisadap = []; // jawaban yang dibuat uji sendiri lewat route.fulfill, dipakai sebagai bukti jaringan
+const kodeStatusKonsol = (text) => {
+  const cocok = String(text).match(/status of (\d{3})/) || String(text).match(/\b([45]\d\d)\b/);
+  return Number((cocok || [])[1] || 0);
+};
 const konsolAudit = []; // catatan keputusan tiap galat konsol, dipakai di laporan bila ada yang tak dikenali
 page.on("console", (message) => {
   if (message.type() !== "error") return;
   const text = message.text();
   const url = message.location()?.url ?? "";
   const lintasan = url.replace(base, "");
+  const jalurTanpaKueri = lintasan.split("?")[0];
+  const kode = kodeStatusKonsol(text);
   if (/400/.test(text) && url.includes("/api/v1/tools-policy")) {
     expectedApiErrors.push(`${text} ${lintasan}`);
     konsolAudit.push(`[kebijakan-alat] ${lintasan}`);
   } else if (/401/.test(text) && url.includes("/auth/me")) {
     expectedSignedOut.push(`${text} ${lintasan}`);
     konsolAudit.push(`[sesi] ${lintasan}`);
-  } else if (/([45]\d\d)/.test(text) && jalurGalat11C.some((jalur) => url.includes(jalur))) {
-    expectedApiErrors11C.push(`${text} [${lintasan}]`);
-    konsolAudit.push(`[dipancing-11C] ${lintasan}`);
+  } else if (kode >= 400) {
+    // 4xx: cocokkan awalan jalur + kode yang terdaftar. 5xx: wajib cocok jalur PERSIS + kode yang sudah
+    // dideklarasikan beserta bukti pemeriksaan yang menegaskannya.
+    const aturan = galat11CDisengaja.find((item) => (kode < 500
+      ? item.kode.includes(kode) && lintasan.includes(item.jalur)
+      : (item.kode5xx || []).includes(kode) && jalurTanpaKueri === item.jalur5xx));
+    if (aturan) {
+      expectedApiErrors11C.push(`${text} [${lintasan}] [aturan ${aturan.jalur} kode=${kode}]`);
+      pancing11C.push({ kode, jalur: jalurTanpaKueri, aturan });
+      konsolAudit.push(`[dipancing-11C] ${lintasan} kode=${kode} aturan=${aturan.jalur}`);
+    } else {
+      consoleErrors.push(`${text} [${lintasan}]`);
+      konsolAudit.push(`[LUAR] ${text.slice(0, 100)} <${lintasan}>`);
+    }
   } else {
     consoleErrors.push(`${text} [${lintasan}]`);
     konsolAudit.push(`[LUAR] ${text.slice(0, 100)} <${lintasan}>`);
@@ -359,8 +502,18 @@ try {
   // 404/405/501 dilaporkan sebagai "menunggu API", bukan sebagai lulus.
   const jalurStatus = (part) => Number((callsTo(part).pop() || "").split(" ")[0]) || 0;
   const checkApi = (nama, jalur, ok, detail) => {
+    // Argumen yang bergeser (jalur ternyata bukan teks) TIDAK boleh berubah menjadi lulus lewat nilai
+    // yang selalu dianggap benar. Salah panggil seperti itu dilaporkan gagal supaya langsung terlihat.
+    if (typeof jalur !== "string" || !jalur) {
+      return check(nama, false, `checkApi dipanggil dengan jalur tidak sah (${String(jalur)}) - argumen bergeser? detail=${String(detail)}`);
+    }
     if (ok) return check(nama, true, detail);
-    if ([404, 405, 501].includes(jalurStatus(jalur))) return skip(nama, `menunggu API ${jalur} (server menjawab ${jalurStatus(jalur)})`);
+    const kode = jalurStatus(jalur);
+    if ([404, 405, 501].includes(kode)) {
+      // Rute belum ada: pemeriksaan ini ditunda dan dicatat sebagai SKIP-RUTE (bukan bukti rute ada).
+      skipRute.push(`SKIP-RUTE ${nama} - jalur ${jalur} dijawab server ${kode}; pemeriksaan ini BUKAN bukti bahwa rute itu ada`);
+      return skip(nama, `menunggu API ${jalur} (server menjawab ${kode})`);
+    }
     return check(nama, false, detail);
   };
   // Sama seperti openPage, tetapi panggilan API halaman baru diperiksa dengan toleransi
@@ -393,6 +546,22 @@ try {
   // Jadi berkas kecil diunggah apa adanya, lalu ukuran yang dilihat peramban disimulasikan 11 MB
   // lewat penyadapan jawaban daftar artefak. Yang diuji tetap aturan antarmuka untuk berkas besar.
   const namaBesar = `uji-${stamp}-besar.txt`;
+  // Butir 48 (pratinjau di dalam editor): artefak .html dipasang APA ADANYA ke iframe bersandbox.
+  // Fixture ini SENGAJA tidak memuat skrip: CSP aplikasi (`script-src 'self'`) menolak skrip inline di
+  // dalam dokumen `srcdoc`, dan penolakan itu memunculkan galat konsol yang BUKAN kerusakan aplikasi
+  // (diukur terpisah 26 Sep 2026). Isolasinya diuji dari SISI INDUK: halaman induk tidak boleh bisa
+  // membaca isi dokumen iframe.
+  const namaHtml = `uji-${stamp}-halaman.html`;
+  // Berkas .pdf tiruan: yang diuji BUKAN pembaca PDF, melainkan sikap jujur pratinjau editor
+  // ("Jenis berkas ini tidak bisa dipratinjau di sini.") untuk jenis berkas yang tidak bisa dipasang.
+  const namaPdf = `uji-${stamp}-sample.pdf`;
+  const isiPdf = "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
+  const isiHtml = [
+    "<html><body>",
+    `<p id="tanda-pratinjau">PRATINJAU-${stamp}</p>`,
+    '<b id="tebal-pratinjau">TEKS-TEBAL-PRATINJAU</b>',
+    "</body></html>",
+  ].join("");
   const bacaFixture = (nama) => readFileSync(`${dashboardDir}/e2e/fixtures/${nama}`);
   const siapkanUji = await page.evaluate(async ({ payloads, proyekUji }) => {
     const daftarWorkspace = await (await fetch("/api/v1/workspaces")).json();
@@ -425,10 +594,12 @@ try {
       { name: namaMd, mime: "text/markdown", b64: bacaFixture("catatan-uji.md").toString("base64") },
       { name: namaRusak, mime: docxMime, b64: Buffer.from("ini bukan dokumen Word yang sah").toString("base64") },
       { name: namaBesar, mime: "text/plain", b64: Buffer.from("berkas kecil di server; ukuran besar hanya disimulasikan pada uji ini").toString("base64") },
+      { name: namaHtml, mime: "text/html", b64: Buffer.from(isiHtml).toString("base64") },
+      { name: namaPdf, mime: "application/pdf", b64: Buffer.from(isiPdf).toString("base64") },
     ],
   });
-  check("proyek uji dan 6 artefak uji dibuat lewat API",
-    siapkanUji.rows?.length === 6 && siapkanUji.rows.every((row) => row.status === 201),
+  check("proyek uji dan 8 artefak uji dibuat lewat API",
+    siapkanUji.rows?.length === 8 && siapkanUji.rows.every((row) => row.status === 201),
     JSON.stringify(siapkanUji.rows?.map((row) => [row.name, row.status]) ?? siapkanUji.error));
 
   // Ukuran besar disimulasikan pada jawaban daftar artefak (lihat catatan di atas).
@@ -576,6 +747,143 @@ try {
   // Editor ditutup supaya halaman kembali bersih.
   await editor.locator("button", { hasText: "Tutup" }).first().click().catch(() => undefined);
 
+  // ------- butir 48 (v0.23.1): tombol Render MEMASANG artefak ke iframe bersandbox -------
+  // Dua sisi diperiksa sekaligus: (a) berkas .html WAJIB muncul di iframe dengan sandbox TEPAT
+  // "allow-scripts", skrip di dalamnya berjalan, dan skrip itu TIDAK bisa menyentuh dokumen induk;
+  // (b) berkas biner (.docx/.pdf) TIDAK boleh punya iframe dan catatannya harus berkata jujur bahwa
+  // pratinjaunya tidak tersedia. Atribut yang salah (mis. ditambah `allow-same-origin`) akan gagal.
+  const catatanTidakBisa = "Jenis berkas ini tidak bisa dipratinjau di sini.";
+  /** Buka editor sebuah artefak, tekan Render, lalu kembalikan apa yang BENAR-BENAR tergambar. */
+  async function periksaRender(nama) {
+    const barisnya = barisArtefak(nama);
+    const hasil = { tombol: 0, frameSebelum: -1, frameSesudah: 0, sandbox: "", catatan: "", isi: { tanda: "", tebal: "" }, bisaBacaInduk: "BELUM-DIUKUR" };
+    try {
+      await barisnya.locator("button", { hasText: "Sunting" }).first().click({ timeout: 8000 });
+      const editorNya = barisnya.locator('[data-testid="artifact-editor"]').first();
+      await editorNya.waitFor({ timeout: 15000 });
+      hasil.tombol = await editorNya.locator('[data-testid="artifact-render"]').count();
+      hasil.frameSebelum = await editorNya.locator('[data-testid="artifact-render-frame"]').count();
+      if (hasil.tombol === 1) await editorNya.locator('[data-testid="artifact-render"]').first().click({ timeout: 8000 });
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        hasil.frameSesudah = await editorNya.locator('[data-testid="artifact-render-frame"]').count();
+        hasil.catatan = String(await editorNya.locator('[data-testid="artifact-render-catatan"]').first().innerText({ timeout: 900 }).catch(() => "")) || "";
+        if (hasil.frameSesudah > 0 || hasil.catatan.length > 0) break;
+        await page.waitForTimeout(250);
+      }
+      if (hasil.frameSesudah > 0) {
+        hasil.sandbox = String(await editorNya.locator('[data-testid="artifact-render-frame"]').first().getAttribute("sandbox").catch(() => "")) || "";
+        const bingkai = page.frameLocator('[data-testid="artifact-render-frame"]');
+        hasil.isi = {
+          tanda: String(await bingkai.locator("#tanda-pratinjau").innerText({ timeout: 3000 }).catch(() => "")),
+          tebal: String(await bingkai.locator("#tebal-pratinjau").innerText({ timeout: 3000 }).catch(() => "")),
+        };
+        // Sisi INDUK: tanpa `allow-same-origin` dokumen iframe berorisin opaque, jadi `contentDocument`
+        // harus null (atau aksesnya ditolak peramban). Diukur dari konteks halaman utama, bukan dari
+        // dalam iframe, supaya tidak terpengaruh CSP pratinjau.
+        // Bukti gambar untuk pemeriksaan ini (isi iframe terlihat apa adanya di layar).
+        await page.screenshot({ path: `${shots}/pratinjau-artefak-html.png`, fullPage: false }).catch(() => undefined);
+        hasil.bisaBacaInduk = await page.evaluate(() => {
+          const el = document.querySelector('[data-testid="artifact-render-frame"]');
+          if (!el) return "FRAME-HILANG";
+          try { return el.contentDocument === null ? "TIDAK-BISA-BACA" : "BISA-BACA"; }
+          catch (error) { return `DITOLAK-PERAMBAN:${String(error.name)}`; }
+        });
+      }
+      await editorNya.locator('[data-testid="artifact-render-tutup"]').first().click({ timeout: 4000 }).catch(() => undefined);
+      await editorNya.locator("button", { hasText: "Tutup" }).first().click({ timeout: 4000 }).catch(() => undefined);
+    } catch (error) {
+      hasil.catatan = `${hasil.catatan} | GAGAL: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    return hasil;
+  }
+
+  const renderHtml = await periksaRender(namaHtml);
+  check("tombol Render artefak .html memasang iframe dengan sandbox TEPAT allow-scripts (tanpa allow-same-origin)",
+    renderHtml.tombol === 1 && renderHtml.frameSebelum === 0 && renderHtml.frameSesudah === 1
+      && renderHtml.sandbox === "allow-scripts",
+    `tombol=${renderHtml.tombol} frame sebelum=${renderHtml.frameSebelum} sesudah=${renderHtml.frameSesudah} sandbox="${renderHtml.sandbox}"`);
+  // Batas wewenang: gerbang ini menyajikan bundel statis TANPA header CSP, jadi kebijakan CSP produksi
+  // (mis. skrip inline di dalam pratinjau ditolak `script-src 'self'`) BUKAN urusan berkas uji ini —
+  // itu diukur terpisah terhadap server produksi. Yang diperiksa di sini hanya: iframe terpasang,
+  // sandbox TEPAT `allow-scripts`, dan isinya tidak bisa dibaca dokumen induk.
+  check("pratinjau .html tergambar apa adanya dan isinya TIDAK bisa dibaca dokumen induk (tanpa allow-same-origin)",
+    renderHtml.isi.tanda === `PRATINJAU-${stamp}` && renderHtml.isi.tebal === "TEKS-TEBAL-PRATINJAU"
+      && (renderHtml.bisaBacaInduk === "TIDAK-BISA-BACA" || renderHtml.bisaBacaInduk.startsWith("DITOLAK-PERAMBAN"))
+      && !renderHtml.sandbox.includes("allow-same-origin"),
+    `tanda="${renderHtml.isi.tanda}" tebal="${renderHtml.isi.tebal}" sandbox="${renderHtml.sandbox}" bacaDariInduk=${renderHtml.bisaBacaInduk}`);
+
+  for (const [jenisBiner, namaBiner] of [["docx", namaDocx], ["pdf", namaPdf]]) {
+    const renderBiner = await periksaRender(namaBiner);
+    check(`artefak .${jenisBiner} tidak dipratinjau: TIDAK ada iframe dan catatannya jujur (butir 48)`,
+      renderBiner.tombol === 1 && renderBiner.frameSesudah === 0 && renderBiner.catatan.includes(catatanTidakBisa),
+      `tombol=${renderBiner.tombol} frame=${renderBiner.frameSesudah} catatan="${renderBiner.catatan.replace(/\s+/g, " ").slice(0, 200)}"`);
+  }
+
+  // ------- butir 80 (v0.23.1): kartu "Pagar konteks & pemotongan" pada halaman Pemakaian -------
+  // Angka kartu dibandingkan dengan jawaban server PADA SAAT ITU; bila tidak ada sisipan yang dipotong,
+  // kartu harus menulis kalimat jujur itu dan TIDAK boleh mengarang angka pemotongan.
+  const angkaID = (nilai) => Number(nilai ?? 0).toLocaleString("id-ID");
+  const panggilanPagarSebelum = callsTo("/api/v1/context-budget/report").length;
+  const diklikPemakaian = await page.evaluate(() => {
+    const tautan = [...document.querySelectorAll("nav.page-nav .page-link")];
+    // Label "Pemakaian saya" juga memuat "Pemakaian": yang dicari menu yang BERAKHIR "Pemakaian".
+    const cocok = tautan.find((node) => String(node.textContent || "").trim().endsWith("Pemakaian"));
+    if (!cocok) return false;
+    cocok.click();
+    return true;
+  });
+  await page.waitForTimeout(600);
+  let panggilanPagar = 0;
+  let teksAngkaPagar = ""; let teksDipotongPagar = ""; let teksCatatanPagar = ""; let adaGalatPagar = 0;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    panggilanPagar = callsTo("/api/v1/context-budget/report").length - panggilanPagarSebelum;
+    teksAngkaPagar = String(await page.locator('[data-testid="pagar-konteks-angka"]').first().innerText({ timeout: 900 }).catch(() => "")) || "";
+    teksDipotongPagar = String(await page.locator('[data-testid="pagar-konteks-dipotong"]').first().innerText({ timeout: 900 }).catch(() => "")) || "";
+    teksCatatanPagar = String(await page.locator('[data-testid="pagar-konteks-catatan"]').first().innerText({ timeout: 900 }).catch(() => "")) || "";
+    adaGalatPagar = await page.locator('[data-testid="pagar-konteks-galat"]').count();
+    if (teksAngkaPagar || adaGalatPagar) break;
+    await page.waitForTimeout(250);
+  }
+  const adaKartuPagar = await page.locator('[data-testid="pagar-konteks-kartu"]').count();
+  const laporanPagar = await page.evaluate(async () => {
+    const jawaban = await fetch("/api/v1/context-budget/report");
+    return { status: jawaban.status, badan: await jawaban.json().catch(() => null) };
+  });
+  const pagar = laporanPagar.badan || {};
+  const dipotongPagar = Array.isArray(pagar.dipotong) ? pagar.dipotong : [];
+  checkApi("kartu pagar konteks di halaman Pemakaian memuat angka yang sama dengan jawaban server (butir 80)",
+    "/api/v1/context-budget/report",
+    diklikPemakaian && adaKartuPagar === 1 && panggilanPagar > 0 && adaGalatPagar === 0 && laporanPagar.status === 200
+      && teksAngkaPagar.includes(angkaID(pagar.budgetChars))
+      && teksAngkaPagar.includes(angkaID(pagar.totalCharsBeforeTrim))
+      && teksAngkaPagar.includes(angkaID(pagar.keptChars))
+      && teksAngkaPagar.includes(pagar.overBudget ? "ya" : "tidak"),
+    `diklik=${diklikPemakaian} kartu=${adaKartuPagar} panggilan=${panggilanPagar} galat=${adaGalatPagar} angka="${teksAngkaPagar.replace(/\s+/g, " ").slice(0, 160)}" server=${angkaID(pagar.budgetChars)}/${angkaID(pagar.totalCharsBeforeTrim)}/${angkaID(pagar.keptChars)}/${pagar.overBudget}`);
+  // Harapan dihitung persis seperti layar menghitungnya (Tools.tsx:489-500): sumber utama
+  // `dipotong`, ditambah blok yang `terkirim=false` bila belum tercatat (jangan dobel).
+  const blokTidakTerkirim = (Array.isArray(pagar.blocks) ? pagar.blocks : []).filter((blok) => blok && blok.terkirim === false);
+  const namaSudahTercatat = new Set(dipotongPagar.map((item) => String(item.name)));
+  const bagianDiLayar = dipotongPagar.map((item) => ({ name: String(item.name), chars: Number(item.chars ?? 0) }));
+  for (const blok of blokTidakTerkirim) {
+    if (namaSudahTercatat.has(String(blok.name))) continue;
+    namaSudahTercatat.add(String(blok.name));
+    bagianDiLayar.push({ name: String(blok.name), chars: Number(blok.chars ?? 0) });
+  }
+  const jumlahBagianDiLayar = bagianDiLayar.length;
+  const totalKarakterDiLayar = bagianDiLayar.reduce((total, item) => total + item.chars, 0);
+  // Hanya SATU keadaan yang benar, sesuai jawaban server saat itu (bukan "salah satu dari dua").
+  const dipotongJujur = jumlahBagianDiLayar > 0
+    ? teksDipotongPagar.includes(`${jumlahBagianDiLayar} bagian tidak terkirim utuh`)
+      && teksDipotongPagar.includes(angkaID(totalKarakterDiLayar))
+      && bagianDiLayar.every((item) => teksDipotongPagar.includes(item.name))
+    : teksDipotongPagar.includes("Tidak ada sisipan yang dipotong pada pemeriksaan terakhir.")
+      && !/bagian tidak terkirim utuh/.test(teksDipotongPagar);
+  // Bukti gambar untuk kartu pagar konteks (angka yang dibandingkan di atas).
+  await page.screenshot({ path: `${shots}/pagar-konteks-pemakaian.png`, fullPage: false }).catch(() => undefined);
+  check("kartu pagar konteks memuat pemotongan yang NYATA, atau kalimat jujur bila tidak ada yang dipotong (butir 80)",
+    adaKartuPagar === 1 && dipotongJujur && teksCatatanPagar.trim() === String(pagar.catatan ?? "").trim(),
+    `server dipotong=${dipotongPagar.length} blokTidakTerkirim=${blokTidakTerkirim.length} harapan=${jumlahBagianDiLayar} bagian/${totalKarakterDiLayar} karakter layar="${teksDipotongPagar.replace(/\s+/g, " ").slice(0, 200)}" catatan="${teksCatatanPagar.slice(0, 120)}"`);
+
   // ----- 5) butir 42: mode diskusi/eksekusi pada percakapan, plus satu run untuk Riwayat run.
   await page.click('nav.page-nav .page-link:has-text("Percakapan")');
   await page.waitForTimeout(400);
@@ -638,8 +946,84 @@ try {
   await page.waitForTimeout(400);
   const barisCadanganAkhir = await page.locator('[data-testid^="fallback-input-"]').count();
   checkApi("halaman Penghemat token menyediakan urutan model cadangan yang bisa ditambah",
+    "/api/v1/agents/fallback",
     adaPanelCadangan > 0 && barisCadanganAkhir === barisCadanganAwal + 1,
     `panel=${adaPanelCadangan} baris ${barisCadanganAwal} -> ${barisCadanganAkhir}`);
+
+  // Temuan audit butir 57 (b): tombol naik/turun urutan model cadangan belum pernah diuji. Yang diuji
+  // bukan sekadar tombolnya bisa diklik, melainkan URUTANNYA benar-benar berpindah: di layar, di isi
+  // permintaan simpan, dan di jawaban server sesudah disimpan.
+  const cadanganA = `uji/cadangan-a-${stamp}`;
+  const cadanganB = `uji/cadangan-b-${stamp}`;
+  const ambilUrutanCadangan = async () => [
+    String(await page.locator('[data-testid="fallback-input-0"]').first().inputValue({ timeout: 900 }).catch(() => "")),
+    String(await page.locator('[data-testid="fallback-input-1"]').first().inputValue({ timeout: 900 }).catch(() => "")),
+  ];
+  // Dua baris dijamin ada: satu baris sudah ditambahkan pemeriksaan di atas, satu lagi bila perlu.
+  for (let attempt = 0; attempt < 2 && (await page.locator('[data-testid^="fallback-input-"]').count()) < 2; attempt += 1) {
+    await page.click('[data-testid="fallback-add"]', { timeout: 4000 }).catch(() => undefined);
+    await page.waitForTimeout(300);
+  }
+  await page.fill('[data-testid="fallback-input-0"]', cadanganA, { timeout: 4000 });
+  await page.fill('[data-testid="fallback-input-1"]', cadanganB, { timeout: 4000 });
+  const urutanCadanganAwal = await ambilUrutanCadangan();
+  await page.click('[data-testid="fallback-down-0"]', { timeout: 4000 });
+  await page.waitForTimeout(300);
+  const urutanSetelahTurun = await ambilUrutanCadangan();
+  await page.click('[data-testid="fallback-up-1"]', { timeout: 4000 });
+  await page.waitForTimeout(300);
+  const urutanSetelahNaik = await ambilUrutanCadangan();
+  check("tombol naik/turun benar-benar menggeser urutan model cadangan di layar (temuan audit butir 57)",
+    urutanCadanganAwal[0] === cadanganA && urutanCadanganAwal[1] === cadanganB
+      && urutanSetelahTurun[0] === cadanganB && urutanSetelahTurun[1] === cadanganA
+      && urutanSetelahNaik[0] === cadanganA && urutanSetelahNaik[1] === cadanganB,
+    `awal=${JSON.stringify(urutanCadanganAwal)} turun=${JSON.stringify(urutanSetelahTurun)} naik=${JSON.stringify(urutanSetelahNaik)}`);
+
+  // Urutan baru harus benar-benar TERSIMPAN: geser lagi, simpan lewat tombol "Simpan pengaturan",
+  // lalu baca kembali daftar model cadangan dari server.
+  let isiSimpanCadangan = null;
+  await page.route("**/api/v1/agents/settings", async (route) => {
+    if (route.request().method() !== "PATCH") return route.continue();
+    isiSimpanCadangan = JSON.parse(route.request().postData() || "{}");
+    await route.continue();
+  });
+  await page.click('[data-testid="fallback-down-0"]', { timeout: 4000 });
+  await page.waitForTimeout(200);
+  await page.locator("button", { hasText: "Simpan pengaturan" }).first().click({ timeout: 4000 });
+  let cadanganServer = [];
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    cadanganServer = await page.evaluate(async () => {
+      const jawaban = await fetch("/api/v1/agents/fallback").catch(() => null);
+      const badan = jawaban ? await jawaban.json().catch(() => null) : null;
+      return Array.isArray(badan?.models) ? badan.models : [];
+    });
+    if (cadanganServer.length >= 2 && cadanganServer[0] === cadanganB) break;
+    await page.waitForTimeout(250);
+  }
+  check("urutan hasil tombol turun benar-benar dikirim ke API dan tersimpan di server (temuan audit butir 57)",
+    Array.isArray(isiSimpanCadangan?.fallbackModels) && isiSimpanCadangan.fallbackModels[0] === cadanganB
+      && isiSimpanCadangan.fallbackModels[1] === cadanganA
+      && cadanganServer[0] === cadanganB && cadanganServer[1] === cadanganA,
+    `PATCH=${JSON.stringify(isiSimpanCadangan?.fallbackModels ?? null)} server=${JSON.stringify(cadanganServer)}`);
+  // Keadaan dikembalikan seperti semula: dua baris uji dihapus lalu disimpan, dan daftar di server
+  // harus benar-benar kosong lagi (bukan hanya kosong di layar).
+  await page.click('[data-testid="fallback-remove-0"]', { timeout: 4000 }).catch(() => undefined);
+  await page.waitForTimeout(300);
+  await page.click('[data-testid="fallback-remove-0"]', { timeout: 4000 }).catch(() => undefined);
+  await page.waitForTimeout(300);
+  await page.locator("button", { hasText: "Simpan pengaturan" }).first().click({ timeout: 4000 }).catch(() => undefined);
+  let cadanganServerAkhir = ["belum-dibaca"];
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    cadanganServerAkhir = await page.evaluate(async () => {
+      const jawaban = await fetch("/api/v1/agents/fallback").catch(() => null);
+      const badan = jawaban ? await jawaban.json().catch(() => null) : null;
+      return Array.isArray(badan?.models) ? badan.models : ["gagal-baca"];
+    });
+    if (cadanganServerAkhir.length === 0) break;
+    await page.waitForTimeout(250);
+  }
+  check("menghapus baris model cadangan ikut tersimpan di server (bersih-bersih setelah uji)",
+    cadanganServerAkhir.length === 0, `server=${JSON.stringify(cadanganServerAkhir)}`);
 
   // butir 46: kolom `violations` pada detail run. Diperiksa dua langkah supaya jujur:
   // (a) data NYATA dibaca langsung dari API: daftarnya kosong, sebab aturan larangan menahan permintaan
@@ -663,12 +1047,18 @@ try {
     pattern: "kata-rahasia", snippet: `potongan uji ${stamp}`, createdAt: new Date().toISOString(),
   };
   // Penyadapan hanya untuk jalur detail (GET /api/v1/runs/<id>); jawaban aslinya tetap dipakai.
+  // Data cadangan NYATA dari jawaban itu disimpan supaya pemeriksaan di bawah bisa menuntut SATU
+  // keadaan yang benar (dulu pemeriksaan menerima "ada penanda ATAU tanpa penanda", jadi selalu hijau).
+  let dataCadanganServer = null;
   await page.route("**/api/v1/runs/*", async (route) => {
     const jalur = new URL(route.request().url()).pathname;
     if (route.request().method() !== "GET" || !/^\/api\/v1\/runs\/[^/]+$/.test(jalur)) return route.continue();
     const jawaban = await route.fetch();
     const badan = await jawaban.json().catch(() => null);
-    if (badan && typeof badan === "object") badan.violations = [pelanggaranUji];
+    if (badan && typeof badan === "object") {
+      badan.violations = [pelanggaranUji];
+      dataCadanganServer = { fallbackCount: badan.fallbackCount ?? null, fallbackFrom: badan.fallbackFrom ?? null, model: badan.model ?? null };
+    }
     await route.fulfill({ response: jawaban, json: badan });
   });
 
@@ -678,14 +1068,38 @@ try {
   const barisRun = page.locator("main.main table tbody tr").first();
   if (await barisRun.count()) {
     await barisRun.click();
-    let penandaCadangan = 0;
+    // Temuan audit butir 57 (a): pemeriksaan lama menerima penanda `run-fallback-marker` ATAU
+    // `run-fallback-none`, sehingga SELALU hijau apa pun yang digambar layar. Sekarang hanya SATU
+    // keadaan yang diterima, yaitu yang cocok dengan jawaban server untuk run ini (`fallbackCount`
+    // dan `fallbackFrom` yang ditangkap dari penyadapan di atas).
+    let adaPenandaCadangan = 0; let adaTanpaCadangan = 0;
     for (let attempt = 0; attempt < 40; attempt += 1) {
-      penandaCadangan = await page.locator('[data-testid="run-fallback-marker"], [data-testid="run-fallback-none"]').count();
-      if (penandaCadangan > 0) break;
+      adaPenandaCadangan = await page.locator('[data-testid="run-fallback-marker"]').count();
+      adaTanpaCadangan = await page.locator('[data-testid="run-fallback-none"]').count();
+      if (adaPenandaCadangan + adaTanpaCadangan > 0) break;
       await page.waitForTimeout(250);
     }
+    if (!dataCadanganServer) {
+      dataCadanganServer = await page.evaluate(async (id) => {
+        const jawaban = await fetch(`/api/v1/runs/${id}`).catch(() => null);
+        const badan = jawaban ? await jawaban.json().catch(() => null) : null;
+        return badan ? { fallbackCount: badan.fallbackCount ?? null, fallbackFrom: badan.fallbackFrom ?? null } : null;
+      }, detailRunNyata.id);
+    }
+    const jumlahCadanganServer = Number(dataCadanganServer?.fallbackCount ?? -1);
+    const dariCadanganServer = String(dataCadanganServer?.fallbackFrom ?? "");
+    const teksPenandaCadangan = adaPenandaCadangan
+      ? String(await page.locator('[data-testid="run-fallback-marker"]').first().innerText({ timeout: 900 }).catch(() => "")).replace(/\s+/g, " ")
+      : "";
+    const penandaCadanganCocok = jumlahCadanganServer > 0
+      ? adaPenandaCadangan === 1 && adaTanpaCadangan === 0
+        && teksPenandaCadangan.includes(String(jumlahCadanganServer))
+        && (dariCadanganServer === "" || teksPenandaCadangan.includes(dariCadanganServer))
+      : jumlahCadanganServer === 0 && adaTanpaCadangan === 1 && adaPenandaCadangan === 0;
     checkApi("detail run menjelaskan ada atau tidaknya perpindahan model cadangan",
-      penandaCadangan > 0, `penanda=${penandaCadangan} panggilan=${callsTo("/runs/").join(" | ").slice(0, 160)}`);
+      "/api/v1/runs/",
+      penandaCadanganCocok,
+      `server fallbackCount=${dataCadanganServer?.fallbackCount} from=${dataCadanganServer?.fallbackFrom} layar marker=${adaPenandaCadangan} none=${adaTanpaCadangan} teks="${teksPenandaCadangan.slice(0, 160)}" panggilan=${callsTo("/runs/").join(" | ").slice(0, 120)}`);
 
     // butir 46: panel pelanggaran dari kolom yang baru saja dibaca.
     let panelPelanggaran = 0;
@@ -750,6 +1164,7 @@ try {
       await page.waitForTimeout(300);
     }
     checkApi("tombol hitung di Playground memanggil API perkiraan dan menampilkan rincian harga",
+      "/api/v1/playground/estimate",
       callsTo("/playground/estimate").length > estimasiSebelum && /perkiraan biaya/i.test(teksEstimasi) && /Rp/.test(teksEstimasi),
       teksEstimasi.replace(/\n+/g, " | ").slice(0, 240));
     const kolomOpsional = await page.locator('[data-testid="playground-estimate-output-tokens"], [data-testid="playground-estimate-runs"]').count();
@@ -794,7 +1209,8 @@ try {
     await page.waitForSelector('[data-testid="history-delete"]', { timeout: 10000 }).catch(() => undefined);
     const tombolHapus = page.locator('[data-testid="history-delete"]').first();
     const hapusMatiSebelumEkspor = await tombolHapus.isDisabled().catch(() => null);
-    checkApi("tombol hapus riwayat mati sebelum ekspor disiapkan (wajib ekspor dulu)",
+    // Murni keadaan tombol di antarmuka (tidak memanggil API), jadi diperiksa dengan `check`, bukan `checkApi`.
+    check("tombol hapus riwayat mati sebelum ekspor disiapkan (wajib ekspor dulu)",
       hapusMatiSebelumEkspor === true, String(hapusMatiSebelumEkspor));
     await page.selectOption('[data-testid="history-target"]', { label: proyekUji }).catch(() => undefined);
     await page.click('[data-testid="history-export"]');
@@ -805,11 +1221,13 @@ try {
       await page.waitForTimeout(300);
     }
     checkApi("ekspor riwayat berhasil dan melaporkan jumlah percakapan",
+      "/api/v1/conversations/bulk-export",
       infoEkspor.trim().length > 0 && /percakapan/i.test(infoEkspor), infoEkspor.replace(/\n+/g, " | ").slice(0, 200));
     await page.fill('[data-testid="history-confirm-input"]', "HAPUS").catch(() => undefined);
     await page.waitForTimeout(300);
     const hapusHidup = await tombolHapus.isDisabled().catch(() => true) === false;
-    checkApi("tombol hapus riwayat hidup setelah konfirmasi HAPUS diketik", hapusHidup, String(hapusHidup));
+    // Murni keadaan tombol setelah konfirmasi diketik (tidak memanggil API) -> `check`, bukan `checkApi`.
+    check("tombol hapus riwayat hidup setelah konfirmasi HAPUS diketik", hapusHidup, String(hapusHidup));
     if (hapusHidup) {
       const hapusSebelum = callsTo("/bulk-delete").length;
       await tombolHapus.click();
@@ -820,6 +1238,7 @@ try {
         await page.waitForTimeout(300);
       }
       checkApi("penghapusan riwayat berjalan lewat API dan melaporkan jumlah yang dihapus",
+        "/api/v1/conversations/bulk-delete",
         callsTo("/bulk-delete").length > hapusSebelum && /percakapan/i.test(hasilHapus),
         hasilHapus.replace(/\n+/g, " | ").slice(0, 200));
     } else {
@@ -1943,9 +2362,12 @@ try {
       "server belum punya catatan galat pada basis data uji (hanya galat status 500 yang dicatat)");
   } else {
     const teksBarisGalat = rapi(await page.locator('[data-testid="admin-errors"]').first().innerText().catch(() => ""));
+    // `every` pada daftar kosong selalu benar, jadi syarat jumlah baris ditulis eksplisit: pemeriksaan ini
+    // tidak boleh lulus hampa saat server melaporkan total galat > 0 tetapi tidak mengirim satu baris pun.
     check("setiap galat yang dikirim server tampil di tabel dengan kode dan pesannya",
-      barisGalatServer.every((row) => Boolean(teksBarisGalat.includes(String(row.message).slice(0, 60)))),
-      `baris=${barisGalatServer.length}`);
+      barisGalatServer.length > 0
+        && barisGalatServer.every((row) => Boolean(teksBarisGalat.includes(String(row.message).slice(0, 60)))),
+      `baris=${barisGalatServer.length} total=${totalGalat}`);
   }
 
   const kindUjiGalat = "ui";
@@ -2061,13 +2483,13 @@ try {
   // dengan jawaban server yang diambil pada saat yang sama, bukan dengan tebakan.
   const c11TungguTeks = async (selector, batas = 80) => {
     for (let attempt = 0; attempt < batas; attempt += 1) {
-      const teks = await page.locator(selector).first().innerText().catch(() => "");
+      const teks = await page.locator(selector).first().innerText({ timeout: 900 }).catch(() => "");
       if (teks && teks.trim().length > 0) return teks.trim();
       await page.waitForTimeout(200);
     }
     return "";
   };
-  const c11Attr = (selector, nama) => page.locator(selector).first().getAttribute(nama).catch(() => null);
+  const c11Attr = (selector, nama) => page.locator(selector).first().getAttribute(nama, { timeout: 900 }).catch(() => null);
   /** Tunggu sampai sebuah atribut ada DAN tidak kosong (mis. penanda 'data sudah dimuat'). */
   const c11TungguAttr = async (selector, nama, batas = 60) => {
     let terakhir = null;
@@ -2114,7 +2536,7 @@ try {
   const c11TungguPesan = async (selector, potongan, batas = 80) => {
     let terakhir = "";
     for (let attempt = 0; attempt < batas; attempt += 1) {
-      terakhir = String(await page.locator(selector).first().innerText().catch(() => ""));
+      terakhir = String(await page.locator(selector).first().innerText({ timeout: 900 }).catch(() => ""));
       if (terakhir.includes(potongan)) return terakhir.trim();
       await page.waitForTimeout(200);
     }
@@ -2330,10 +2752,16 @@ try {
   await bukaHalaman11B("Kanal bot", "/api/v1/admin/bot-channels");
   const botAwal = await serverJson("/api/v1/admin/bot-channels");
   const catatanBot = await c11TungguTeks('[data-testid="bot-catatan-honest"]');
-  check("halaman Kanal bot jujur: tidak ada rute uji kirim, tindakan nyatanya Simpan yang memanggil setWebhook (butir 69)",
-    catatanBot.includes('Tidak ada rute "uji kirim"') && catatanBot.includes("setWebhook")
+  // Perbaikan 26 Sep 2026: v0.23.1 MENAMBAH rute nyata uji kirim, jadi klaim lama "tidak ada rute uji kirim"
+  // sudah tidak benar. Pemeriksaan ini tidak dihapus dan tidak di-SKIP: syaratnya dibalik menjadi bukti
+  // bahwa catatan memuat KEDUA tindakan nyata (setWebhook + Uji kirim beserta rutenya) dan tidak lagi
+  // memuat klaim rute yang sudah usang.
+  check("halaman Kanal bot jujur: catatan memuat setWebhook DAN Uji kirim beserta rute ujinya, tanpa klaim rute yang sudah usang (butir 69)",
+    catatanBot.includes("setWebhook") && catatanBot.includes("Uji kirim")
+      && catatanBot.includes("/api/v1/admin/bot-channels/:id/test")
+      && !/Tidak ada rute/i.test(catatanBot)
       && (await c11Attr('[data-testid="bot-channels"]', "data-jumlah")) === String((botAwal.badan.channels || []).length),
-    `catatan=${catatanBot.slice(0, 90)}… jumlah server=${(botAwal.badan.channels || []).length}`);
+    `catatan=${catatanBot.slice(0, 160)}… jumlah server=${(botAwal.badan.channels || []).length} | layar datang dari dist/ hasil build; bila dist/ belum dibangun ulang dari src/ v0.23.1, catatan ini masih versi lama`);
 
   // Kode pemasangan sebelum ada kanal: server menjawab 404 CHANNEL_NOT_FOUND.
   const tolakKode = await serverJson("/api/v1/bot-identities/link-code", jsonKirim({}));
@@ -2369,6 +2797,105 @@ try {
       && urlWebhook.startsWith(`${stubBase}/bot-hook/api/v1/bots/telegram/webhook/`)
       && typeof badanHulu?.secret_token === "string" && badanHulu.secret_token.length >= 8,
     `terdaftar=${terdaftar} status=${statusWebhook} path=${panggilanHulu?.path} url=${urlWebhook} huluUrl=${badanHulu?.url}`);
+
+  /* ------- butir 69 (v0.23.1): tombol Uji kirim BENAR-BENAR mengirim, dan penolakan hulu tidak disamarkan -------
+     Hulu Telegram tiruan di berkas ini menerima `/bot<token>/sendMessage`, jadi hasil uji kirim bisa dibuktikan
+     dari dua sisi sekaligus: apa yang benar-benar dikirim platform ke hulu, dan apa yang ditulis layar. */
+  const botSetelahSimpan = (await serverJson("/api/v1/admin/bot-channels")).badan.channels || [];
+  const kanalUji = botSetelahSimpan.find((row) => row.name === `Bot uji ${stamp}` && row.provider === "telegram") || null;
+  const idKanalUji = String(kanalUji?.id ?? "");
+  const barisKanalLayar = await c11Hitung('[data-testid^="bot-kanal-"]');
+  check("daftar kanal bot di layar sama dengan daftar kanal dari server, dan kanal yang baru disimpan muncul sebagai baris",
+    idKanalUji.length > 0 && barisKanalLayar === botSetelahSimpan.length
+      && (await c11Hitung(`[data-testid="bot-kanal-${idKanalUji}"]`)) === 1,
+    `layar=${barisKanalLayar} server=${botSetelahSimpan.length} id=${idKanalUji}`);
+
+  const kirimHuluKe = () => stubRequests.filter((item) => /^\/bot[^/]+\/sendMessage$/.test(item.path)).length;
+  // Kendali uji kirim hanya ada di layar hasil build v0.23.1+. Bila `dist/` belum dibangun ulang dari
+  // `src/`, kendalinya tidak ada — dan itu harus terbaca sebagai GAGAL yang jujur, bukan uji yang mati.
+  // Kejadian nyata 26 Sep 2026: `page.fill` menunggu 30000 ms lalu MELEMPAR, sehingga 40+ pemeriksaan
+  // berikutnya tidak pernah berjalan dan laporan terlihat "hanya 2 gagal". Karena itu setiap tindakan
+  // di bawah memakai pembungkus yang mengembalikan false alih-alih melempar.
+  const adaIsianUji = await c11Hitung('[data-testid="bot-chat-uji"]');
+  const adaTombolUji = await c11Hitung(`[data-testid="bot-uji-${idKanalUji}"]`);
+  const adaKendaliUji = adaIsianUji === 1 && adaTombolUji === 1;
+  const sebabKendaliHilang = `layar hasil build tidak punya kendali uji kirim (bot-chat-uji=${adaIsianUji}, bot-uji-${idKanalUji}=${adaTombolUji}); kemungkinan dist/ belum dibangun ulang dari src/ v0.23.1`;
+  const isiAman = async (selector, teks) => { try { await page.fill(selector, teks, { timeout: 5000 }); return true; } catch { return false; } };
+  const klikAman = async (selector) => { try { await page.click(selector, { timeout: 5000 }); return true; } catch { return false; } };
+
+  // (1) Tanpa tujuan: server menolak 409 BOT_TEST_TARGET_MISSING dan layar menampilkan penolakan itu apa adanya.
+  const sebelumUjiKosong = kirimHuluKe();
+  await isiAman('[data-testid="bot-chat-uji"]', "");
+  await klikAman(`[data-testid="bot-uji-${idKanalUji}"]`);
+  let ujiKosong = {};
+  for (let attempt = 0; adaKendaliUji && attempt < 80; attempt += 1) {
+    ujiKosong = await c11Snap(`[data-testid="bot-uji-hasil-${idKanalUji}"]`, ["data-terkirim", "data-kode", "data-status"]) ?? {};
+    if (ujiKosong["data-kode"]) break;
+    await page.waitForTimeout(200);
+  }
+  const teksKosong = await c11TungguPesan(`[data-testid="bot-uji-galat-${idKanalUji}"]`, "BOT_TEST_TARGET_MISSING", 20);
+  const tolakKosong = await serverJson(`/api/v1/admin/bot-channels/${idKanalUji}/test`, jsonKirim({}));
+  check("uji kirim tanpa tujuan dijawab jujur: 409 BOT_TEST_TARGET_MISSING di server DAN di layar, tanpa mengirim apa pun ke hulu",
+    adaKendaliUji && tolakKosong.status === 409 && tolakKosong.badan.error === "BOT_TEST_TARGET_MISSING"
+      && ujiKosong["data-kode"] === "BOT_TEST_TARGET_MISSING" && ujiKosong["data-terkirim"] === "false"
+      && ujiKosong["data-status"] === "409" && teksKosong.includes(tolakKosong.badan.message)
+      && kirimHuluKe() === sebelumUjiKosong,
+    `server=${tolakKosong.status} ${tolakKosong.badan.error} layar=${JSON.stringify(ujiKosong)} hulu=${kirimHuluKe() - sebelumUjiKosong}${adaKendaliUji ? "" : ` | ${sebabKendaliHilang}`}`);
+
+  // (2) Hulu menolak pesan uji: server meneruskan penolakan Telegram apa adanya sebagai 502
+  // TELEGRAM_UPSTREAM_ERROR. Jawaban 5xx ini SENGAJA dan ditegaskan pemeriksaan di bawah, jadi jalur +
+  // kodenya dideklarasikan lebih dulu (jalur PERSIS, plus bukti) supaya tidak terbaca sebagai galat liar.
+  // Aturan 5xx hanya didaftarkan bila pemeriksaannya benar-benar BISA dijalankan: mendaftarkan pemaafan
+  // untuk galat yang tidak pernah dipancing sama dengan menulis bukti yang tidak pernah diuji.
+  if (adaKendaliUji) galat11CDisengaja.push({
+    jalur: "/api/v1/admin/bot-channels",
+    kode: [],
+    kode5xx: [502],
+    jalur5xx: `/api/v1/admin/bot-channels/${idKanalUji}/test`,
+    bukti5xx: "e2e/ui.e2e.mjs:2532 — hulu Telegram tiruan menolak pesan uji (HTTP 400) dan pemeriksaan blok butir 69 menegaskan server meneruskan 502 TELEGRAM_UPSTREAM_ERROR beserta kata-kata hulu apa adanya",
+    alasan: "502 TELEGRAM_UPSTREAM_ERROR saat hulu menolak pesan uji: jawaban jujur yang memang ditegaskan uji butir 69",
+  });
+  const sebelumTolakHulu = kirimHuluKe();
+  await isiAman('[data-testid="bot-chat-uji"]', "tolak-uji");
+  await klikAman(`[data-testid="bot-uji-${idKanalUji}"]`);
+  let ujiTolak = {};
+  for (let attempt = 0; adaKendaliUji && attempt < 80; attempt += 1) {
+    ujiTolak = await c11Snap(`[data-testid="bot-uji-hasil-${idKanalUji}"]`, ["data-terkirim", "data-kode", "data-status"]) ?? {};
+    if (ujiTolak["data-kode"] === "TELEGRAM_UPSTREAM_ERROR") break;
+    await page.waitForTimeout(200);
+  }
+  const kirimanTolak = stubRequests.filter((item) => /^\/bot[^/]+\/sendMessage$/.test(item.path)).slice(sebelumTolakHulu);
+  const ringkasTolak = await c11TungguPesan(`[data-testid="bot-uji-ringkas-${idKanalUji}"]`, "TIDAK terkirim", 20);
+  const huluTolak = await c11TungguPesan(`[data-testid="bot-uji-hulu-${idKanalUji}"]`, "Jawaban hulu", 20);
+  check("hulu menolak pesan uji: layar menulis TIDAK terkirim + 502 TELEGRAM_UPSTREAM_ERROR, dan kata-kata hulu tampil apa adanya (tanpa klaim berhasil)",
+    adaKendaliUji && ujiTolak["data-terkirim"] === "false" && ujiTolak["data-kode"] === "TELEGRAM_UPSTREAM_ERROR" && ujiTolak["data-status"] === "502"
+      && /TIDAK terkirim/.test(ringkasTolak) && !/Terkirim: ya/.test(ringkasTolak)
+      && kirimanTolak.length >= 1
+      && kirimanTolak.every((item) => String(JSON.parse(item.body || "{}").chat_id ?? "") === "tolak-uji")
+      && huluTolak.includes("chat not found"),
+    `layar=${JSON.stringify(ujiTolak)} hulu=${kirimanTolak.length} pesan=${huluTolak.slice(0, 200)}${adaKendaliUji ? "" : ` | ${sebabKendaliHilang}`}`);
+
+  // (3) Hulu menerima: pesan uji benar-benar sampai, tujuan dan isinya sama dengan yang dikirim platform.
+  const sebelumSukses = kirimHuluKe();
+  const chatIdUji = `77${String(stamp).slice(-8)}`;
+  await isiAman('[data-testid="bot-chat-uji"]', chatIdUji);
+  await klikAman(`[data-testid="bot-uji-${idKanalUji}"]`);
+  let ujiSukses = {};
+  for (let attempt = 0; adaKendaliUji && attempt < 80; attempt += 1) {
+    ujiSukses = await c11Snap(`[data-testid="bot-uji-hasil-${idKanalUji}"]`, ["data-terkirim", "data-kode", "data-status"]) ?? {};
+    if (ujiSukses["data-terkirim"] === "true") break;
+    await page.waitForTimeout(200);
+  }
+  const kirimanSukses = stubRequests.filter((item) => /^\/bot[^/]+\/sendMessage$/.test(item.path)).slice(sebelumSukses);
+  const badanSukses = kirimanSukses.length ? JSON.parse(kirimanSukses[0].body || "{}") : null;
+  const ringkasSukses = await c11TungguPesan(`[data-testid="bot-uji-ringkas-${idKanalUji}"]`, "Terkirim: ya", 20);
+  check("tombol Uji kirim benar-benar mengirim ke hulu Telegram: tujuan dan isi pesan sama dengan yang dikirim platform, layar melaporkan hulu HTTP 200 (butir 69)",
+    adaKendaliUji && ujiSukses["data-terkirim"] === "true" && ujiSukses["data-kode"] === "" && ujiSukses["data-status"] === "200"
+      && kirimanSukses.length >= 1 && kirimanSukses[0].path === `/bot${tokenBotBenar}/sendMessage`
+      && String(badanSukses?.chat_id ?? "") === chatIdUji && String(badanSukses?.text ?? "").length > 0
+      && ringkasSukses.includes(chatIdUji) && /hulu HTTP 200/.test(ringkasSukses),
+    `layar=${JSON.stringify(ujiSukses)} hulu=${kirimanSukses.length} path=${kirimanSukses[0]?.path} chat_id=${badanSukses?.chat_id} ringkas=${ringkasSukses.slice(0, 200)}${adaKendaliUji ? "" : ` | ${sebabKendaliHilang}`}`);
+
 
   // Token bot tidak boleh tertinggal di DOM, dan isian token harus dikosongkan setelah simpan.
   const layarBot = await page.evaluate((rahasia) => ({
@@ -2769,6 +3296,9 @@ try {
         status: 429, contentType: "application/json",
         body: JSON.stringify({ error: "AVATAR_RATE_LIMITED", message: "Terlalu banyak unggahan avatar (batas 20 per jam). Coba lagi nanti.", retryAfter: 60 }),
       });
+      // Jawaban ini dibuat uji sendiri, jadi tidak selalu muncul di `apiCalls`; dicatat di sini sebagai
+      // bukti jaringan bahwa galat 429 pada jalur ini memang dibuat oleh uji (bukan datang entah dari mana).
+      ruteDisadap.push("429 /api/v1/account/avatar");
       return;
     }
     await rute.continue();
@@ -2992,12 +3522,31 @@ try {
   /* ---------------- pemeriksaan akhir Wave 11C: galat konsol yang memang dipancing ---------------- */
   const galatLiar11C = consoleErrors.slice();
   const dipancing11C = expectedApiErrors11C.slice();
-  const diLuarDaftar11C = dipancing11C.filter((baris) => !jalurGalat11C.some((jalur) => baris.includes(jalur)));
-  check("seluruh galat jaringan Wave 11C berasal dari jalur yang memang dipancing uji ini (tidak ada galat liar)",
+  // PERBAIKAN KEJUJURAN (26 Sep 2026): pemeriksaan lama memakai `diLuarDaftar11C` yang SELALU bernilai 0
+  // (galat sudah disaring oleh daftar putih di pendengar konsol, jadi hasilnya pasti kosong) — pemeriksaan
+  // yang tidak pernah bisa gagal. Penggantinya: setiap galat yang dimaafkan harus punya JAWABAN JARINGAN
+  // NYATA dengan kode dan jalur yang sama, dari `apiCalls` (jawaban server) atau `ruteDisadap` (jawaban
+  // yang dibuat uji sendiri). Pemaafan tanpa jawaban jaringan = gagal.
+  const adaBukti11C = (item) => apiCalls.concat(ruteDisadap)
+    .some((baris) => baris.startsWith(`${item.kode} `) && baris.includes(item.jalur));
+  const pancingTanpaBukti11C = pancing11C.filter((item) => !adaBukti11C(item));
+  const ringkas11C = pancing11C.reduce((peta, item) => { const kunci = `${item.kode} ${item.jalur}`; peta[kunci] = (peta[kunci] || 0) + 1; return peta; }, {});
+  // Jawaban 5xx dari server: hanya boleh datang dari jalur + kode yang sudah dideklarasikan lengkap dengan
+  // bukti pemeriksaan. 5xx di luar deklarasi itu = kegagalan, bukan catatan pinggir.
+  const jalur5xxDideklarasikan = galat11CDisengaja.filter((item) => (item.kode5xx || []).length > 0);
+  const jawaban5xx11C = apiCalls.filter((baris) => Number(baris.split(" ")[0]) >= 500);
+  const jawaban5xxDideklarasikan = jawaban5xx11C.filter((baris) => jalur5xxDideklarasikan.some((item) => baris.includes(item.jalur5xx)));
+  const jawaban5xxLiar = jawaban5xx11C.filter((baris) => !jalur5xxDideklarasikan.some((item) => baris.includes(item.jalur5xx)));
+  const pancing5xx11C = pancing11C.filter((item) => item.kode >= 500);
+  check("seluruh galat jaringan Wave 11C berasal dari jalur dan kode yang memang dipancing uji ini (tidak ada galat liar)",
     // Batas atas 150 hanya penjaga kalau ada gelung yang mengulang permintaan gagal tanpa henti; yang
-    // menentukan lulus bukan angkanya, melainkan "tidak ada galat liar" + "semua jalur ada di daftar putih".
-    galatLiar11C.length === 0 && dipancing11C.length > 0 && dipancing11C.length <= 150 && diLuarDaftar11C.length === 0,
-    `galatLiar=${galatLiar11C.length}${galatLiar11C.length ? ` contoh=${galatLiar11C.slice(0, 3).join(" | ")} LUAR=${konsolAudit.filter((baris) => baris.startsWith("[LUAR]")).slice(0, 4).join(" || ")}` : ""} dipancing=${dipancing11C.length} diLuarDaftar=${diLuarDaftar11C.length} hitung=${JSON.stringify(dipancing11C.reduce((peta, baris) => { const jalur = (baris.match(/\[(.*?)\]/) || [])[1] || baris; peta[jalur] = (peta[jalur] || 0) + 1; return peta; }, {}))} jalur=${[...new Set(dipancing11C.map((baris) => (baris.match(/\[(.*?)\]/) || [])[1] || baris))].slice(0, 12).join(", ")}`);
+    // menentukan lulus bukan angkanya, melainkan "tidak ada galat liar" + "setiap pemaafan punya bukti".
+    galatLiar11C.length === 0 && dipancing11C.length > 0 && dipancing11C.length <= 150 && pancingTanpaBukti11C.length === 0,
+    `galatLiar=${galatLiar11C.length}${galatLiar11C.length ? ` contoh=${galatLiar11C.slice(0, 3).join(" | ")} LUAR=${konsolAudit.filter((baris) => baris.startsWith("[LUAR]")).slice(0, 4).join(" || ")}` : ""} dipancing=${dipancing11C.length} tanpaBuktiJaringan=${pancingTanpaBukti11C.length}${pancingTanpaBukti11C.length ? ` contoh=${JSON.stringify(pancingTanpaBukti11C.slice(0, 3).map((item) => `${item.kode} ${item.jalur}`))}` : ""} hitung=${JSON.stringify(ringkas11C)}`);
+  check("setiap jawaban 5xx dari server sudah dideklarasikan sebagai galat yang sengaja dipancing (kode + jalur + bukti)",
+    jawaban5xxLiar.length === 0 && pancing5xx11C.length > 0 && pancing5xx11C.length <= jawaban5xx11C.length,
+    `5xxJaringan=${jawaban5xx11C.length} dideklarasikan=${jawaban5xxDideklarasikan.length} liar=${jawaban5xxLiar.length}${jawaban5xxLiar.length ? ` contoh=${jawaban5xxLiar.slice(0, 3).join(" | ")}` : ""} dimaafkan=${pancing5xx11C.length} bukti=${jalur5xxDideklarasikan.map((item) => `${item.kode5xx.join("/")} ${item.jalur5xx}`).join(" | ")}`);
+  console.log(`INFO 11C-galat-dimaafkan=${pancing11C.length} 5xx=${pancing5xx11C.length} hitung=${JSON.stringify(ringkas11C)}`);
 
   const adminCalls = apiCalls.filter((line) => line.startsWith("403"));
   check("tidak ada halaman yang ditolak server karena peran (akun uji adalah admin platform)",
@@ -3027,7 +3576,32 @@ try {
   child.stderr?.destroy();
 }
 
+// Galat halaman (pageerror) dicetak LENGKAP: pesan + jejak + halaman. Tanpa ini, penyebabnya hanya
+// terbaca sebagai satu baris di daftar galat konsol, padahal bukti yang menentukan ada di jejaknya.
+if (galatHalaman.length > 0) {
+  console.log(`INFO galat-halaman=${galatHalaman.length}`);
+  for (const item of galatHalaman) {
+    console.log(`INFO   pesan=${String(item.pesan).slice(0, 200)} | jejak=${String(item.jejak).slice(0, 300)} | halaman=${item.halaman}`);
+  }
+}
+// PERBAIKAN KEJUJURAN (26 Sep 2026): sebelum ini kode keluar hanya melihat `failed`, dan penyebut
+// ringkasan (`passed + failed`) tidak memuat skip — jadi pemeriksaan yang DILEWATI tidak pernah bisa
+// memerahkan gerbang. Sekarang skip tanpa alasan jujur dihitung sebagai kegagalan, dan penyebutnya
+// memuat semua titik yang berbunyi.
+if (skipsTanpaAlasan.length > 0) {
+  failed += 1;
+  failures.push(`skip tanpa alasan jujur (${skipsTanpaAlasan.length}): ${skipsTanpaAlasan.join(", ")}`);
+}
+console.log(`SKIP-TOTAL ${skips.length} (tanpa alasan jujur: ${skipsTanpaAlasan.length}; menunggu rute API: ${skipRute.length})`);
 for (const item of skips) console.log(`SKIP-TOTAL ${item}`);
-console.log(`wave10-ui: ${passed}/${passed + failed} lulus, gagal ${failed}, skip ${skips.length}`);
+// Rute yang belum ada dilaporkan TERPISAH dan lengkap (jalur + jawaban server), supaya "lulus karena
+// rutenya tidak ada" tidak pernah terbaca sebagai bukti. Jumlah 0 berarti semua rute yang diperiksa ada.
+for (const item of skipRute) console.log(item);
+console.log(`SKIP-RUTE ${skipRute.length}`);
+// Waktu ubah bundel ikut dicetak: tanpa ini, "hijau" tidak bisa dibedakan antara bundel segar dan
+// bundel basi (lihat Penjaga bundel basi di awal berkas).
+const capWaktuDist = waktuDist === null ? "tidak diketahui" : new Date(waktuDist).toISOString();
+console.log(`BUNDEL ${labelDist} diubah ${capWaktuDist} (${sumberLebihBaru.length === 0 ? "segar terhadap berkas sumber" : `BASI: ${sumberLebihBaru.length} berkas sumber lebih baru`})`);
+console.log(`wave10-ui: ${passed}/${passed + failed} lulus, gagal ${failed}, skip ${skips.length} dari ${passed + failed + skips.length} titik yang berbunyi (tanpa alasan jujur ${skipsTanpaAlasan.length}; ${skipRute.length} menunggu rute API)`);
 if (failed > 0) { console.log(`UI_E2E_FAILED ${failures.join(" | ")}`); process.exit(1); }
 console.log("UI_E2E_PASSED");

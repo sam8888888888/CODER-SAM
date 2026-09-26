@@ -523,14 +523,18 @@ check("9f. baris galat menyimpan pengguna yang sedang memanggil (user_id terisi)
   Boolean(barisServer) && barisServer!.userId === ownerId, `userId=${barisServer?.userId}`);
 
 // Penyaringan langsung pada fungsinya: semua pola rahasia wajib hilang sebelum disimpan.
-const pesanKotor = 'Gagal klaim untuk Bearer abcdefGHIJK1234567890xyz; password=RahasiaSangat123; SECRETS_KEY=zzz999; api_key=KEYABC123456; sk-abcdef123456; isi enc:v1:QUJDREVGRA==';
+// `kunciApi` meniru kunci API platform yang sebenarnya (`apikeys.ts`: `ck_` + 20 bita heksadesimal).
+// Sebelum perbaikan audit, kunci bentuk ini LEWAT utuh karena garis bawah bukan pemisah kata.
+const kunciApi = `ck_${"ab12".repeat(10)}`;
+const pesanKotor = `Gagal klaim untuk Bearer abcdefGHIJK1234567890xyz; password=RahasiaSangat123; SECRETS_KEY=zzz999; api_key=KEYABC123456; sk-abcdef123456; isi enc:v1:QUJDREVGRA==; kunci ${kunciApi}; tanpa label ${kunciApi}`;
 errorsMod.recordErrorEvent({ kind: "uji", code: "UJI_RAHASIA", message: pesanKotor, runId: null, userId: ownerId });
 const barisUji = db.prepare("SELECT id, kind, code, message, user_id AS userId FROM error_events WHERE code='UJI_RAHASIA' ORDER BY rowid DESC LIMIT 1").get() as any;
-check("9g. recordErrorEvent menyaring Bearer, password=, SECRETS_KEY=, api_key=, sk-, dan enc:v1:",
+check("9g. recordErrorEvent menyaring Bearer, password=, SECRETS_KEY=, api_key=, sk-, enc:v1:, dan kunci ck_:",
   Boolean(barisUji)
   && !barisUji.message.includes("abcdefGHIJK1234567890xyz") && !barisUji.message.includes("RahasiaSangat123")
   && !barisUji.message.includes("zzz999") && !barisUji.message.includes("KEYABC123456")
   && !barisUji.message.includes("sk-abcdef123456") && !barisUji.message.includes("QUJDREVGRA==")
+  && !barisUji.message.includes(kunciApi)
   && barisUji.message.includes("[disunting]"),
   short(barisUji?.message, 300));
 check("9h. penyaringan tidak menghapus bagian pesan yang tidak rahasia (pesan tetap bisa dibaca)",

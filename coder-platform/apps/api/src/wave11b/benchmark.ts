@@ -18,6 +18,11 @@
  * Catatan uang (diputuskan sendiri, dilaporkan ke lead): `cost_micros` yang disimpan dan
  * dikembalikan adalah HARGA JUAL (`run_usage.sell_cost_micros`), sama seperti perkiraan butir 56.
  * Harga dasar (modal) tersedia lewat `biayaDasarMicros`.
+ *
+ * Perbaikan audit Wave 11 (temuan F7 butir 61): biaya satu pasangan dibaca dari BARIS `run_usage`
+ * milik pasangan itu (`WHERE id=?`), bukan `SUM(sell_cost_micros) WHERE run_id=?`. Sebelum
+ * perbaikan, karena satu `run_id` dipakai semua pasangan, angka yang tersimpan = biaya kumulatif
+ * (laporan 5690 micros padahal biaya sebenarnya 404 micros), dan ringkasan per model ikut membengkak.
  */
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -202,8 +207,14 @@ export function skorKesepakatan(jawaban: string[], indeks: number): number | nul
 
 type PemakaianBenchmark = { runId: string; projectId: string; userId: string; model: string; prompt: string; answer: string; usage: unknown };
 
-/** Menulis satu baris `run_usage` per panggilan mesin, dengan aturan yang sama seperti run biasa. */
-function catatPemakaian(input: PemakaianBenchmark): void {
+/**
+ * Menulis satu baris `run_usage` per panggilan mesin, dengan aturan yang sama seperti run biasa.
+ *
+ * Mengembalikan id baris yang baru ditulis. Satu `run_id` dipakai bersama SEMUA pasangan
+ * (model x soal), jadi biaya satu pasangan hanya boleh dibaca dari barisnya sendiri; membaca
+ * `SUM(...) WHERE run_id=?` akan menumpuk biaya pasangan sebelumnya (audit Wave 11 butir 61, F7).
+ */
+function catatPemakaian(input: PemakaianBenchmark): string {
   const dilaporkan = input.usage && typeof input.usage === "object" ? input.usage as Record<string, unknown> : null;
   const adaToken = typeof dilaporkan?.inputTokens === "number" || typeof dilaporkan?.outputTokens === "number";
   const inputTokens = adaToken ? Math.round(Number(dilaporkan?.inputTokens ?? 0)) : estimateTokensFromChars(input.prompt.length);
@@ -212,13 +223,15 @@ function catatPemakaian(input: PemakaianBenchmark): void {
   const model = typeof dilaporkan?.model === "string" && dilaporkan.model ? dilaporkan.model : input.model;
   const quote = quoteCosts(model, { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
   const biayaDasar = !adaToken ? null : (typeof dilaporkan?.costMicros === "number" ? Math.round(Number(dilaporkan.costMicros)) : quote.baseMicros);
+  const idBaris = randomUUID();
   db.prepare(`INSERT INTO run_usage (id,run_id,project_id,model,provider,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost_micros,sell_cost_micros,estimated,raw_json,created_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-    randomUUID(), input.runId, input.projectId, model, priceView(model).provider ?? config.PRIME_AGENT_PROVIDER ?? null,
+    idBaris, input.runId, input.projectId, model, priceView(model).provider ?? config.PRIME_AGENT_PROVIDER ?? null,
     inputTokens, outputTokens, 0, 0, totalTokens, biayaDasar, sellForBaseMicros(biayaDasar, quote.markup),
     adaToken ? 0 : 1, dilaporkan ? JSON.stringify(dilaporkan.raw ?? null).slice(0, 4000) : null, new Date().toISOString(),
   );
   chargeQuota(input.userId, totalTokens);
+  return idBaris;
 }
 
 type HasilSatuPanggilan = { answer: string; costMicros: number; baseMicros: number; latencyMs: number; errorCode: string | null; modelDipakai: string };
@@ -251,9 +264,12 @@ async function panggilSatu(input: { userId: string; runId: string; projectId: st
         return { text: potongan, usage: pemakaian };
       },
     });
-    catatPemakaian({ runId: input.runId, projectId: input.projectId, userId: input.userId, model: hasil.model, prompt, answer: hasil.text, usage: hasil.usage });
+    const idBarisUsage = catatPemakaian({ runId: input.runId, projectId: input.projectId, userId: input.userId, model: hasil.model, prompt, answer: hasil.text, usage: hasil.usage });
     // Biaya dibaca kembali dari tabel setelah barisnya ditulis, supaya angkanya berasal dari basis data.
-    const biaya = db.prepare("SELECT COALESCE(SUM(cost_micros),0) AS baseMicros, COALESCE(SUM(sell_cost_micros),0) AS sellMicros, COALESCE(SUM(created_at),'') AS terakhir FROM run_usage WHERE run_id=?").get(input.runId) as { baseMicros: number; sellMicros: number };
+    // Dibaca PER BARIS (`WHERE id=?`), bukan `SUM(...) WHERE run_id=?`: run ini menampung semua
+    // pasangan, jadi SUM akan menumpuk biaya pasangan sebelumnya ke pasangan yang sedang dihitung
+    // (audit Wave 11 butir 61 F7: laporan 5690 micros vs 404 micros sebenarnya).
+    const biaya = db.prepare("SELECT COALESCE(cost_micros,0) AS baseMicros, COALESCE(sell_cost_micros,0) AS sellMicros, created_at AS terakhir FROM run_usage WHERE id=?").get(idBarisUsage) as { baseMicros: number; sellMicros: number; terakhir: string };
     return { answer: hasil.text, costMicros: biaya.sellMicros, baseMicros: biaya.baseMicros, latencyMs: Date.now() - jamMulai, errorCode: null, modelDipakai: hasil.model };
   } catch (galat) {
     const pesan = galat instanceof Error ? galat.message : "ENGINE_FAILED";
@@ -365,6 +381,8 @@ export function registerBenchmarkRoutes(app: any): void {
     const now = new Date().toISOString();
     // Satu baris `runs` menandai SATU benchmark; tiap pasangan menulis barisnya sendiri di run_usage
     // (kolom run_usage.project_id wajib terisi, jadi benchmark memakai proyek pertama milik pengguna).
+    // Karena `run_id` dipakai bersama, biaya tiap pasangan dibaca dari baris run_usage pasangan itu
+    // sendiri (lihat `panggilSatu`), bukan dari jumlah seluruh run.
     db.prepare("INSERT INTO runs (id,project_id,status,prompt,model,created_at) VALUES (?,?,?,?,?,?)")
       .run(runId, anchor.projectId, "running", promptRunBenchmark(benchmarkRunId, models.length, soal.length), models[0] ?? null, now);
     db.prepare(`INSERT INTO benchmark_runs (id,user_id,status,model_list,question_count,estimated_cost_micros,cost_micros,created_at,finished_at)

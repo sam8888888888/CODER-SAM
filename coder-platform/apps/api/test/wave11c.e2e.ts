@@ -208,7 +208,8 @@ try {
   const buatTanpaSambungan = await akunA.call("POST", `${jalur}/pages`, { title: "Halaman tanpa sambungan" });
   u.check("DELETE: sambungan dilepas", putus.status === 200 && putus.json?.deleted === true && putus.json?.provider === "notion", `status=${putus.status} ${potong(putus.json)}`);
   u.check("setelah DELETE: terpasang=false dan barisnya hilang", setelahPutus.json?.integration?.terpasang === false && jumlah("SELECT COUNT(*) AS n FROM user_integrations WHERE user_id=? AND provider='notion'", userId) === 0, potong(setelahPutus.json?.integration?.terpasang));
-  u.check("DELETE kedua: 404 NOTION_NOT_CONNECTED", putusLagi.status === 404 && putusLagi.json?.error === "NOTION_NOT_CONNECTED", `status=${putusLagi.status} ${potong(putusLagi.json)}`);
+  // PRD butir 68: keadaan "belum tersambung" dijawab 409 (keadaan), bukan 404 (alamat).
+  u.check("DELETE kedua tanpa sambungan: 409 NOTION_NOT_CONNECTED", putusLagi.status === 409 && putusLagi.json?.error === "NOTION_NOT_CONNECTED", `status=${putusLagi.status} ${potong(putusLagi.json)}`);
   u.check("POST pages tanpa sambungan: 409 NOTION_NOT_CONNECTED", buatTanpaSambungan.status === 409 && buatTanpaSambungan.json?.error === "NOTION_NOT_CONNECTED", `status=${buatTanpaSambungan.status} ${potong(buatTanpaSambungan.json)}`);
 
   // §15 Tanpa SECRETS_KEY: 503, dan tidak ada teks polos yang ditulis.

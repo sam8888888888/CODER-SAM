@@ -15,7 +15,9 @@
  *
  * Dua pembaca konfigurasi sengaja membaca `process.env` lebih dulu dengan bawaan `config.*`
  * (`BOT_GROUP_ENABLED`, `BOT_REPLY_MAX_CHARS`), supaya bendera itu bisa dibuktikan berubah di dalam
- * satu proses uji tanpa memuat ulang modul. Sisanya memakai `config.*` apa adanya.
+ * satu proses uji tanpa memuat ulang modul. PENGERASAN: jalur env-first itu hanya hidup di LUAR
+ * produksi — saat `NODE_ENV=production` yang berlaku `config.*` (lihat `knobUjiHidup`). Sisanya
+ * memakai `config.*` apa adanya.
  */
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { db } from "../db.js";
@@ -100,16 +102,29 @@ export function teksSamaAman(a: string, b: string): boolean {
   return timingSafeEqual(x, y);
 }
 
-/** Bendera grup: nilai proses lebih dulu, lalu bawaan config (lihat catatan berkas ini). */
-export function botGroupEnabled(): boolean {
-  const mentah = process.env.BOT_GROUP_ENABLED;
+/**
+ * Jalur "nilai proses lebih dulu" di bawah adalah KNOB UJI: hanya untuk suite/lokal supaya bendera bisa
+ * berubah di dalam satu proses tanpa memuat ulang modul. DI PRODUKSI (`NODE_ENV=production`) jalur itu
+ * MATI: yang berlaku selalu `config` (skema tervalidasi), supaya satu variabel lingkungan tidak bisa
+ * diam-diam mengubah perilaku bot. `env` bisa diberikan pemanggil (pola sama seperti `connectorLimits`)
+ * sehingga perilaku produksi bisa diuji tanpa mengubah lingkungan proses.
+ */
+function knobUjiHidup(env: NodeJS.ProcessEnv): boolean {
+  return (env.NODE_ENV ?? process.env.NODE_ENV) !== "production";
+}
+
+/** Bendera grup: di luar produksi nilai proses lebih dulu, lalu bawaan config (lihat catatan di atas). */
+export function botGroupEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!knobUjiHidup(env)) return config.BOT_GROUP_ENABLED;
+  const mentah = env.BOT_GROUP_ENABLED;
   if (mentah === undefined) return config.BOT_GROUP_ENABLED;
   return mentah === "true" || mentah === "1";
 }
 
-/** Batas panjang balasan: nilai proses lebih dulu, lalu bawaan config. */
-export function botReplyMaxChars(): number {
-  const angka = Number(process.env.BOT_REPLY_MAX_CHARS);
+/** Batas panjang balasan: di luar produksi nilai proses lebih dulu, lalu bawaan config (catatan di atas). */
+export function botReplyMaxChars(env: NodeJS.ProcessEnv = process.env): number {
+  if (!knobUjiHidup(env)) return config.BOT_REPLY_MAX_CHARS;
+  const angka = Number(env.BOT_REPLY_MAX_CHARS);
   return Number.isFinite(angka) && angka >= 200 ? Math.floor(angka) : config.BOT_REPLY_MAX_CHARS;
 }
 
@@ -120,6 +135,16 @@ export const inboundLimiter = createRateLimiter(
 /** Batas percobaan kode pemasangan per (kanal, external_id): salah terus -> 429. */
 export const linkAttemptLimiter = createRateLimiter(
   { windowMs: 15 * 60_000, max: config.BOT_LINK_MAX_ATTEMPTS }, "bot-link");
+
+/**
+ * Pembatas KEDUA rute pemasangan, dikunci per ALAMAT pemanggil (dipakai `bot-identities.ts`).
+ * Alasan: pembatas per (kanal, external_id) di atas bisa dilewati dengan mengganti `external_id`
+ * setiap percobaan, sedangkan ruang tebakan kode 6 angka hanya 10^6. Yang dihitung HANYA percobaan
+ * yang GAGAL, jadi satu alamat kantor (NAT) tidak terblokir karena pemasangan yang berhasil.
+ */
+export const BOT_LINK_IP_MAX_FAILURES = 20;
+export const linkIpFailureLimiter = createRateLimiter(
+  { windowMs: 15 * 60_000, max: BOT_LINK_IP_MAX_FAILURES }, "bot-link-ip");
 
 /* ------------------------------------------------------------------ pagar akun & kuota */
 

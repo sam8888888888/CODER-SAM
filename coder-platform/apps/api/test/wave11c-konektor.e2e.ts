@@ -34,6 +34,8 @@ const port = await cariPortBebas(7321);
 const dataDir = `/tmp/coder-wave11c-konektor-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 const email = `w11c-konektor-${Date.now()}@example.test`;
 const emailLain = `w11c-konektor-lain-${Date.now()}@example.test`;
+// Akun admin platform: hanya untuk membuktikan rute daftar putih MCP (`PLATFORM_ADMIN_EMAILS`).
+const emailAdmin = `w11c-konektor-admin-${Date.now()}@example.test`;
 const password = "SandiUji2026!aman";
 const kunciSecrets = randomBytes(32).toString("base64");
 
@@ -53,6 +55,7 @@ process.env.DATA_DIR = dataDir;
 process.env.PUBLIC_DIR = `${dataDir}/public`;
 process.env.MOCK_ENGINE = "true";
 process.env.CSRF_STRICT = "true";
+process.env.PLATFORM_ADMIN_EMAILS = emailAdmin;
 process.env.RATE_LIMIT_REGISTER_PER_HOUR = "60";
 process.env.RATE_LIMIT_LOGIN_PER_15MIN = "60";
 process.env.RETENTION_ENABLED = "false";
@@ -67,12 +70,13 @@ await import("../src/server.js");
 const { db, SCHEMA_VERSION } = await import("../src/db.js");
 const { collectUserData } = await import("../src/dataexport.js");
 const { sealSecret } = await import("../src/secrets.js");
-const { savePlatformSetting } = await import("../src/wave11a/shared.js");
 
 const base = `http://127.0.0.1:${port}`;
 const akunA = buatKlien(base);
 const akunB = buatKlien(base);
+const akunAdmin = buatKlien(base);
 const jalur = "/api/v1/connectors";
+const p_admin = "/api/v1/admin/mcp-allowed-tools";
 const jumlah = (sql: string, ...params: unknown[]) => Number((db.prepare(sql).get(...params as any[]) as { n: number })?.n ?? 0);
 const rahasiaSlack = "rahasia-uji-1234";
 const rahasiaMcp = "token-mcp-uji-5678";
@@ -91,6 +95,11 @@ try {
   u.check("akun uji terdaftar", daftar.status === 201 && Boolean(userId), `status=${daftar.status} ${potong(daftar.json)}`);
   await akunB.bootstrap();
   await akunB.call("POST", "/api/v1/auth/register", { email: emailLain, password, displayName: "Akun Lain" });
+  await akunAdmin.bootstrap();
+  const daftarAdmin = await akunAdmin.call("POST", "/api/v1/auth/register", { email: emailAdmin, password, displayName: "Admin Platform" });
+  // Balasan pendaftaran tidak membawa `isAdmin`; sumber kebenarannya `GET /api/v1/auth/me`.
+  const meAdmin = await akunAdmin.call("GET", "/api/v1/auth/me");
+  u.check("akun admin platform terdaftar dan dikenali admin lewat /auth/me", daftarAdmin.status === 201 && meAdmin.status === 200 && meAdmin.json?.user?.isAdmin === true, `daftar=${daftarAdmin.status} me=${meAdmin.status} isAdmin=${meAdmin.json?.user?.isAdmin}`);
 
   // §1 Katalog jujur apa adanya.
   const katalog = await akunA.call("GET", jalur);
@@ -180,8 +189,20 @@ try {
   const kirim2 = await akunA.call("POST", `${jalur}/${slackId}/test`, { teks: "Halo lagi" });
   u.check("aktif kembali: kirim berikutnya 'aktif' dan status baris 'aktif'", aktifkan.json?.konektor?.enabled === true && kirim2.json?.hasil?.status === "aktif" && kirim2.json?.konektor?.status === "aktif" && kirim2.json?.konektor?.lastError === null, potong(kirim2.json?.konektor));
 
-  // §10 Daftar putih alat MCP dari admin platform.
-  savePlatformSetting("mcp_allowed_tools", "kirim_pesan");
+  // §10 Daftar putih alat MCP dari admin platform — lewat RUTE nyata, bukan tulisan langsung ke DB.
+  // Sebelum ada rute ini, `mcp_allowed_tools` tidak punya penulis di produksi (MCP selalu tertutup).
+  const lihatDaftar = await akunAdmin.call("GET", p_admin);
+  u.check("admin: GET daftar putih MCP 200 dan kosong (MCP tertutup)", lihatDaftar.status === 200 && Array.isArray(lihatDaftar.json?.alat) && lihatDaftar.json.alat.length === 0 && lihatDaftar.json?.terbuka === false && lihatDaftar.json?.batas?.maksimalAlat > 0, `status=${lihatDaftar.status} ${potong(lihatDaftar.json)}`);
+  const bukanAdminGet = await akunA.call("GET", p_admin);
+  const bukanAdminPut = await akunA.call("PUT", p_admin, { alat: ["kirim_pesan"] });
+  u.check("pengguna biasa tidak boleh membaca atau menulis daftar putih MCP (403 ADMIN_REQUIRED)", bukanAdminGet.status === 403 && bukanAdminPut.status === 403 && bukanAdminGet.json?.error === "ADMIN_REQUIRED" && bukanAdminPut.json?.error === "ADMIN_REQUIRED", `get=${bukanAdminGet.status} put=${bukanAdminPut.status}`);
+  const daftarSalahBentuk = await akunAdmin.call("PUT", p_admin, { alat: "kirim_pesan" });
+  const daftarNamaBuruk = await akunAdmin.call("PUT", p_admin, { alat: ["Kirim Pesan!"] });
+  u.check("bentuk salah dan nama alat tidak sah ditolak 400 MCP_ALLOWED_TOOLS_INVALID", daftarSalahBentuk.status === 400 && daftarNamaBuruk.status === 400 && daftarNamaBuruk.json?.error === "MCP_ALLOWED_TOOLS_INVALID" && (daftarNamaBuruk.json?.ditolak ?? []).includes("kirim pesan!"), `bentuk=${daftarSalahBentuk.status} nama=${daftarNamaBuruk.status} ${potong(daftarNamaBuruk.json)}`);
+  const tulisDaftar = await akunAdmin.call("PUT", p_admin, { alat: ["Kirim_Pesan", "kirim_pesan", "baca_berkas"] });
+  const auditDaftar = jumlah("SELECT COUNT(*) AS n FROM audit_events WHERE action='admin.mcp_allowed_tools_updated' AND actor_user_id=(SELECT id FROM users WHERE email=?)", emailAdmin);
+  u.check("admin menulis daftar putih: 200, nama dinormalkan, tanpa duplikat, dan tercatat di audit", tulisDaftar.status === 200 && tulisDaftar.json?.alat?.join(",") === "kirim_pesan,baca_berkas" && tulisDaftar.json?.terbuka === true && auditDaftar >= 1, `status=${tulisDaftar.status} alat=${tulisDaftar.json?.alat} audit=${auditDaftar}`);
+  u.check("kolom pengaturan menyimpan tepat daftar yang dilaporkan rute", String((db.prepare("SELECT value FROM platform_settings WHERE key='mcp_allowed_tools'").get() as any)?.value ?? "") === "kirim_pesan,baca_berkas", potong((db.prepare("SELECT value FROM platform_settings WHERE key='mcp_allowed_tools'").get() as any)?.value));
   const mcpTerbuka = await akunA.call("GET", jalur);
   u.check("katalog MCP 'siap' setelah admin menulis daftar putih", (mcpTerbuka.json?.katalog ?? []).find((item: any) => item.kind === "mcp")?.status === "siap" && mcpTerbuka.json?.pengaturan?.mcpTerbuka === true, potong(mcpTerbuka.json?.pengaturan));
   const buatMcp = await akunA.call("POST", jalur, { kind: "mcp", url: urlMcp(), alat: ["kirim_pesan"], token: rahasiaMcp, nama: "Alat Uji" });
@@ -196,8 +217,9 @@ try {
   u.check("kirim MCP berhasil dan memakai bentuk tools/call", kirimMcp.json?.hasil?.status === "aktif" && badanMcp?.jsonrpc === "2.0" && badanMcp?.method === "tools/call" && badanMcp?.params?.name === "kirim_pesan", potong(badanMcp));
   u.check("token MCP dikirim sebagai Bearer hanya ke hulu", String(mock.terakhirHeader["/mcp/" + rahasiaMcp]?.authorization ?? "") === `Bearer ${rahasiaMcp}` && !kirimMcp.text.includes(rahasiaMcp), potong(mock.terakhirHeader["/mcp/" + rahasiaMcp]?.authorization));
 
-  // §12 Daftar putih dicabut: kirim berikutnya ditolak tanpa memanggil hulu.
-  savePlatformSetting("mcp_allowed_tools", "");
+  // §12 Daftar putih dicabut lewat rute admin: kirim berikutnya ditolak tanpa memanggil hulu.
+  const cabutDaftar = await akunAdmin.call("PUT", p_admin, { alat: [] });
+  u.check("admin mengosongkan daftar putih: 200 dan MCP tertutup lagi", cabutDaftar.status === 200 && cabutDaftar.json?.terbuka === false && (cabutDaftar.json?.alat ?? []).length === 0, `status=${cabutDaftar.status} ${potong(cabutDaftar.json)}`);
   const sebelumCabut = mock.hitungan.total ?? 0;
   const kirimCabut = await akunA.call("POST", `${jalur}/${mcpId}/test`, { teks: "sesudah dicabut" });
   const viewMcl = (await akunA.call("GET", jalur)).json?.konektor?.find((item: any) => item.id === mcpId);
@@ -231,6 +253,21 @@ try {
   const sesudahPulih = await akunA.call("GET", jalur);
   const viewMcpPulih = (sesudahPulih.json?.konektor ?? []).find((item: any) => item.id === mcpId);
   u.check("kunci pulih: konfigurasi MCP bisa dibuka lagi", viewMcpPulih?.tautan?.bisaDibuka === true && viewMcpPulih?.tautan?.host === "127.0.0.1", potong(viewMcpPulih?.tautan));
+
+  // §17 Batas laju kirim/uji per pengguna (tabel `rate_limit_hits`).
+  // Diperiksa paling akhir karena kuota akun ini terpakai oleh bagian-bagian sebelumnya.
+  let diizinkanLaju = 0;
+  let ditolakLaju = 0;
+  for (let i = 0; i < 20; i += 1) {
+    const coba = await akunA.call("POST", `${jalur}/${mcpId}/test`, { teks: `banjir ${i}` });
+    if (coba.status === 429 && coba.json?.error === "CONNECTOR_TEST_RATE_LIMITED") {
+      ditolakLaju += 1;
+      u.check("kiriman ke-13 dalam jendela ditolak 429 dengan sisa waktu tunggu", Number(coba.json?.retryAfter) > 0,potong(coba.json));
+      break;
+    }
+    diizinkanLaju += 1;
+  }
+  u.check("batas laju kirim/uji bekerja: tidak lebih dari 12 kiriman diizinkan lalu 429", ditolakLaju === 1 && diizinkanLaju <= 12, `diizinkan=${diizinkanLaju} ditolak=${ditolakLaju}`);
 
   keluar = u.failed === 0 ? 0 : 1;
 } catch (error) {

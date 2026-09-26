@@ -82,10 +82,13 @@ import { resolveSessionPersona } from "./wave11b/behavior-matrix.js";
 import { recordErrorEvent } from "./wave11b/errors.js";
 import { learningBlocks, touchLearnings } from "./wave11b/learnings.js";
 import { recordShadowMeasurements, shadowModeActive } from "./wave11b/shadow.js";
-import { markInterruptedRuns, markRunResumable } from "./wave11b/resume.js";
+import { attemptAutoResumes, markInterruptedRuns, markRunResumable } from "./wave11b/resume.js";
 import { runDueSchedules } from "./wave11b/schedules.js";
 /** Wave 11A (butir 42/45/46/51/52/80): mode, guard, guardrail, skill, KB, dan pagar konteks. */
 import { agentModeBlocks, conversationAgentMode } from "./wave11a/mode.js";
+/** Wave 11A (butir 47): satu aturan validasi daftar alat untuk SEMUA pintu tulis `agent_settings.tools_allow`. */
+import { parseToolsAllow as uraiDaftarAlat, toolsAllowState } from "./wave11a/tools-policy.js";
+import { audit as auditCatat } from "./wave11a/shared.js";
 import { guardrailBlockFor, guardrailViolations, recordSafetyEvent } from "./wave11a/guardrails.js";
 import { platformKnowledgeBlock } from "./wave11a/knowledge-base.js";
 import { touchUserSkills, userSkillsBlock } from "./wave11a/skills.js";
@@ -906,12 +909,35 @@ function queueRunJob(input: {
  * Stores token usage for a finished run. Usage reported by the engine is stored as-is;
  * when the engine reports nothing, the numbers are marked estimated = 1.
  */
-let modelCache: { at: number; names: string[] } = { at: 0, names: [] };
-/** Accepts a model only when the engine catalogue lists it; the catalogue is cached for five minutes. */
+/**
+ * Wave 11A (butir 57, diperbaiki 26 Sep 2026): daftar model yang dikenal adalah HIMPUNAN yang hanya
+ * bertambah, bukan salinan jawaban terakhir.
+ *
+ * Sebabnya terukur: `prime-agent model list` bertanya ke penyedia, jadi satu jawaban bisa tidak
+ * lengkap (penyedia lambat, keluaran terpotong saat mesin sibuk). Dulu jawaban tidak lengkap itu
+ * menimpa daftar lama, sehingga model yang sah ditolak `400 UNKNOWN_MODEL` — persis yang terjadi pada
+ * satu jalan suite `wave11a.e2e.ts` tanggal 26 Sep 2026 saat peramban uji berjalan bersamaan
+ * (`/workspace/outputs/w11a_57_run.log`, 12h/12n), lalu hilang pada jalan berikutnya.
+ * Model yang sudah dikenal karena itu tidak boleh "dilupakan" oleh jawaban yang lebih pendek.
+ */
+let modelCache: { at: number; names: Set<string>; bare: Set<string> } = { at: 0, names: new Set(), bare: new Set() };
+/** Nama tanpa awalan penyedia: CLI menulis `deepseek-v4-flash` di satu penyedia dan `z-ai/glm-4.7-flash` di penyedia lain. */
+const namaDasarModel = (model: string) => model.trim().split("/").pop()!.toLowerCase();
+function muatKatalogModel(): { at: number; names: Set<string>; bare: Set<string> } {
+  for (const row of engineModelCatalogue().models) {
+    if (!row.model) continue;
+    modelCache.names.add(row.model);
+    modelCache.bare.add(namaDasarModel(row.model));
+  }
+  modelCache.at = Date.now();
+  return modelCache;
+}
+/** Accepts a model when the engine catalogue lists it exactly or by its bare name; cached five minutes. */
 function isKnownModel(model: string): boolean {
-  if (Date.now() - modelCache.at > 300_000) modelCache = { at: Date.now(), names: engineModelCatalogue().models.map((row) => row.model) };
-  if (!modelCache.names.length) return true;
-  return modelCache.names.includes(model);
+  if (Date.now() - modelCache.at > 300_000) muatKatalogModel();
+  if (!modelCache.names.size) return true; // katalog kosong = tidak ada bahan pembanding, jadi semua diterima
+  const nama = model.trim();
+  return modelCache.names.has(nama) || modelCache.bare.has(namaDasarModel(nama));
 }
 
 function providerForModel(model: string): string | undefined {
@@ -1009,7 +1035,17 @@ async function executeRun(runId: string, projectId: string, prompt: string, conv
             if (event.type !== "completed") publishRunEvent(runId, event.type, event.data);
             if (event.type === "text") attemptText += typeof event.data === "string" ? event.data : JSON.stringify(event.data);
             if (event.type === "completed") attemptUsage = (event.data as { usage?: unknown })?.usage ?? null;
-            if (event.type === "failed") throw new Error(String((event.data as { message?: string })?.message ?? "ENGINE_FAILED"));
+            // Wave 11A (butir 57, ditutup 26 Sep 2026): kode galat mesin WAJIB ikut, bukan hanya
+            // pesannya. Mesin sungguhan sering mengirim `code` tanpa pesan (`RPC_FRAME_TOO_LARGE`)
+            // atau pesan yang tidak memuat kelasnya (`ENGINE_EXITED` -> "Prime Agent exited with 1"),
+            // sehingga membuang `code` membuat galat koneksi tidak pernah memicu model cadangan.
+            if (event.type === "failed") {
+              const galatMesin = (event.data ?? {}) as { code?: unknown; message?: unknown };
+              const kodeMesin = typeof galatMesin.code === "string" ? galatMesin.code.trim() : "";
+              const pesanMesin = typeof galatMesin.message === "string" ? galatMesin.message.trim() : "";
+              const kodeUntukKlasifikasi = kodeMesin && pesanMesin && pesanMesin.startsWith(kodeMesin) ? pesanMesin : [kodeMesin, pesanMesin].filter(Boolean).join(": ");
+              throw new Error(kodeUntukKlasifikasi || "ENGINE_FAILED");
+            }
           }
           return { text: attemptText, usage: attemptUsage };
         },
@@ -1775,6 +1811,9 @@ function catalogueFor(force: boolean) {
   }
   const value = readEngineModelCatalogue();
   catalogueCache = { at: Date.now(), value };
+  // `?refresh=1` juga menyegarkan ingatan penjaga nama model, supaya tombol segarkan benar-benar
+  // memperbarui pembanding `isKnownModel` (bukan hanya jawaban rute). Dipakai uji katalog.
+  if (force) { modelCache.at = 0; muatKatalogModel(); }
   return value;
 }
 
@@ -1793,6 +1832,20 @@ app.post<{ Params: { projectId: string }; Body: { name?: string; mimeType?: stri
   const role = project ? membershipRole(project.workspaceId, request.user!.id) : undefined;
   if (!role) return reply.code(404).send({ error: "PROJECT_NOT_FOUND" });
   if (role === "viewer") return reply.code(403).send({ error: "INSUFFICIENT_ROLE" });
+  // Wave 11A (butir 42, ditutup 26 Sep 2026): penegakan MODE DISKUSI di pintu artefak.
+  // Instruksi 【MODE DISKUSI】 hanya mengatur mesin; berkas tetap bisa lahir dari jalur API ini.
+  // Karena itu artefak yang menempel pada satu run diperiksa: run wajib milik proyek ini, dan
+  // percakapannya tidak boleh sedang bermode diskusi ("diskusi dulu, eksekusi setelah disepakati").
+  const runIdBody = request.body?.runId === undefined || request.body?.runId === null ? "" : String(request.body.runId);
+  if (runIdBody) {
+    const runRow = db.prepare("SELECT project_id AS projectId FROM runs WHERE id=?").get(runIdBody) as { projectId?: string } | undefined;
+    if (!runRow || runRow.projectId !== request.params.projectId) return reply.code(400).send({ error: "RUN_NOT_IN_PROJECT", message: "Run itu bukan milik proyek ini." });
+    const percakapanRun = db.prepare("SELECT conversation_id AS conversationId FROM messages WHERE run_id=? ORDER BY created_at DESC LIMIT 1").get(runIdBody) as { conversationId?: string } | undefined;
+    if (conversationAgentMode(percakapanRun?.conversationId ?? null) === "diskusi") {
+      recordAudit(project?.workspaceId ?? null, request.user!.id, "artifact.blocked_diskusi", { projectId: request.params.projectId, runId: runIdBody, conversationId: percakapanRun?.conversationId ?? null });
+      return reply.code(409).send({ error: "DISKUSI_MODE_NO_EXECUTE", message: "Percakapan sedang mode diskusi, jadi berkas tidak dibuat dari run ini. Ubah ke mode eksekusi dulu, lalu jalankan ulang." });
+    }
+  }
   const name = request.body?.name?.trim(); const mimeType = request.body?.mimeType?.trim(); const encoded = request.body?.contentBase64;
   if (!name || !mimeType || !encoded || encoded.length > 14_000_000 || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || name.includes("/") || name.includes("\\")) return reply.code(400).send({ error: "INVALID_ARTIFACT" });
   let content: Buffer; try { content = Buffer.from(encoded, "base64"); } catch { return reply.code(400).send({ error: "INVALID_ARTIFACT_ENCODING" }); }
@@ -2687,6 +2740,7 @@ app.get("/api/v1/agents/settings", { preHandler: requireUser }, async (request: 
 
 app.patch<{ Body: { thinkingLevel?: string; autoCompact?: boolean; compactAfterMessages?: number; toolsAllow?: string; autonomousDefault?: boolean; autonomousMaxTurns?: number; autonomousMaxTokens?: number; fallbackModels?: unknown; modelUtama?: string } }>("/api/v1/agents/settings", { preHandler: requireUser }, async (request: any, reply) => {
   const userId = request.user!.id; const body = request.body ?? {}; const patch: Partial<AgentSettingsRow> = {};
+  let alatDiubah = false;
   if (body.fallbackModels !== undefined) {
     // Wave 11A (butir 57): model cadangan tidak boleh sama dengan model utama, tanpa duplikat, maks 3.
     const primary = String(body.modelUtama ?? config.PRIME_AGENT_MODEL ?? "").trim() || null;
@@ -2704,7 +2758,16 @@ app.patch<{ Body: { thinkingLevel?: string; autoCompact?: boolean; compactAfterM
     if (!Number.isFinite(value) || value < 4 || value > 500) return reply.code(400).send({ error: "INVALID_COMPACT_THRESHOLD", message: "Ambang pemadatan antara 4 dan 500 pesan." });
     patch.compact_after_messages = Math.round(value);
   }
-  if (body.toolsAllow !== undefined) patch.tools_allow = String(body.toolsAllow).trim().slice(0, 400);
+  if (body.toolsAllow !== undefined) {
+    // Butir 47 — dulu baris ini menulis kolom yang sama TANPA validasi dan TANPA catatan audit,
+    // sehingga nama alat apa pun bisa masuk lewat pintu ini (temuan audit 26 Sep 2026) padahal
+    // `PUT /api/v1/tools-policy` memvalidasinya terhadap katalog admin. Sekarang keduanya memakai
+    // pengurai yang sama, dan hasilnya dicatat di jejak audit supaya bisa ditelusuri.
+    const urai = uraiDaftarAlat(body.toolsAllow);
+    if (!urai.ok) return reply.code(400).send({ error: urai.kode, message: urai.pesan, ...(urai.detail ?? {}) });
+    patch.tools_allow = urai.raw;
+    alatDiubah = true;
+  }
   if (body.autonomousDefault !== undefined) patch.autonomous_default = body.autonomousDefault ? 1 : 0;
   if (body.autonomousMaxTurns !== undefined) {
     const value = Number(body.autonomousMaxTurns);
@@ -2716,7 +2779,12 @@ app.patch<{ Body: { thinkingLevel?: string; autoCompact?: boolean; compactAfterM
     if (!Number.isFinite(value) || value < 1000 || value > 500000) return reply.code(400).send({ error: "INVALID_AUTONOMOUS_TOKENS", message: "Batas token antara 1.000 dan 500.000." });
     patch.autonomous_max_tokens = Math.round(value);
   }
-  return { settings: saveAgentSettings(userId, patch) };
+  const settings = saveAgentSettings(userId, patch);
+  if (alatDiubah) {
+    const state = toolsAllowState(settings?.tools_allow ?? patch.tools_allow ?? "");
+    auditCatat(userId, "tool_policy.updated", { mode: state.mode, count: state.tools?.length ?? 0, pintu: "agents_settings" });
+  }
+  return { settings };
 });
 
 /** Honest preview of what the platform will send to the engine for a conversation. */
@@ -3266,6 +3334,21 @@ app.post<{ Body: { prompt?: string; model?: string; thinking?: string; personaId
       recordAudit(null, userId, "prompt_hijack_blocked", { asal: "playground", pola: hijack.pattern, kategori: hijack.category, kutipan: hijack.snippet, panjangPesan: prompt.length });
       return reply.code(400).send({ error: "PROMPT_BLOCKED", message: hijackMessage(hijack.pattern), pola: hijack.pattern, kategori: hijack.category });
     }
+  }
+  // Wave 11A (butir 46): playground dulu hanya memasang pengaman prompt-hijack, sedangkan aturan
+  // larangan akun (`guardrail_rules`) DILEWATI — jalan pintas yang sama seperti jalur jadwal sebelum
+  // diperbaiki. Sekarang ketiga jalur (chat, run langsung, playground) memakai penjaga yang sama.
+  const pelanggaranPlayground = guardrailViolations(userId, prompt);
+  if (pelanggaranPlayground.length) {
+    for (const hit of pelanggaranPlayground) {
+      recordSafetyEvent({ userId, ruleId: hit.rule.id, pattern: hit.pattern, snippet: prompt });
+      recordAudit(null, userId, "safety_violation", { asal: "playground", ruleId: hit.rule.id, judul: hit.rule.title, pola: hit.pattern, kutipan: prompt.replace(/\s+/g, " ").slice(0, 200) });
+    }
+    return reply.code(400).send({
+      error: "GUARDRAIL_BLOCKED",
+      message: `Permintaan ini dilarang aturan "${pelanggaranPlayground[0].rule.title}". Aksi tidak dijalankan.`,
+      aturan: pelanggaranPlayground.map((hit) => ({ id: hit.rule.id, title: hit.rule.title, pola: hit.pattern })),
+    });
   }
   const settings = agentSettings(userId);
   const thinking = isThinkingLevel(request.body?.thinking) ? String(request.body?.thinking) : settings.thinking_level;
@@ -4651,8 +4734,12 @@ function registerBackgroundHandlers() {
   // Wave 11C butir 82: pengiriman konektor berjalan di proses pekerja terpisah.
   registerConnectorJobHandlers();
   registerJobHandler("resume.scan", async () => {
-    const marked = markInterruptedRuns();
-    return { marked };
+    // Butir 63: pemindai ini dulu HANYA menandai run putus, sedangkan percobaan lanjutan otomatis
+    // (`attemptAutoResumes`, dibatasi `config.RESUME_MAX_AUTO_ATTEMPTS` = 1) tidak pernah dipanggil
+    // siapa pun di produksi — kalimat PRD "maksimal 1 percobaan otomatis" praktis mati (temuan audit
+    // 26 Sep 2026). Sekarang pemindai menandai SEKALIGUS menjalankan percobaan yang diizinkan itu.
+    const laporan = await attemptAutoResumes();
+    return { marked: laporan.tandaiBaru, diperiksa: laporan.diperiksa, dilanjutkan: laporan.dilanjutkan.length, dilewati: laporan.dilewati.length };
   });
 }
 

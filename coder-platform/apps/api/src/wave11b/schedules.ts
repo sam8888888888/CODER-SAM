@@ -9,12 +9,18 @@
  * - Perilaku saat percakapan mode diskusi mengikuti matriks perilaku butir 83 ①: jadwal DILEWATI,
  *   tidak ada run, tidak ada biaya — bukan "tetap jalan lalu ditolak".
  * - Penanda otonom hanya dari kolom `autonomous` jadwal (butir 83 ②).
+ * - Butir 45/46 berlaku juga DI SINI: prompt jadwal diperiksa `scanPromptHijack` dan
+ *   `guardrailViolations` sebelum run dibuat, sama seperti jalur chat. Tanpa itu, jadwal menjadi
+ *   jalan pintas yang melewati dua penjaga keamanan. Pemeriksaan ditaruh paling depan supaya prompt
+ *   berbahaya tetap tercatat di audit walau jadwalnya sebenarnya dilewati karena alasan lain.
  */
 import { randomUUID } from "node:crypto";
 import { db } from "../db.js";
 import { config } from "../config.js";
 import { describeCron, nextCronRun, validateCronExpression } from "../cron.js";
 import { requireUser } from "../auth.js";
+import { hijackMessage, scanPromptHijack } from "../prompt-guard.js";
+import { guardrailViolations, recordSafetyEvent } from "../wave11a/guardrails.js";
 import { audit, fail, mayWrite } from "../wave11a/shared.js";
 import { createRunAndDispatch, isKnownModelName, isThinkingLevelName, projectOfConversation } from "./dispatch.js";
 
@@ -112,8 +118,50 @@ function resolveTargets(userId: string, projectId?: string | null, conversationI
   return { projectId: project, conversationId: null };
 }
 
+/**
+ * Wave 11A (butir 45/46) pada jalur jadwal: penjaga yang sama dengan jalur chat.
+ *
+ * Prompt jadwal disimpan pemakainya dan dijalankan berulang tanpa pengawasan, jadi jalan pintas di
+ * sini lebih berbahaya daripada di chat: satu jadwal nakal akan mencoba lagi setiap kali jatuh tempo.
+ * Pemeriksaan mengembalikan sebab pembatalan (`PROMPT_BLOCKED` / `GUARDRAIL_BLOCKED`) atau null bila
+ * prompt lolos. Semua pembatalan dicatat: jejak hijack lewat `prompt_hijack_blocked` (sama seperti
+ * chat), pelanggaran larangan lewat `safety_violation` + tabel `safety_events` (halaman Safety).
+ */
+function promptBlockFor(row: ScheduleRow, mode: "terjadwal" | "manual"): { alasan: string; catatan: string } | null {
+  if (config.PROMPT_GUARD_ENABLED) {
+    const hijack = scanPromptHijack(row.prompt);
+    if (hijack.blocked) {
+      audit(row.userId, "prompt_hijack_blocked", {
+        scheduleId: row.id, jalur: "jadwal", mode, pola: hijack.pattern, kategori: hijack.category,
+        kutipan: hijack.snippet, panjangPesan: row.prompt.length,
+      });
+      return { alasan: "PROMPT_BLOCKED", catatan: hijackMessage(hijack.pattern) };
+    }
+  }
+  const pelanggaran = guardrailViolations(row.userId, row.prompt);
+  if (pelanggaran.length) {
+    for (const hit of pelanggaran) {
+      recordSafetyEvent({ userId: row.userId, ruleId: hit.rule.id, pattern: hit.pattern, snippet: row.prompt });
+      audit(row.userId, "safety_violation", {
+        scheduleId: row.id, jalur: "jadwal", mode, ruleId: hit.rule.id, judul: hit.rule.title, pola: hit.pattern,
+      });
+    }
+    return {
+      alasan: "GUARDRAIL_BLOCKED",
+      catatan: `Permintaan ini dilarang aturan "${pelanggaran[0].rule.title}". Aksi tidak dijalankan.`,
+    };
+  }
+  return null;
+}
+
 /** Membuat run untuk satu jadwal, dengan aturan matriks butir 83 sudah diperiksa pemanggil. */
 async function runSchedule(row: ScheduleRow, now: Date, mode: "terjadwal" | "manual"): Promise<{ dijalankan: boolean; alasan: string; runId: string | null; catatan: string }> {
+  // Butir 45/46 lebih dulu: prompt berbahaya tidak boleh diproses lanjut, apa pun mode jadwalnya.
+  const blokir = promptBlockFor(row, mode);
+  if (blokir) {
+    audit(row.userId, "schedule.blocked", { scheduleId: row.id, mode, alasan: blokir.alasan });
+    return { dijalankan: false, alasan: blokir.alasan, runId: null, catatan: blokir.catatan };
+  }
   const { decideScheduledExecution } = await import("./behavior-matrix.js");
   const keputusan = decideScheduledExecution({ conversationId: row.conversationId, autonomousRequested: Boolean(row.autonomous) });
   if (!keputusan.dijalankan) return { dijalankan: false, alasan: keputusan.alasan, runId: null, catatan: keputusan.catatan };

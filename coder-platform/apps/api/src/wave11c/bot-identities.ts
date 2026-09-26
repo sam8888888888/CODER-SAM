@@ -10,6 +10,10 @@
  * (skema v21 tidak punya kolom status) dan dihapus/diubah saat pemasangan berhasil. Percobaan salah
  * dibatasi `BOT_LINK_MAX_ATTEMPTS` per (kanal, identitas) memakai pembatas laju bersama.
  *
+ * Pengerasan: karena `external_id` ditentukan pemanggil, pembatas per (kanal, identitas) bisa
+ * dilewati dengan mengganti `external_id` setiap percobaan. Rute `POST /api/v1/bots/:channelId/link`
+ * karena itu juga dibatasi per ALAMAT pemanggil (`BOT_LINK_IP_MAX_FAILURES` kegagalan / 15 menit).
+ *
  * Satu external_id hanya boleh melayani satu akun: penautan ke akun lain ditolak 409.
  */
 import { randomInt, randomUUID } from "node:crypto";
@@ -17,7 +21,7 @@ import { db } from "../db.js";
 import { config } from "../config.js";
 import { requireUser } from "../auth.js";
 import { audit, fail, isPlatformAdmin } from "../wave11a/shared.js";
-import { channelById, hashKode, tautkanIdentitas, type BotProvider } from "./bot-core.js";
+import { BOT_LINK_IP_MAX_FAILURES, channelById, hashKode, linkIpFailureLimiter, tautkanIdentitas, type BotProvider } from "./bot-core.js";
 
 const CARA_PAKAI = "Kirim kode ini ke bot sebagai perintah: /taut <kode>. Kode hanya bisa dipakai sekali dan berlaku terbatas.";
 
@@ -79,9 +83,23 @@ export function registerBotIdentityRoutes(app: any): void {
     const body = (request.body ?? {}) as Record<string, unknown>;
     const externalId = String(body.external_id ?? body.externalId ?? "").trim();
     const kode = String(body.code ?? body.kode ?? "").trim();
+    // Pembatas per ALAMAT pemanggil: pembatas per (kanal, external_id) di `tautkanIdentitas` bisa
+    // dilewati dengan mengganti `external_id`, jadi percobaan GAGAL dari satu alamat juga dihitung di
+    // sini. Kodenya `BOT_LINK_RATE_LIMITED`, terpisah dari `TOO_MANY_LINK_ATTEMPTS` (kasus lain).
+    const alamat = String(request.ip ?? "alamat-tidak-dikenal");
+    const tungguDetik = linkIpFailureLimiter.retryAfterSeconds(alamat);
+    if (tungguDetik > 0) {
+      return fail(reply, 429, "BOT_LINK_RATE_LIMITED",
+        `Terlalu banyak percobaan pemasangan yang gagal dari alamat ini (batas ${BOT_LINK_IP_MAX_FAILURES} kegagalan per 15 menit). Tunggu sekitar ${Math.max(1, Math.ceil(tungguDetik / 60))} menit, lalu coba lagi dengan kode baru dari dasbor.`,
+        { retryAfter: tungguDetik });
+    }
     if (!externalId) return fail(reply, 400, "EXTERNAL_ID_REQUIRED", "Isi 'external_id' (chat id Telegram atau nomor WhatsApp).");
     const hasil = tautkanIdentitas(String(request.params?.channelId ?? ""), externalId, kode);
-    if (!hasil.ok) return fail(reply, hasil.status, hasil.error, hasil.message);
+    if (!hasil.ok) {
+      // Hanya percobaan yang GAGAL yang dihitung; pemasangan berhasil tidak membebani alamat ini.
+      linkIpFailureLimiter.allow(alamat);
+      return fail(reply, hasil.status, hasil.error, hasil.message);
+    }
     const identitas = hasil.identitas;
     return {
       identitas: {

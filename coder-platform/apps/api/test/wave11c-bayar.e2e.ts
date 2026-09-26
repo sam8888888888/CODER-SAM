@@ -171,7 +171,13 @@ check(`B6. tidak ada satu pun nominal kembar di antara ${JUMLAH} pesanan aktif`,
 const selisih = nominal.map((nilai) => nilai - hargaPremium);
 check("B7. setiap kode unik berada di rentang 1..999 di atas dasar nominal", selisih.every((k) => k >= 1 && k <= 999), short({ min: Math.min(...selisih), maks: Math.max(...selisih) }));
 check("B8. kode unik tidak selalu sama (bervariasi, bukan angka tetap)", new Set(selisih).size > 1, short({ kodeBerbeda: new Set(selisih).size }));
-const taksaNominal = semua("SELECT amount_idr AS amountIdr, total_idr AS totalIdr, unique_amount_idr AS uniqueAmountIdr FROM orders WHERE id IN (SELECT id FROM orders WHERE method='manual') LIMIT 500");
+// Diperbaiki 26 Sep 2026 (audit cek vakum): `.every()` pada daftar kosong selalu lulus, jadi query
+// yang mengembalikan 0 baris dulu "lulus" tanpa memeriksa apa pun. Barisnya kini dibatasi ke pesanan
+// yang benar-benar sudah dipasangi kode unik, dan jumlahnya diperiksa lebih dulu (B9a) supaya B9
+// tidak bisa lulus vakum.
+const taksaNominal = semua("SELECT amount_idr AS amountIdr, total_idr AS totalIdr, unique_amount_idr AS uniqueAmountIdr FROM orders WHERE method='manual' AND unique_amount_idr IS NOT NULL LIMIT 500");
+check(`B9a. baris yang diperiksa B9 tidak kosong (${JUMLAH} pesanan berkode unik terbaca)`, taksaNominal.length === JUMLAH,
+  short({ terbaca: taksaNominal.length, harap: JUMLAH }));
 check("B9. amount_idr dan total_idr TIDAK diubah pemasangan kode unik (tetap harga paket)", taksaNominal.every((row) => Number(row.amountIdr) === hargaPremium && Number(row.totalIdr) === hargaPremium), short(taksaNominal.slice(0, 2)));
 check("B10. nominal unik tersimpan di kolom terpisah orders.unique_amount_idr (bukan di total)", hitung("SELECT COUNT(*) AS n FROM orders WHERE unique_amount_idr IS NOT NULL") === JUMLAH
   && hitung("SELECT COUNT(*) AS n FROM orders WHERE unique_amount_idr = total_idr") === 0, short({ berkolom: hitung("SELECT COUNT(*) AS n FROM orders WHERE unique_amount_idr IS NOT NULL") }));
@@ -285,11 +291,18 @@ check("B33. pengisian borongan hanya untuk admin -> 403 ADMIN_REQUIRED", isiBoro
 // Pesanan `langka-target` sengaja dibiarkan tanpa kode di antara kandidat: pengisian borongan harus
 // MELAPORKAN kegagalannya (kode habis), bukan melewatinya diam-diam.
 check("B34. admin mengisi kode unik pesanan lama sekaligus, kegagalan dilaporkan apa adanya", isiBorongan.status === 200
-  && Number(isiBorongan.json?.diisi) >= 3 && (isiBorongan.json?.kegagalan ?? []).every((row: any) => row.error === "UNIQUE_AMOUNT_EXHAUSTED")
+  && Number(isiBorongan.json?.diisi) >= 3
+  // Penjaga anti-lulus-vakum (audit 26 Sep 2026): `?? []` membuat `.every()` selalu lulus saat
+  // daftar kegagalan kosong, padahal satu pesanan sengaja dibiarkan tanpa kode di antara kandidat.
+  && (isiBorongan.json?.kegagalan ?? []).length >= 1
+  && (isiBorongan.json?.kegagalan ?? []).every((row: any) => row.error === "UNIQUE_AMOUNT_EXHAUSTED")
   && hitung("SELECT COUNT(*) AS n FROM orders WHERE id IN (?,?,?) AND unique_amount_idr IS NOT NULL", ...lama) === 3
   && hitung("SELECT COUNT(*) AS n FROM audit_events WHERE action='billing.manual_queue_filled'") === 1, short(isiBorongan.json));
 const nominalLama = semua("SELECT total_idr AS totalIdr, unique_amount_idr AS uniqueAmountIdr FROM orders WHERE id IN (?,?,?)", ...lama);
-check("B35. kode unik hasil pengisian borongan juga 1..999 di atas dasar dan berbeda satu sama lain", nominalLama.every((row) => Number(row.uniqueAmountIdr) - Number(row.totalIdr) >= 1 && Number(row.uniqueAmountIdr) - Number(row.totalIdr) <= 999)
+check("B35. kode unik hasil pengisian borongan juga 1..999 di atas dasar dan berbeda satu sama lain", nominalLama.length === 3
+  // Penjaga panjang (audit 26 Sep 2026): tanpa ini, daftar kosong membuat `.every()` dan
+  // `Set().size === length` sama-sama lulus tanpa membuktikan satu baris pun.
+  && nominalLama.every((row) => Number(row.uniqueAmountIdr) - Number(row.totalIdr) >= 1 && Number(row.uniqueAmountIdr) - Number(row.totalIdr) <= 999)
   && new Set(nominalLama.map((row) => Number(row.uniqueAmountIdr))).size === nominalLama.length, short(nominalLama));
 
 /* =====================================================================================

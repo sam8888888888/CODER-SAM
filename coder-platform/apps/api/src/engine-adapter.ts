@@ -53,7 +53,15 @@ export class MockEngine implements AgentEngine {
     // real engine fails. It is off unless a suite sets it, so no other suite is affected.
     const failModels = String(process.env.MOCK_ENGINE_FAIL_MODELS ?? "").split(",").map((item) => item.trim()).filter(Boolean);
     if (request.model && failModels.includes(request.model)) {
-      const [codeRaw, ...rest] = String(process.env.MOCK_ENGINE_FAIL_TEXT ?? "429 rate limit exceeded").split(" ");
+      // Test-only knob (Wave 11A butir 57): MOCK_ENGINE_FAIL_TEXT_BY_MODEL="model-a=400 permintaan salah;model-b=429 rate limit"
+      // lets ONE suite make the primary model fail transiently and the fallback model fail
+      // permanently, so the rule "the real request error is not masked as ENGINE_UNAVAILABLE"
+      // becomes testable. Unset = every failing model uses MOCK_ENGINE_FAIL_TEXT.
+      const teksPerModel = String(process.env.MOCK_ENGINE_FAIL_TEXT_BY_MODEL ?? "")
+        .split(";").map((item) => item.trim()).filter(Boolean)
+        .map((item) => { const idx = item.indexOf("="); return idx < 0 ? null : { nama: item.slice(0, idx).trim(), teks: item.slice(idx + 1).trim() }; })
+        .find((baris) => baris && baris.nama === request.model);
+      const [codeRaw, ...rest] = String(teksPerModel?.teks ?? process.env.MOCK_ENGINE_FAIL_TEXT ?? "429 rate limit exceeded").split(" ");
       yield { type: "failed", data: { code: codeRaw, message: rest.join(" ") || codeRaw } };
       return;
     }

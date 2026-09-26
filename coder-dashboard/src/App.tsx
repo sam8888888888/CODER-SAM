@@ -372,7 +372,7 @@ function App() {
     : page === 'toolsPolicy' && user ? <ToolsPolicy onError={setError} isAdmin={isAdmin} />
     : page === 'notion' && user ? <NotionHub onError={setError} />
     : page === 'botChannels' && user ? <BotChannels isAdmin={isAdmin} onError={setError} />
-    : page === 'connectors' && user ? <Connectors onError={setError} />
+    : page === 'connectors' && user ? <Connectors onError={setError} isAdmin={isAdmin} />
     : page === 'agents' && user ? <AgentMap onError={setError} />
     : page === 'diff' && user ? <DiffView projectId={projectId} onError={setError} />
     : page === 'skills' && user ? <Skills onError={setError} />

@@ -326,6 +326,17 @@ check("[C] admin GET /admin/orders?status=pending -> 200 hanya baris pending",
   `${adminPending.status} ${short(pendingRows)}`);
 check("[C] tiap baris pesanan admin memuat userEmail",
   pendingRows.length > 0 && pendingRows.every((row: any) => typeof row?.userEmail === "string" && row.userEmail.includes("@")), short(pendingRows));
+// Wave 11C butir 74: admin harus melihat nominal transfer yang harus dicocokkan dengan mutasi bank.
+// Dua medan ini ditambahkan rute tetapi sebelumnya tidak diperiksa suite mana pun (temuan audit).
+check("[C] tiap baris pesanan admin memuat nominalBayarIdr berupa bilangan bulat dan uniqueAmountIdr ada",
+  pendingRows.length > 0 && pendingRows.every((row: any) => Number.isInteger(row?.nominalBayarIdr) && row.nominalBayarIdr > 0 && "uniqueAmountIdr" in row), short(pendingRows));
+const barisAdminPremium = pendingRows.find((row: any) => row?.id === premiumOrder?.id);
+const dbPremium = db.prepare("SELECT unique_amount_idr AS uniqueAmountIdr, total_idr AS totalIdr FROM orders WHERE id=?").get(premiumOrder?.id) as { uniqueAmountIdr: number | null; totalIdr: number } | undefined;
+check("[C] nominalBayarIdr dan uniqueAmountIdr pesanan premium sama dengan kolomnya di basis data",
+  Boolean(barisAdminPremium) && Boolean(dbPremium) &&
+    barisAdminPremium?.uniqueAmountIdr === dbPremium?.uniqueAmountIdr &&
+    barisAdminPremium?.nominalBayarIdr === (dbPremium?.uniqueAmountIdr ?? dbPremium?.totalIdr),
+  `api=${short(barisAdminPremium)} db=${short(dbPremium)}`);
 check("[C] pesanan premium pembeli ada di daftar pending",
   pendingRows.some((row: any) => row?.id === premiumOrder?.id), short(pendingRows));
 

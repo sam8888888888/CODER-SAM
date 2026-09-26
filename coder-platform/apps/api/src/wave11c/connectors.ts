@@ -10,16 +10,22 @@
  *     diperiksa lagi oleh proses anak saat mengirim (daftar putih dibaca dua kali).
  *  4. Alat MCP hanya boleh dipakai bila admin platform menuliskannya di `platform_settings.mcp_allowed_tools`.
  *     Bawaan kosong = MCP tertutup (403 MCP_TOOL_NOT_ALLOWED), bukan "terbuka dengan sendirinya".
+ *     Daftar itu ditulis lewat `GET/PUT /api/v1/admin/mcp-allowed-tools` (khusus admin platform);
+ *     tanpa rute itu tidak ada satu pun jalan bagi pelanggan untuk membuka MCP.
+ *  5. Kirim/uji dibatasi laju per pengguna (`rate_limit_hits`), supaya satu akun tidak bisa membanjiri hulu.
  */
 import { config } from "../config.js";
 import { db } from "../db.js";
 import { requireUser } from "../auth.js";
+import { createRateLimiter, type RateLimiter } from "../ratelimit.js";
 import { SecretsKeyError, sealSecret, secretsKeyState } from "../secrets.js";
-import { audit, fail } from "../wave11a/shared.js";
+import { adminRequired, audit, fail, isPlatformAdmin } from "../wave11a/shared.js";
 import { checkOutboundUrl, allowedOutboundHosts } from "./connector-outbound.js";
 import {
   CONNECTOR_KINDS,
   CONNECTOR_STATUSES,
+  MAX_MCP_TOOLS,
+  MCP_TOOL_PATTERN,
   MAX_NAME_CHARS,
   MAX_TOOLS,
   MAX_TOKEN_CHARS,
@@ -34,11 +40,36 @@ import {
   mcpToolsAllowed,
   openConnectorConfig,
   saveConnectorRow,
+  setMcpAllowedTools,
   updateConnectorState,
 } from "./connector-store.js";
 import { connectorLimits, deliverConnectorWithJob } from "./connector-job.js";
 
 type Body = Record<string, unknown>;
+
+/** Batas laju kirim/uji konektor per pengguna. Dipakai rute `POST /api/v1/connectors/:id/test`. */
+export const CONNECTOR_TEST_RULE = { windowMs: 10 * 60 * 1000, max: 12 } as const;
+let limiterUji: RateLimiter | null = null;
+function connectorTestLimiter(): RateLimiter {
+  if (!limiterUji) limiterUji = createRateLimiter({ ...CONNECTOR_TEST_RULE }, "connector_test");
+  return limiterUji;
+}
+
+/** Memeriksa daftar putih alat MCP dari admin platform. Nama dinormalkan ke huruf kecil. */
+function periksaDaftarAlatMcp(nilai: unknown): { ok: true; alat: string[] } | { ok: false; ditolak: string[]; pesan: string } {
+  if (!Array.isArray(nilai)) {
+    return { ok: false, ditolak: [], pesan: "Daftar alat MCP harus berupa larik nama alat (contoh: [\"kirim_pesan\"])." };
+  }
+  const mentah = nilai.map((item) => String(item).trim().toLowerCase()).filter(Boolean);
+  if (mentah.length > MAX_MCP_TOOLS) {
+    return { ok: false, ditolak: mentah.slice(MAX_MCP_TOOLS), pesan: `Maksimal ${MAX_MCP_TOOLS} alat MCP dalam satu daftar putih.` };
+  }
+  const ditolak = mentah.filter((item) => !MCP_TOOL_PATTERN.test(item));
+  if (ditolak.length) {
+    return { ok: false, ditolak, pesan: "Nama alat MCP hanya boleh huruf kecil, angka, titik, garis bawah, titik dua, dan tanda hubung (maksimal 64 karakter)." };
+  }
+  return { ok: true, alat: mentah };
+}
 
 function daftarAlat(nilai: unknown): { ok: true; alat: string[] } | { ok: false; kode: string; pesan: string } {
   if (nilai === undefined || nilai === null) return { ok: true, alat: [] };
@@ -193,6 +224,11 @@ export function registerConnectorRoutes(app: any): void {
     if (secretsKeyState() !== "ok") {
       return fail(reply, 503, "SECRETS_KEY_MISSING", "Penyimpanan rahasia belum dikonfigurasi, jadi konektor tidak bisa dibuka.");
     }
+    const limiter = connectorTestLimiter();
+    const kunci = `user:${request.user!.id}`;
+    if (!limiter.allow(kunci)) {
+      return fail(reply, 429, "CONNECTOR_TEST_RATE_LIMITED", `Maksimal ${CONNECTOR_TEST_RULE.max} kirim/uji per ${Math.round(CONNECTOR_TEST_RULE.windowMs / 60000)} menit. Coba lagi setelah ${limiter.retryAfterSeconds(kunci)} detik.`, { retryAfter: limiter.retryAfterSeconds(kunci), max: CONNECTOR_TEST_RULE.max });
+    }
     const body = (request.body ?? {}) as Body;
     const teks = String(body.teks ?? "Uji kirim dari COBLAI Coder.").slice(0, 3000);
     const kirim = await deliverConnectorWithJob({ connectorId: row.id, userId: request.user!.id, teks, jenis: "uji" });
@@ -210,6 +246,38 @@ export function registerConnectorRoutes(app: any): void {
       pekerjaan: { id: kirim.jobId, diklaim: kirim.diklaim, pesan: kirim.pesan },
       // `pekerjaDalamProses` = pekerjaan dijalankan di proses web (key yang menentukan, lihat GET di atas).
       pengaturan: { pekerjaDalamProses: config.JOB_WORKER_IN_WEB && !config.WORKER_ONLY, batasMenungguHuluMs: connectorLimits().childAbortMs, batasHidupProsesAnakMs: connectorLimits().parentDeadlineMs },
+    };
+  });
+  // ── Butir 71: daftar putih alat MCP untuk admin platform ─────────────────────────────────────────
+  // Tanpa kedua rute ini, `platform_settings.mcp_allowed_tools` tidak punya penulis di produksi:
+  // status katalog MCP selalu "dikembangkan" dan setiap pembuatan konektor MCP dijawab 403.
+  app.get("/api/v1/admin/mcp-allowed-tools", { preHandler: requireUser }, async (request: any, reply: any) => {
+    if (!isPlatformAdmin(request.user!)) return adminRequired(reply);
+    const alat = mcpAllowedTools();
+    return {
+      alat,
+      terbuka: alat.length > 0,
+      batas: { maksimalAlat: MAX_MCP_TOOLS, polaNama: String(MCP_TOOL_PATTERN) },
+      catatan: "Daftar kosong berarti MCP tertutup: pembuatan konektor MCP dijawab 403 MCP_TOOL_NOT_ALLOWED.",
+    };
+  });
+
+  app.put("/api/v1/admin/mcp-allowed-tools", { preHandler: requireUser }, async (request: any, reply: any) => {
+    if (!isPlatformAdmin(request.user!)) return adminRequired(reply);
+    const body = (request.body ?? {}) as Body;
+    const periksa = periksaDaftarAlatMcp(body.alat ?? body.tools);
+    if (!periksa.ok) {
+      return fail(reply, 400, "MCP_ALLOWED_TOOLS_INVALID", periksa.pesan, { ditolak: periksa.ditolak });
+    }
+    const alat = setMcpAllowedTools(periksa.alat);
+    audit(request.user!.id, "admin.mcp_allowed_tools_updated", { jumlah: alat.length, terbuka: alat.length > 0, alat });
+    return {
+      alat,
+      terbuka: alat.length > 0,
+      katalog: catalogueFor(request.user!.id),
+      pesan: alat.length
+        ? `Daftar putih disimpan: ${alat.length} alat MCP diizinkan.`
+        : "Daftar putih dikosongkan: MCP tertutup untuk semua pengguna.",
     };
   });
 }

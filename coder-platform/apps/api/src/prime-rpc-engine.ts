@@ -8,6 +8,21 @@ import { vendorCostMicros } from "./vendor-prices.js";
 
 type Active = { process: ChildProcessWithoutNullStreams; cancel: () => void };
 
+/**
+ * Batas panjang satu ringkasan alat yang disimpan ke `run_events`. Satu baris basis data tidak boleh
+ * membengkak gara-gara keluaran alat yang besar; pemotongannya eksplisit supaya tidak menyesatkan.
+ */
+export const TOOL_SUMMARY_MAX_CHARS = 600;
+
+/** Merapikan args/keluaran alat menjadi satu ringkasan pendek (satu baris, dipotong di batas). */
+function ringkasAlat(nilai: unknown): string {
+  if (nilai === null || nilai === undefined) return "";
+  let teks: string;
+  try { teks = typeof nilai === "string" ? nilai : JSON.stringify(nilai); } catch { teks = String(nilai); }
+  teks = (teks ?? "").replace(/\s+/g, " ").trim();
+  return teks.length > TOOL_SUMMARY_MAX_CHARS ? `${teks.slice(0, TOOL_SUMMARY_MAX_CHARS)}…` : teks;
+}
+
 /** Adapter for the validated Prime Agent stdio JSONL contract. */
 export class PrimeRpcEngine implements AgentEngine {
   private active = new Map<string, Active>();
@@ -49,6 +64,13 @@ export class PrimeRpcEngine implements AgentEngine {
       let event: any; try { event = JSON.parse(line); } catch { return; }
       if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") { const delta = String(event.assistantMessageEvent.delta ?? ""); if (delta) { streamed = true; push({ type: "text", data: delta }); } }
       else if (event.type === "agent_end") { if (!streamed) { const text = lastAssistantText(event); if (text) push({ type: "text", data: text }); } push({ type: "completed", data: { usage: extractUsage(event, request.model ?? this.options.model) } }); finish(); }
+      // Wave 11B (butir 62): urutan aksi alat. Mesin nyata mengirim `tool_execution_start` /
+      // `tool_execution_end` (bentuk frame: toolCallId, toolName, args/result, isError). Dulu cabang ini
+      // tidak ada, sehingga tabel `run_events` tidak pernah memuat baris `tool` dan timeline run tidak
+      // bisa mempertanggungjawabkan langkah alat. Sekarang setiap alat menjadi SATU peristiwa `tool`
+      // berisi nama + ringkasan keluaran; isinya dipotong supaya baris basis data tidak membengkak.
+      else if (event.type === "tool_execution_start") push({ type: "tool", data: { fase: "mulai", nama: String(event.toolName ?? "alat"), name: String(event.toolName ?? "alat"), toolCallId: String(event.toolCallId ?? ""), summary: ringkasAlat(event.args) } });
+      else if (event.type === "tool_execution_end") push({ type: "tool", data: { fase: "selesai", nama: String(event.toolName ?? "alat"), name: String(event.toolName ?? "alat"), toolCallId: String(event.toolCallId ?? ""), status: event.isError === true ? "gagal" : "selesai", summary: ringkasAlat(event.result) } });
       else if (event.type === "error" || event.success === false) push({ type: "failed", data: { code: "ENGINE_ERROR", message: event.error ?? event.message ?? "Prime Agent error" } });
     });
     child.on("error", (error) => { push({ type: "failed", data: { code: "ENGINE_START_FAILED", message: error.message } }); finish(); });

@@ -462,6 +462,12 @@ export type BotChannel = {
 };
 export type BotChannelsResponse = { channels: BotChannel[] };
 
+/** Butir 69 (v0.23.1) — hasil "uji kirim": satu pesan nyata ke kanal tersimpan, jawaban hulu apa adanya. */
+export type BotTestResponse = {
+  terkirim: boolean; jalur: string; statusHulu: number[]; tujuan: string; panjangTeks: number;
+  pesanHulu: string; kanal: BotChannel;
+};
+
 /** Butir 69 — kode pemasangan akun ke bot (sekali pakai, berlaku terbatas). */
 export type BotLinkCode = {
   kode: string; identityId: string; channelId: string; kanal: string; provider: string;
@@ -482,6 +488,10 @@ export type ConnectorView = {
   id: string; kind: ConnectorKind; nama: string; enabled: boolean; status: string; lastError: string | null;
   tautan: { terpasang: boolean; tersegel: boolean; bisaDibuka: boolean; ekor: string | null; host: string | null; alat: string[] };
   createdAt: string; updatedAt: string;
+};
+/** Balasan rute admin daftar putih alat MCP (butir 71) — satu-satunya penulis di produksi. */
+export type McpAllowedToolsResponse = {
+  alat: string[]; terbuka: boolean; batas?: { maksimalAlat: number; polaNama: string }; catatan?: string; pesan?: string;
 };
 export type ConnectorsResponse = {
   katalog: ConnectorCatalogueEntry[]; konektor: ConnectorView[]; total: number;
@@ -541,6 +551,24 @@ export type EngineVersionReport = {
 
 /** Kalimat yang dipakai server saat mesin tidak melaporkan versinya (wave11c/engine-version.ts). */
 export const VERSI_TIDAK_DILAPORKAN = 'versi tidak dilaporkan';
+
+/* ================= Wave 11A (butir 80): pagar konteks total =================
+ * Bentuk di bawah disalin dari balasan NYATA rute `GET /api/v1/context-budget/report`
+ * (`budgetReport()` + `limitMin`/`limitMax`/`defaultChars` di apps/api/src/wave11a/context-budget.ts).
+ * Halaman Pemakaian menampilkan angka apa adanya, termasuk saat ada yang dipotong. */
+
+/** Satu bagian sisipan yang dibuang atau dipotong sebagian. `alasan` hanya dua nilai dari server. */
+export type ContextBudgetDrop = { name: string; chars: number; alasan: 'prioritas_terendah' | 'dipotong_sebagian' };
+
+/** Keadaan satu bagian sisipan: `terkirim=false` berarti bagian itu TIDAK ikut ke mesin. */
+export type ContextBudgetBlock = { name: string; priority: number; chars: number; keterangan: string; terkirim: boolean };
+
+/** Laporan pagar konteks: pagar aktif, total sebelum dipotong, yang terkirim, dan catatan jujur server. */
+export type ContextBudgetReport = {
+  budgetChars: number; keptChars: number; totalCharsBeforeTrim: number; overBudget: boolean;
+  dipotong: ContextBudgetDrop[]; blocks: ContextBudgetBlock[]; catatan: string;
+  limitMin: number; limitMax: number; defaultChars: number;
+};
 
 /** Galat API yang menyimpan kode mesin, status, dan badan jawaban (pesan Indonesia dari server). */
 export type ApiFailureDetails = { status: number; code: string; message: string; body: Record<string, unknown> | null };
@@ -1001,6 +1029,10 @@ export const api = {
   botIdentities: () => requestDetailed<{ identitas: BotIdentity[] }>('/v1/bot-identities'),
   botRevokeIdentity: (identityId: string) =>
     requestDetailed<{ dihapus: boolean; id: string; oleh: string }>(`/v1/bot-identities/${encodeURIComponent(identityId)}`, { method: 'DELETE' }),
+  /** Butir 69: kirim SATU pesan uji ke kanal bot tersimpan (admin platform). Isi `chatId` opsional:
+   *  tanpa itu server memakai tautan paling baru di kanal tersebut, atau menjawab 409 apa adanya. */
+  botTestChannel: (channelId: string, input?: { chatId?: string; teks?: string }) =>
+    requestDetailed<BotTestResponse>(`/v1/admin/bot-channels/${encodeURIComponent(channelId)}/test`, { method: 'POST', body: JSON.stringify(input ?? {}) }),
 
   /** Butir 71: katalog konektor + uji kirim. Status 'aktif' hanya datang dari server. */
   connectors: () => requestDetailed<ConnectorsResponse>('/v1/connectors'),
@@ -1012,6 +1044,11 @@ export const api = {
     requestDetailed<{ deleted: boolean; id: string }>(`/v1/connectors/${encodeURIComponent(connectorId)}`, { method: 'DELETE' }),
   testConnector: (connectorId: string, teks?: string) =>
     requestDetailed<ConnectorTestResponse>(`/v1/connectors/${encodeURIComponent(connectorId)}/test`, { method: 'POST', body: JSON.stringify(teks === undefined ? {} : { teks }) }),
+
+  /** Butir 71 (admin): daftar putih alat MCP. Tanpa penulis ini konektor MCP tidak bisa dibuat sama sekali. */
+  mcpAllowedTools: () => requestDetailed<McpAllowedToolsResponse>('/v1/admin/mcp-allowed-tools'),
+  saveMcpAllowedTools: (alat: string[]) =>
+    requestDetailed<McpAllowedToolsResponse>('/v1/admin/mcp-allowed-tools', { method: 'PUT', body: JSON.stringify({ alat }) }),
 
   /** Butir 74: nominal unik untuk pesanan transfer manual. */
   billingUniqueAmount: (orderId: string) =>
@@ -1040,6 +1077,11 @@ export const api = {
 
   /** Butir 78 tahap 1: laporan versi mesin (admin platform). */
   engineVersion: () => requestDetailed<EngineVersionReport>('/v1/admin/engine/version'),
+
+  /** Butir 80: laporan pagar konteks total + daftar sisipan yang dipotong. `conversationId` opsional;
+   *  tanpa itu server memeriksa sisipan untuk pengguna yang sedang masuk. */
+  contextBudgetReport: (conversationId?: string) =>
+    request<ContextBudgetReport>(`/v1/context-budget/report${conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : ''}`),
 
   /** Wave 10: gerbang umum untuk halaman baru. Jalur ditulis tanpa awalan /api, dan cookie CSRF
    *  ditambahkan otomatis untuk metode yang mengubah data. */

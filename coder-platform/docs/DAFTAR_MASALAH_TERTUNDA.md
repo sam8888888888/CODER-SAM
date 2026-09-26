@@ -255,7 +255,7 @@ Sumber: PRD Wave 11 versi 5 (25 Sep 2026), **42 butir** (42–83), dikerjakan be
 **11A → v0.21.0 · 11B → v0.22.0 · 11C → v0.23.0**. Bagian ini menggantikan cara nomor 42–83
 disebut satu per satu; rincian bukti ada di `docs/STATUS.md` bagian "Wave 11A".
 
-### 6.1 Wave 11A (v0.21.0) — SUDAH DI KODE, BELUM DI-DEPLOY (26 Sep 2026)
+### 6.1 Wave 11A (v0.21.0) — SELESAI DI KODE, SUDAH LIVE (26 Sep 2026)
 
 18 butir: 42, 43, 44, 45, 46, 47, 48, 49, 51, 52, 53, 54, 55, 56, 57, 79, 80 — dan 50 TERTAHAN.
 Gerbang: `npm run verify` hijau (44/44 suite), skema 18 → 19, suite baru 176 + 127 + 84 + 187 =
@@ -283,10 +283,10 @@ Gerbang: `npm run verify` hijau (44/44 suite), skema 18 → 19, suite baru 176 +
 | 80 | Pagar konteks total | SELESAI | `wave11a §13` 14 |
 
 Yang **belum** beres di 11A dan perlu perhatian Bapak:
-- **Deploy v0.21.0** belum dijalankan (butuh izin): skema naik ke 19, butuh gerbang migrasi di
-  salinan cadangan + `SECRETS_KEY` diisi di `.env` server. Tanpa `SECRETS_KEY`, rute rahasia
-  menjawab `503 SECRETS_KEY_MISSING`. Sembilan kunci baru sudah masuk `.env.austria.example` dan
-  `deploy/env.keys.txt`, jadi `env-sync.sh` akan menambahkannya sendiri saat deploy.
+- **Deploy v0.21.0** SUDAH dijalankan bersama rilis v0.23.0 (26 Sep 2026): skema naik ke 19 lewat
+  gerbang migrasi di salinan cadangan, dan `SECRETS_KEY` sudah diisi di `.env` server. Sembilan kunci
+  baru masuk lewat `env-sync.sh` saat deploy; tanpa `SECRETS_KEY` rute rahasia akan menjawab
+  `503 SECRETS_KEY_MISSING` — sekarang tidak.
 - **Butir 42 bagian DoD** ("perintah tulis berkas tidak menghasilkan artefak saat mode diskusi")
   belum bisa dibuktikan dengan mesin mock — butuh mesin AI nyata.
 - **Butir 48**: pagar anti-bentrok-tulis hanya berlaku di dalam satu proses; dua pekerja terpisah
@@ -296,7 +296,7 @@ Yang **belum** beres di 11A dan perlu perhatian Bapak:
 - **Butir 40 (dari daftar lama)**: direktori uji di `/tmp` masih menumpuk (~174 direktori, ~800 MB),
   menunggu izin hapus.
 
-### 6.2 Wave 11B (v0.22.0) — SELESAI DI KODE, BELUM DI-DEPLOY (26 Sep 2026)
+### 6.2 Wave 11B (v0.22.0) — SELESAI DI KODE, SUDAH LIVE (26 Sep 2026)
 
 Butir 58–67, 83, **plus butir 72** (ditarik dari 11C karena 83 memprasyaratkannya). Skema **19 → 20**.
 Gerbang: `npm run verify` **48/48 suite hijau** keluar 0; empat suite 11B (81/92/111/103 lulus, 0 gagal,
@@ -316,7 +316,7 @@ Yang perlu diketahui operator (bukan bug, tapi bisa mengejutkan):
 - **Menunggu keputusan Bapak sebelum rilis:** menyetel `APP_VERSION=0.23.0` di `.env` server saat
   deploy, bersama `SECRETS_KEY` dan `CSP_ENABLED` (dua kunci terakhir wajib ada supaya fitur 11A hidup).
 
-### 6.3 Wave 11C (v0.23.0) — SELESAI DI KODE, BELUM DI-DEPLOY (13 butir, skema 20 → 21, port 7320–7349)
+### 6.3 Wave 11C (v0.23.0) — SELESAI DI KODE, SUDAH LIVE (13 butir, skema 20 → 21, port 7320–7349)
 
 68 Notion · 69 Bot Telegram · 70 Bot WhatsApp (Twilio) · 71 Katalog plugin & konektor ·
 72 Jadwal prompt (**sudah dikerjakan di Wave 11B**) · 73 Grup chat multi-agen · 74 Nominal unik 3 digit ·
@@ -482,6 +482,55 @@ temuan 2 masih berupa perbaikan yang masuk akal, belum hasil uji ujung-ke-ujung.
 Catatan tambahan (jujur, di luar cakupan PRD): blok `location /apk/` milik aplikasi Personal Life OS
 punya `add_header` sendiri, sehingga header keamanan warisan tidak berlaku di jalur itu. Tidak diubah
 pada rilis ini.
+
+### 6.8 Audit menyeluruh Wave 11 + perbaikan + rebuild (26 Sep 2026) — perintah Bapak
+
+Bapak meminta: "cek dulu pekerjaan mana saja yang belum selesai dan belum di uji, tuntaskan semuanya,
+lalu rebuild kalau sudah diperbaiki, baru push." Bagian ini mencatat cara pemeriksaannya, temuan
+beserta perbaikannya, dan — yang penting — apa yang MASIH belum tuntas.
+
+**Cara audit (bukan membaca laporan, tetapi membaca kode).** Tiga agen audit memeriksa tiga wilayah
+dan menulis temuan dengan `berkas:baris` + kutipan asli:
+`/workspace/outputs/audit/audit_11ab.md` (Wave 11A/11B), `/workspace/outputs/audit/audit_ui.md`
+(antarmuka + `e2e/ui.e2e.mjs`), `/workspace/outputs/audit/audit_11c.md` (Wave 11C).
+Setiap temuan diuji ulang oleh lead sebelum diperbaiki; temuan yang tidak terbukti TIDAK diperbaiki
+(lihat bagian "temuan yang gugur" di bawah).
+
+**Temuan berat dan perbaikannya.**
+
+| Butir | Temuan audit | Perbaikan | Bukti uji |
+|---|---|---|---|
+| 42 | Mode diskusi hanya menempel di prompt; perintah "tulis berkas" tetap bisa menghasilkan artefak lewat API | Penjagaan di pintu artefak (`server.ts`): run wajib milik proyek itu (`400 RUN_NOT_IN_PROJECT`), percakapan mode diskusi → `409 DISKUSI_MODE_NO_EXECUTE` + audit `artifact.blocked_diskusi` | `wave11a.e2e.ts` cek 1p–1v; `w11a_42_run.log` 200 lulus |
+| 45/46 | Tiga jalan pintas lolos dari penyaring prompt: jadwal (`schedules.ts`), Playground, dan jalur lanjutkan run | `promptBlockFor()` di jadwal (audit `schedule.blocked`), guardrail Playground (`400 GUARDRAIL_BLOCKED`), jalur lanjutkan (`409 RESUME_PROMPT_BLOCKED` / `RESUME_GUARDRAIL_BLOCKED`) | `w11b_63_run2.log` 109 lulus; `w11a_46_run3.log`; `w11a_57_run2.log` |
+| 56 | Perkiraan biaya memakai harga luar-jam-puncak untuk model vendor; uji membandingkan rute dengan fungsi yang sama | `estimate.ts` memakai `quoteCosts()` (tarif puncak 2x ikut), `tarifPuncak` dilaporkan; 8 cek baru (11j–11q) membandingkan angka NYATA | `fix-perkiraan-biaya`: puncak 465 = 465 (sebelumnya 232) |
+| 61 | Biaya benchmark ±14x terlalu besar (5690 vs 404) karena harga dihitung per kelompok | `catatPemakaian()` mengembalikan `id` baris; biaya dihitung per baris | `wave11b-council.e2e.ts` 94 lulus; mutasi 3 gagal |
+| 63 | `attemptAutoResumes` tidak punya pemanggil di produksi (kebijakan "otomatis maks 1" tidak pernah jalan) | Pekerja `resume.scan` (`server.ts`) sekarang memanggil `attemptAutoResumes` dan melaporkan `{marked, diperiksa, dilanjutkan, dilewati}` | `wave11b.e2e.ts` §12ag/12ah; 109 lulus |
+| 62 | `run_events.type='tool'` tidak pernah ditulis (jalur produksi tidak punya cabangnya) | `prime-rpc-engine.ts` menulis `tool_execution_start`/`tool_execution_end` (ringkas ≤600 karakter) | suite baru `wave11b-timeline-alat.e2e.ts` 19/19; mutasi 9 lulus/10 gagal |
+| 71 | Daftar putih alat MCP tidak punya penulis (UI/API) | `connector-store.setMcpAllowedTools()` + rute admin + panel di `Connectors.tsx` | `wave11c-konektor.e2e.ts` 53/53; `tsc -b` 0 galat |
+| 69 | Uji kirim kanal bot: catatan UI menyebut rute yang tidak ada | Rute `POST /admin/bot-channels/:id/test` + tombol uji di UI | suite bot 110 lulus |
+| 57 | (a) Kode galat mesin sungguhan (`ENGINE_EXITED`, `RPC_FRAME_TOO_LARGE`) tidak diklasifikasi, jadi mesin mati tidak pindah model; (b) galat permanen sesudah satu perpindahan dilaporkan sebagai `ENGINE_UNAVAILABLE`; (c) cek 12l lulus karena alasan yang salah (pesan uji memotong kode galat) | `fallback.ts`: daftar kode mesin sementara/permanen (permanen menang); `server.ts` meneruskan kode galat mesin; galat asli dilaporkan bila percobaan terakhir permanen | `wave11a.e2e.ts` 208 lulus (cek 12h0, 12l, 12l2–12l6, 12u baru) |
+| **baru saat butir 57** | Katalog model dari CLI mesin bisa menjawab TIDAK LENGKAP (penyedia lambat). Jawaban pendek dulu menimpa daftar lama, sehingga model SAH ditolak `400 UNKNOWN_MODEL`. Kejadian nyata: `/workspace/outputs/w11a_57_run.log` (12h, 12n) gagal saat gerbang peramban berjalan bersamaan, lalu hijau tanpa perubahan kode | `server.ts`: ingatan katalog hanya BERTAMBAH (jawaban pendek tidak menghapus model yang sudah dikenal), pencocokan juga lewat nama dasar (tanpa awalan penyedia), dan `GET /api/v1/models?refresh=1` menyegarkan ingatan itu | suite baru `wave11a-katalog.e2e.ts` 10/10 (`WAVE11A_KATALOG_PASSED`); mutasi ke perilaku lama → 4 gagal, termasuk `400 UNKNOWN_MODEL` yang sama |
+| 66 | Penyaring rahasia tidak menyunting kunci platform `ck_<40 heks>` | `wave11b/errors.ts` menambah pola itu | uji `wave11b-metrik.e2e.ts` 111 lulus |
+| uji palsu | Tujuh berkas uji memuat cek yang selalu hijau (`check(..., true)`, `skip=0` literal, argumen `checkApi` bergeser) | Semua dihapus/diperbaiki; tidak ada lagi cek yang selalu hijau | `rg 'check\([^,]*,\s*true\)'` kosong; `fix_ui_uji_run1.log` 223 lulus/0 gagal/1 lewat |
+| `ui.e2e.mjs` | Rute tak ada dianggap bukti; `5xx` bisa bersembunyi; satu cek tautologi (`run-fallback-marker` ATAU `run-fallback-none`); 7 `checkApi` salah argumen | `SKIP-RUTE` + aturan 5xx deklaratif + cek tautologi diganti + argumen diperbaiki | `fix_ui_uji_run1.log` 223/0/1 dari 224 titik |
+
+**Temuan audit yang GUGUR (tidak diperbaiki karena tidak terbukti).**
+- "Penampil PDF kosong di produksi" — dibuktikan sebagai batasan alat uji: Chromium bawaan Playwright
+  tidak punya penampil PDF. Kontrol tanpa CSP juga kosong, jadi bukan cacat produk.
+- "Cek 5xx harus menutup semua jalur" — sebagian jalur tidak pernah memicu 5xx di suite; empat jalur
+  yang tidak pernah terpicu DIBUANG dari daftar putih (bukan ditambah), supaya daftar tidak jadi hiasan.
+- Usulan menyatukan seluruh penyaring prompt jadi satu pintu: ditolak karena setiap jalur punya bentuk
+  jawaban berbeda (jadwal `{dijalankan:false}`, lanjutkan 409, Playground 400). Yang disatukan hanya
+  fungsinya, bukan bentuk jawabannya.
+
+**Yang MASIH belum tuntas (jujur).**
+1. **Deploy ulang dashboard ke produksi belum dijalankan.** Semua perubahan antarmuka sesi ini
+   (butir 48 tombol Render, butir 80 kartu pagar konteks, panel MCP, catatan kanal bot) baru ada di
+   repo. Produksi masih memakai paket v0.23.0 lama sampai Bapak memberi izin deploy.
+2. **Push ke GitHub** menunggu token dari Bapak. Cadangan sementara: bundel git di `/workspace/outputs/`.
+3. **Pratinjau PDF ujung-ke-ujung** masih belum diuji karena butuh Chrome desktop sungguhan.
+4. **Kredensial uji live** (akun uji produksi #2) masih hidup; akan dihapus setelah pengujian produksi
+   terakhir selesai, sesuai aturan Bapak.
 
 ### Cara memakai daftar ini
 Bapak cukup menyebut NOMOR (mis. "bereskan 15, 17, 24"). Saya kerjakan satu per satu, dengan

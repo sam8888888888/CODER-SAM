@@ -18,6 +18,10 @@ import { reapAbandonedRuns } from "../jobs.js";
 import { requireUser } from "../auth.js";
 import { audit, fail, mayWrite } from "../wave11a/shared.js";
 import { isTransientEngineError } from "../wave11a/fallback.js";
+// Penjaga yang sama dengan jalur chat/jadwal/playground: jalur lanjutan tidak boleh menjadi
+// pintu belakang yang mengirim ULANG prompt lama ke mesin (temuan audit 26 Sep 2026).
+import { guardrailViolations, recordSafetyEvent } from "../wave11a/guardrails.js";
+import { hijackMessage, scanPromptHijack } from "../prompt-guard.js";
 import { createRunAndDispatch } from "./dispatch.js";
 
 /** Batas jumlah lanjutan yang boleh diminta manusia untuk satu run. Ditulis apa adanya di API. */
@@ -150,6 +154,25 @@ export async function startResume(runId: string, userId: string, mode: "auto" | 
   }
   if (!info.canResume) {
     return { ok: false, status: 409, error: "RESUME_NOT_AVAILABLE", message: info.catatan, body: { reason: info.reason } };
+  }
+  // Periksa prompt LAMA sebelum dijalankan ulang. Run yang dibuat sebelum penjaga jalur jadwal
+  // dipasang (atau lewat jalur lain di masa lalu) bisa memuat prompt hijack/pelanggaran aturan.
+  if (config.PROMPT_GUARD_ENABLED) {
+    const hijack = scanPromptHijack(run.prompt);
+    if (hijack.blocked) {
+      audit(userId, "prompt_hijack_blocked", { asal: "resume", runId: run.id, pola: hijack.pattern, kategori: hijack.category, panjangPesan: run.prompt.length });
+      return { ok: false, status: 409, error: "RESUME_PROMPT_BLOCKED", message: hijackMessage(hijack.pattern), body: { reason: "PROMPT_BLOCKED", pola: hijack.pattern, kategori: hijack.category } };
+    }
+  }
+  const langgar = guardrailViolations(userId, run.prompt);
+  if (langgar.length) {
+    for (const hit of langgar) recordSafetyEvent({ userId, ruleId: hit.rule.id, pattern: hit.pattern, snippet: run.prompt });
+    audit(userId, "safety_violation", { asal: "resume", runId: run.id, ruleId: langgar[0].rule.id, judul: langgar[0].rule.title, pola: langgar[0].pattern });
+    return {
+      ok: false, status: 409, error: "RESUME_GUARDRAIL_BLOCKED",
+      message: `Permintaan ini dilarang aturan "${langgar[0].rule.title}". Aksi tidak dijalankan.`,
+      body: { reason: "GUARDRAIL_BLOCKED", aturan: langgar.map((hit) => ({ id: hit.rule.id, title: hit.rule.title, pola: hit.pattern })) },
+    };
   }
   const { prompt, ringkasanDipakai } = resumePrompt(run, info.ringkasanTerakhir);
   const hasil = await createRunAndDispatch({

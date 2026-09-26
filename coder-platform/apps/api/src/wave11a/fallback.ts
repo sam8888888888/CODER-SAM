@@ -39,13 +39,31 @@ const TRANSIENT_PATTERNS = [/\b429\b/, /\b50[0-4]\b/, /rate.?limit/i, /too many 
 const PERMANENT_PATTERNS = [/\b400\b/, /\b401\b/, /\b403\b/, /\b404\b/, /\b422\b/, /INVALID_/i, /UNAUTHORIZED/i, /FORBIDDEN/i, /MODEL_UNKNOWN/i, /NOT_CONFIGURED/i];
 
 /**
+ * Kode galat MESIN (bukan pesan gaya HTTP) juga menentukan kelas galat.
+ *
+ * Mesin sungguhan (`prime-rpc-engine.ts`) mengirim `code` seperti `ENGINE_EXITED` atau
+ * `RPC_FRAME_TOO_LARGE`, sering TANPA pesan. Tanpa daftar ini, matinya proses mesin tidak
+ * pernah dianggap sementara dan model cadangan tidak pernah dicoba.
+ *
+ * Keputusan (26 Sep 2026, butir 57): proses mesin mati/gagal start dianggap galat KONEKSI
+ * (sementara) karena percobaan ulang dengan model lain masih wajar; `RPC_FRAME_TOO_LARGE`
+ * dianggap PERMANEN karena masalah ukuran bingkai RPC tidak akan berubah oleh model lain.
+ */
+const ENGINE_TRANSIENT_CODES = [/\bENGINE_EXITED\b/, /\bENGINE_START_FAILED\b/];
+const ENGINE_PERMANENT_CODES = [/\bRPC_FRAME_TOO_LARGE\b/];
+
+/**
  * Galat sementara boleh memicu perpindahan model; galat permintaan salah tidak boleh, karena
  * mencoba ulang dengan model lain hanya menyembunyikan kesalahan pengguna dan menambah biaya.
  */
 export function isTransientEngineError(message: unknown): boolean {
   const value = String(message ?? "");
   if (!value.trim()) return false;
+  // Galat permanen menang lebih dulu: pesan boleh memuat "429" sekaligus "400", dan yang terakhir
+  // berarti permintaan pengguna yang salah. Percobaan ulang hanya akan menyembunyikannya.
   if (PERMANENT_PATTERNS.some((pattern) => pattern.test(value))) return false;
+  if (ENGINE_PERMANENT_CODES.some((pattern) => pattern.test(value))) return false;
+  if (ENGINE_TRANSIENT_CODES.some((pattern) => pattern.test(value))) return true;
   return TRANSIENT_PATTERNS.some((pattern) => pattern.test(value));
 }
 
@@ -71,7 +89,8 @@ export type FallbackOutcome = { model: string; switches: number; usage: unknown;
  * Wave 11A (butir 57): menjalankan satu permintaan mesin, lalu berpindah ke model cadangan HANYA
  * bila galatnya sementara (429/5xx/timeout/koneksi) dan jatah perpindahan belum habis.
  * Galat permintaan salah (400/401/403/404) langsung dilempar supaya tidak menutupi masalah nyata.
- * Bila semua percobaan habis, galat yang dilempar adalah `ENGINE_UNAVAILABLE`.
+ * Bila semua percobaan sementara habis, galat yang dilempar adalah `ENGINE_UNAVAILABLE`; galat
+ * permintaan yang salah dilempar apa adanya supaya penyebabnya tidak tersamar.
  */
 export async function runWithModelFallback(input: {
   primary: string;
@@ -92,7 +111,10 @@ export async function runWithModelFallback(input: {
       lastError = error instanceof Error ? error.message : "ENGINE_FAILED";
       const next = attempts[index + 1];
       const canSwitch = Boolean(next) && switches < input.maxSwitches && isTransientEngineError(lastError);
-      if (!canSwitch) throw new Error(switches > 0 ? "ENGINE_UNAVAILABLE" : lastError);
+      // DoD butir 57: jatah perpindahan habis -> `ENGINE_UNAVAILABLE`. Tetapi bila yang gagal
+      // terakhir adalah galat PERMANEN (permintaan salah), galat itu yang dilaporkan apa adanya;
+      // menyebutnya "gangguan mesin" membuat pengguna mengejar penyebab yang salah.
+      if (!canSwitch) throw new Error(switches > 0 && isTransientEngineError(lastError) ? "ENGINE_UNAVAILABLE" : lastError);
       switches += 1;
       input.onFallback?.(attempt, next!, lastError);
     }

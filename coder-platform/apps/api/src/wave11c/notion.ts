@@ -307,7 +307,9 @@ export function registerNotionRoutes(app: any): void {
 
   app.delete("/api/v1/integrations/notion", { preHandler: requireUser }, async (request: any, reply: any) => {
     const row = notionRow(request.user!.id);
-    if (!row) return fail(reply, 404, "NOTION_NOT_CONNECTED", "Notion belum tersambung.");
+    // PRD butir 68 menyebut 409 untuk "belum tersambung" (keadaan, bukan alamat yang salah) — sama
+    // dengan POST /pages. Sebelumnya rute ini menjawab 404; disamakan sekarang.
+    if (!row) return fail(reply, 409, "NOTION_NOT_CONNECTED", "Notion belum tersambung.");
     db.prepare("DELETE FROM user_integrations WHERE id=? AND user_id=?").run(row.id, request.user!.id);
     audit(request.user!.id, "integration.disconnected", { provider: NOTION_PROVIDER });
     return { deleted: true, provider: NOTION_PROVIDER };

@@ -261,15 +261,18 @@ check("4) GET harga satu model menjawab 200 dengan sumber override dan angka yan
   singleModel.status === 200 && singleModel.json?.source === "override" && singleModel.json?.base?.input === 9.5 && singleModel.json?.base?.output === 19,
   JSON.stringify(singleModel.json)?.slice(0, 240));
 check("4) GET harga satu model memuat markup yang berlaku", Number(singleModel.json?.markup) === 1, String(singleModel.json?.markup));
-// TEMUAN: bidang `catalog` pada rute ini dihitung dengan priceView(model, 1), dan priceView selalu
-// mendahulukan harga pengganti. Jadi saat harga pengganti aktif, `catalog` berisi harga pengganti
-// juga, bukan harga resmi katalog. server.ts di luar berkas yang boleh saya sentuh, jadi dilaporkan.
-if (Number(singleModel.json?.catalog?.input) === price?.input && Number(singleModel.json?.catalog?.output) === price?.output) {
-  check("4) bidang catalog memuat harga resmi katalog", true, "");
-} else {
-  skip("4) bidang `catalog` GET /admin/pricing/models/:model memuat harga resmi katalog",
-    `TIDAK terpenuhi: catalog.input=${singleModel.json?.catalog?.input} sedangkan harga katalog resmi=${price?.input}. Ini temuan pada server.ts, bukan kegagalan uji saya.`);
-}
+// Diperbaiki 26 Sep 2026 (audit cek vakum): dulu cabang ini hanya memanggil `check(..., true)` setelah
+// syaratnya sendiri sudah terpenuhi, jadi tidak membuktikan apa pun. Catatan lama menyebut `catalog`
+// berisi harga pengganti karena dihitung priceView(model, 1); server.ts:4017 sekarang mengisinya
+// dengan catalogPriceFor(model) (pricing.ts:134) yang memang mengabaikan harga pengganti. Yang harus
+// dibuktikan: `catalog` tetap memuat harga resmi katalog SELURUHNYA (input, output, cache) walau
+// harga pengganti 9,5 / 19 sedang aktif, dan bukan harga pengganti itu.
+const katalogDiJawaban = singleModel.json?.catalog;
+check("4) bidang catalog memuat harga resmi katalog, bukan harga pengganti",
+  Number(katalogDiJawaban?.input) === price?.input && Number(katalogDiJawaban?.output) === price?.output
+  && Number(katalogDiJawaban?.cacheRead) === price?.cacheRead && Number(katalogDiJawaban?.cacheWrite) === price?.cacheWrite
+  && Number(katalogDiJawaban?.input) !== 9.5 && Number(katalogDiJawaban?.output) !== 19,
+  JSON.stringify({ catalog: katalogDiJawaban, katalogResmi: { input: price?.input, output: price?.output, cacheRead: price?.cacheRead, cacheWrite: price?.cacheWrite }, hargaPengganti: { input: 9.5, output: 19 } })?.slice(0, 300));
 const removed = await admin.call("DELETE", `/api/v1/admin/pricing/models/${KATALOG_MODEL}`);
 check("4) DELETE harga pengganti -> 200 ok", removed.status === 200 && removed.json?.ok === true, JSON.stringify(removed.json)?.slice(0, 200));
 check("4) setelah DELETE: source kembali catalog", removed.json?.price?.source === "catalog", JSON.stringify(removed.json?.price)?.slice(0, 200));

@@ -30,12 +30,18 @@ import { PORT_TERBLOKIR_FETCH, pilihPortUji } from "./port-aman.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const TERBLOKIR = [...PORT_TERBLOKIR_FETCH].sort((a, b) => a - b);
 
-let passed = 0, failed = 0;
+let passed = 0, failed = 0, skipped = 0;
 const failedNames: string[] = [];
 function cek(nama: string, syarat: boolean, rincian = "") {
   if (syarat) { passed++; console.log(`PASS ${nama}${rincian ? " · " + rincian : ""}`); }
   else { failed++; failedNames.push(nama); console.log(`GAGAL ${nama}${rincian ? " · " + rincian : ""}`); }
 }
+/**
+ * Satu-satunya jalan melewati pemeriksaan. Ringkasan berkas ini dulu mencetak `skip=0` secara
+ * HARFIAH, jadi pemeriksaan yang dilewati tidak akan terlihat sama sekali. Sekarang jumlahnya
+ * dihitung sungguhan dan dilaporkan juga sebagai `SKIP-TOTAL`.
+ */
+function skip(nama: string, alasan: string) { skipped++; console.log(`SKIP ${nama} · ${alasan}`); }
 
 /** Sebab galat fetch: "bad port" berarti nomor port ditolak sebelum menyambung. */
 async function sebabFetch(port: number): Promise<string> {
@@ -149,7 +155,8 @@ cek("D4 tidak ada turunan port yang memuat nomor terblokir", turunanSalah.length
 console.log("");
 console.log(`Daftar port terblokir fetch yang diuji: ${TERBLOKIR.join(", ")}`);
 if (failedNames.length) { console.log(`GAGAL ${failed} pemeriksaan:`); for (const n of failedNames) console.log(`  - ${n}`); }
-console.log(`RINGKASAN cek: lulus=${passed} gagal=${failed} skip=0`);
+console.log(`RINGKASAN cek: lulus=${passed} gagal=${failed} skip=${skipped}`);
+if (skipped > 0) console.log(`SKIP-TOTAL ${skipped}`);
 if (failed === 0) { console.log("ALL_PORT_UJI_FETCH_AMAN_PASSED"); process.exit(0); }
 console.log("SUITE_FAILED");
 process.exit(1);

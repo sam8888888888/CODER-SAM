@@ -11,13 +11,18 @@
 import { randomUUID } from "node:crypto";
 import { db } from "../db.js";
 import { isSealed, maskSecret, tryOpenSecret } from "../secrets.js";
-import { platformSetting } from "../wave11a/shared.js";
+import { platformSetting, savePlatformSetting } from "../wave11a/shared.js";
 
 export const CONNECTOR_KINDS = ["slack", "discord", "mcp"] as const;
 export type ConnectorKind = (typeof CONNECTOR_KINDS)[number];
 
 /** Kunci pengaturan platform berisi daftar putih alat MCP. Kosong = MCP belum dibuka sama sekali. */
 export const MCP_ALLOWED_TOOLS_KEY = "mcp_allowed_tools";
+
+/** Batas jumlah alat MCP yang boleh diizinkan admin platform sekaligus. */
+export const MAX_MCP_TOOLS = 60;
+/** Pola nama alat MCP yang sah: huruf kecil/angka, lalu boleh `.`, `_`, `:`, `-`. */
+export const MCP_TOOL_PATTERN = /^[a-z0-9][a-z0-9_.:-]{0,63}$/;
 
 export const MAX_URL_CHARS = 500;
 export const MAX_TOKEN_CHARS = 400;
@@ -204,6 +209,18 @@ export function mcpAllowedTools(): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+/**
+ * Menulis daftar putih alat MCP ke pengaturan platform. Ini SATU-SATUNYA penulis di produksi
+ * (rutenya `PUT /api/v1/admin/mcp-allowed-tools`, khusus admin platform) — sebelum ini hanya suite
+ * uji yang menulis kunci ini, sehingga MCP selalu tertutup bagi pelanggan.
+ * Nama dinormalkan: huruf kecil, tanpa duplikat. Kosong = MCP tertutup.
+ */
+export function setMcpAllowedTools(alat: string[]): string[] {
+  const bersih = Array.from(new Set(alat.map((item) => String(item).trim().toLowerCase()).filter(Boolean)));
+  savePlatformSetting(MCP_ALLOWED_TOOLS_KEY, bersih.join(","));
+  return bersih;
 }
 
 export function mcpToolsAllowed(tools: unknown): { ok: true } | { ok: false; ditolak: string[] } {

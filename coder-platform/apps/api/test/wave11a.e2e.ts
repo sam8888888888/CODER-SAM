@@ -286,6 +286,34 @@ await owner.call("POST", `/api/v1/conversations/${conversationId}/messages`, { c
 const eksekusiEcho = await lastAssistantText(owner, conversationId);
 check("1o. mode eksekusi tidak menyisipkan blok mode", !eksekusiEcho.includes("【MODE DISKUSI】"), short(eksekusiEcho, 240));
 
+// DoD butir 42: "saat mode diskusi, perintah 'tulis berkas X' TIDAK menghasilkan artefak; saat
+// eksekusi menghasilkan." Instruksi 【MODE DISKUSI】 hanya mengatur mesin, jadi janji itu ditegakkan
+// juga di pintu artefak aplikasi: berkas yang menempel pada run mode diskusi ditolak (409).
+const runDiskusi = String((db.prepare("SELECT run_id AS runId FROM messages WHERE conversation_id=? AND role='assistant' AND run_id IS NOT NULL ORDER BY created_at DESC, rowid DESC LIMIT 1").get(conversationId) as any)?.runId ?? "");
+check("1p. run mode diskusi tersedia sebagai bukti (prasyarat DoD)", Boolean(runDiskusi), `runId=${runDiskusi}`);
+const isiArtefak = Buffer.from("catatan uji mode diskusi", "utf8").toString("base64");
+const artefakSebelum = tableCount("SELECT COUNT(*) AS n FROM artifacts");
+await owner.call("PUT", `/api/v1/conversations/${conversationId}/mode`, { mode: "diskusi" });
+const artefakDiskusi = await owner.call("POST", `/api/v1/projects/${projectId}/artifacts`, { name: "tulis-berkas-diskusi.txt", mimeType: "text/plain", contentBase64: isiArtefak, runId: runDiskusi });
+check("1q. mode diskusi menolak berkas dari run itu (409 DISKUSI_MODE_NO_EXECUTE)",
+  artefakDiskusi.status === 409 && artefakDiskusi.json?.error === "DISKUSI_MODE_NO_EXECUTE",
+  `${artefakDiskusi.status} ${short(artefakDiskusi.json, 200)}`);
+check("1r. penolakan itu tidak menyisakan baris artefak", tableCount("SELECT COUNT(*) AS n FROM artifacts") === artefakSebelum,
+  `${artefakSebelum} -> ${tableCount("SELECT COUNT(*) AS n FROM artifacts")}`);
+const auditDiskusi = db.prepare("SELECT metadata_json AS detail FROM audit_events WHERE action='artifact.blocked_diskusi' ORDER BY created_at DESC LIMIT 1").get() as any;
+check("1s. penolakan tercatat di audit_events dengan runId run itu", String(auditDiskusi?.detail ?? "").includes(runDiskusi),
+  short(auditDiskusi?.detail, 200));
+await owner.call("PUT", `/api/v1/conversations/${conversationId}/mode`, { mode: "eksekusi" });
+const artefakEksekusi = await owner.call("POST", `/api/v1/projects/${projectId}/artifacts`, { name: "tulis-berkas-eksekusi.txt", mimeType: "text/plain", contentBase64: isiArtefak, runId: runDiskusi });
+check("1t. mode eksekusi menghasilkan artefak untuk run yang sama (201)", artefakEksekusi.status === 201 && Boolean(artefakEksekusi.json?.id) && tableCount("SELECT COUNT(*) AS n FROM artifacts") === artefakSebelum + 1,
+  `${artefakEksekusi.status} ${short(artefakEksekusi.json, 160)}`);
+const artefakSalahProyek = await other.call("POST", `/api/v1/projects/${otherProjectId}/artifacts`, { name: "salah-proyek.txt", mimeType: "text/plain", contentBase64: isiArtefak, runId: runDiskusi });
+check("1u. run yang bukan milik proyek itu ditolak (400 RUN_NOT_IN_PROJECT)", artefakSalahProyek.status === 400 && artefakSalahProyek.json?.error === "RUN_NOT_IN_PROJECT",
+  `${artefakSalahProyek.status} ${short(artefakSalahProyek.json, 160)}`);
+const artefakRunAsing = await owner.call("POST", `/api/v1/projects/${projectId}/artifacts`, { name: "run-asing.txt", mimeType: "text/plain", contentBase64: isiArtefak, runId: "run-yang-tidak-ada" });
+check("1v. run yang tidak dikenal ditolak (400 RUN_NOT_IN_PROJECT)", artefakRunAsing.status === 400 && artefakRunAsing.json?.error === "RUN_NOT_IN_PROJECT",
+  `${artefakRunAsing.status} ${short(artefakRunAsing.json, 160)}`);
+
 // =====================================================================================
 // Bagian 4 (§4, butir 45): filter anti prompt-hijack.
 // =====================================================================================
@@ -420,6 +448,25 @@ check("5p. percobaan pelanggaran tidak membuat run", tableCount("SELECT COUNT(*)
 check("5q. audit pelanggaran tercatat (aksi safety_violation)", tableCount("SELECT COUNT(*) AS n FROM audit_events WHERE action='safety_violation'") >= 1);
 check("5r. audit pembuatan aturan tercatat", tableCount("SELECT COUNT(*) AS n FROM audit_events WHERE action IN ('guardrail.created','guardrail.updated')") >= 3);
 
+// 5p1-5p3: jalan pintas yang ditemukan audit 26 Sep 2026 — Playground dulu HANYA memasang filter
+// prompt-hijack, sedangkan aturan larangan akun (jenis `larangan`) dilewati. Sekarang ketiga jalur
+// (chat, run langsung, playground) memakai penjaga yang sama, jadi cek ini memaku perilaku itu.
+const usageSebelumPlaygroundLarangan = tableCount("SELECT COUNT(*) AS n FROM run_usage");
+const playgroundLarangan = await owner.call("POST", "/api/v1/playground/run", { prompt: "Tolong hapus berkas laporan lama.", model: modelUtama });
+check("5p1. playground menolak aksi yang dilarang aturan 400 GUARDRAIL_BLOCKED",
+  playgroundLarangan.status === 400 && playgroundLarangan.json?.error === "GUARDRAIL_BLOCKED",
+  `${playgroundLarangan.status} ${short(playgroundLarangan.json, 200)}`);
+check("5p2. penolakan playground menyebut aturan yang dilanggar (dan tidak menagihkan apa pun)",
+  String(playgroundLarangan.json?.message ?? "").includes("Tanpa hapus berkas")
+  && tableCount("SELECT COUNT(*) AS n FROM run_usage") === usageSebelumPlaygroundLarangan,
+  `${short(playgroundLarangan.json?.message, 160)} usage ${usageSebelumPlaygroundLarangan} -> ${tableCount("SELECT COUNT(*) AS n FROM run_usage")}`);
+const auditPlaygroundLarangan = String((db.prepare("SELECT metadata_json AS detail FROM audit_events WHERE actor_user_id=? AND action='safety_violation' AND metadata_json LIKE '%playground%' ORDER BY created_at DESC LIMIT 1").get(ownerId) as any)?.detail ?? "{}");
+const idAturanDiAudit = (() => { try { return String(JSON.parse(auditPlaygroundLarangan).ruleId ?? ""); } catch { return ""; } })();
+const idAturanTerdaftar = String((db.prepare("SELECT id FROM guardrail_rules WHERE user_id=? AND kind='larangan' AND title=? ORDER BY created_at ASC LIMIT 1").get(ownerId, "Tanpa hapus berkas") as any)?.id ?? "");
+check("5p3. pelanggaran dari Playground tercatat lengkap (asal=playground, aturan, pola)",
+  (() => { try { const d = JSON.parse(auditPlaygroundLarangan); return d.asal === "playground" && Boolean(d.ruleId) && d.ruleId === idAturanTerdaftar && d.pola === "hapus berkas" && d.judul === "Tanpa hapus berkas"; } catch { return false; } })(),
+  `laranganId=${laranganId} audit=${idAturanDiAudit} db=${idAturanTerdaftar} ${short(auditPlaygroundLarangan, 160)}`);
+
 // Butir 46 (sisi antarmuka Riwayat run): detail run membawa jejak pelanggaran untuk run ITU.
 // Pelanggaran normalnya dicegat sebelum run dibuat, jadi daftarnya kosong. Supaya kuerinya benar-benar
 // terbukti, satu baris safety_events disisipkan dengan run_id run nyata di percakapan ini.
@@ -488,6 +535,38 @@ check("6k. alat di luar katalog ditolak 400 TOOL_NOT_ALLOWED", luarKatalog.statu
 check("6l. jawaban menyebut nama alat yang tidak dikenal", Array.isArray(luarKatalog.json?.unknown) && luarKatalog.json.unknown.includes("browse_web"), short(luarKatalog.json));
 check("6m. badan permintaan tanpa daftar ditolak 400 INVALID_TOOLS_POLICY", (await owner.call("PUT", "/api/v1/tools-policy", { sesuatu: 1 })).json?.error === "INVALID_TOOLS_POLICY");
 check("6n. kebijakan pengguna lain tidak terpengaruh", String((db.prepare("SELECT tools_allow AS t FROM agent_settings WHERE user_id=?").get(otherId) as any)?.t ?? "") === "");
+await owner.call("PUT", "/api/v1/tools-policy", { tools: [] });
+
+// Butir 47 — audit 26 Sep 2026 menemukan DUA pintu tulis untuk kolom yang sama: `PUT /tools-policy`
+// (memvalidasi) dan `PATCH /agents/settings` (dulu menulis mentah tanpa validasi/audit, dan UI
+// memakai pintu kedua itu). Cek 6o-6t membuktikan kedua pintu kini memakai ATURAN YANG SAMA.
+const viaSettingsLuarKatalog = await owner.call("PATCH", "/api/v1/agents/settings", { toolsAllow: ["browse_web"] });
+check("6o. PATCH /agents/settings menolak alat di luar katalog 400 TOOL_NOT_ALLOWED (dulu tersimpan mentah)",
+  viaSettingsLuarKatalog.status === 400 && viaSettingsLuarKatalog.json?.error === "TOOL_NOT_ALLOWED" &&
+  String((db.prepare("SELECT tools_allow AS t FROM agent_settings WHERE user_id=?").get(ownerId) as any)?.t ?? "") !== "browse_web",
+  `${viaSettingsLuarKatalog.status} ${short(viaSettingsLuarKatalog.json)}`);
+const viaSettingsNamaBuruk = await owner.call("PATCH", "/api/v1/agents/settings", { toolsAllow: ["bad name!"] });
+check("6p. PATCH /agents/settings menolak nama alat tidak sah 400 INVALID_TOOL_NAME",
+  viaSettingsNamaBuruk.status === 400 && viaSettingsNamaBuruk.json?.error === "INVALID_TOOL_NAME",
+  `${viaSettingsNamaBuruk.status} ${short(viaSettingsNamaBuruk.json)}`);
+const auditSebelumPintu = tableCount("SELECT COUNT(*) AS n FROM audit_events WHERE action='tool_policy.updated'");
+const viaSettingsSah = await owner.call("PATCH", "/api/v1/agents/settings", { toolsAllow: "write_file,read_file" });
+check("6q. PATCH /agents/settings menyimpan daftar sah (diurut unik, tanpa spasi)",
+  viaSettingsSah.status === 200 && String((db.prepare("SELECT tools_allow AS t FROM agent_settings WHERE user_id=?").get(ownerId) as any)?.t ?? "") === "write_file,read_file",
+  `${viaSettingsSah.status} db=${(db.prepare("SELECT tools_allow AS t FROM agent_settings WHERE user_id=?").get(ownerId) as any)?.t} ${short(viaSettingsSah.json)}`);
+const auditPintu = db.prepare("SELECT metadata_json AS m FROM audit_events WHERE action='tool_policy.updated' ORDER BY rowid DESC LIMIT 3").all() as any[];
+check("6r. perubahan lewat pintu pengaturan tercatat audit dengan penanda pintu",
+  tableCount("SELECT COUNT(*) AS n FROM audit_events WHERE action='tool_policy.updated'") > auditSebelumPintu &&
+  auditPintu.some((row) => String(row?.m ?? "").includes("agents_settings")),
+  short(auditPintu));
+const viaSettingsTeksKosong = await owner.call("PATCH", "/api/v1/agents/settings", { toolsAllow: "" });
+check("6s. teks kosong di pintu pengaturan berarti bawaan mesin (tersimpan sebagai string kosong)",
+  viaSettingsTeksKosong.status === 200 && String((db.prepare("SELECT tools_allow AS t FROM agent_settings WHERE user_id=?").get(ownerId) as any)?.t ?? "x") === "",
+  `${viaSettingsTeksKosong.status} ${short(viaSettingsTeksKosong.json)}`);
+const viaSettingsNone = await owner.call("PATCH", "/api/v1/agents/settings", { toolsAllow: "none" });
+check("6t. 'none' lewat pintu pengaturan sama artinya dengan pintu kebijakan alat",
+  viaSettingsNone.status === 200 && String((db.prepare("SELECT tools_allow AS t FROM agent_settings WHERE user_id=?").get(ownerId) as any)?.t ?? "") === "none",
+  `${viaSettingsNone.status} ${short(viaSettingsNone.json)}`);
 await owner.call("PUT", "/api/v1/tools-policy", { tools: [] });
 
 // =====================================================================================
@@ -629,6 +708,87 @@ const estimasiAsing = await owner.call("POST", "/api/v1/playground/estimate", { 
 check("11h. model tak dikenal 404 MODEL_UNKNOWN, bukan angka karangan", estimasiAsing.status === 404 && estimasiAsing.json?.error === "MODEL_UNKNOWN", `${estimasiAsing.status} ${short(estimasiAsing.json)}`);
 check("11i. fungsi estimasi modul konsisten dengan rute", estimateMod.estimateTokensFromChars(400) === 100, String(estimateMod.estimateTokensFromChars(400)));
 
+// ---------------------------------------------------------------------------------------------
+// Bagian 11 lanjutan — PERBAIKAN butir 56 (audit 26 Sep 2026): perkiraan biaya di UI bisa
+// SETENGAH tagihan nyata pada jam puncak.
+//
+// Sebelumnya `estimate.ts` mengalikan sendiri `priceView().sell`, sehingga faktor tarif puncak
+// vendor (DeepSeek = 2x tarif luar puncak) tidak ikut terhitung. Uji di bawah membandingkan
+// perkiraan dengan TAGIHAN NYATA: satu permintaan benar-benar dijalankan lewat
+// `/api/v1/playground/run` (rute itu menulis baris `user_usage` memakai jalur penagihan yang sama
+// dengan run biasa), lalu perkiraan diminta untuk token yang SAMA, dan kedua angka harus sama.
+//
+// Supaya hasilnya tidak bergantung pada jam berapa suite dijalankan, jam proses (`Date.now`)
+// dipaku sebentar pada satu jam puncak dan satu jam luar puncak. Jalur penagihan dan jalur
+// perkiraan sama-sama membaca `Date.now()`, jadi keduanya melihat jam yang sama; jam asli
+// dipasang kembali pada blok `finally`. Baris pemakaian tetap tercatat dengan waktu nyata
+// (`new Date()`), hanya tarifnya yang dihitung pada jam uji.
+const modelTarifPuncak = "deepseek-v4-flash"; // ada di katalog mesin DAN di daftar harga vendor (punya tarif puncak)
+const promptTarifPuncak = "p".repeat(4000);   // 4.000 karakter -> 1.000 token masukan
+const markupUjiPuncak = 1.5;                  // markup != 1 supaya markup pemilik ikut terbukti
+const markupSebelumUji = pricingMod.pricingSettings().markup;
+
+/** Jam uji pada jam UTC tertentu di hari kerja terakhir (tarif puncak DeepSeek 01:00-04:00 & 06:00-10:00 UTC, Senin-Jumat). */
+function cariSaatUji(jamUtc: number): number {
+  for (let mundur = 1; mundur <= 14; mundur += 1) {
+    const saat = new Date(Date.now() - mundur * 86_400_000);
+    saat.setUTCHours(jamUtc, 0, 0, 0);
+    const hari = saat.getUTCDay();
+    if (saat.getTime() <= Date.now() && hari >= 1 && hari <= 5) return saat.getTime();
+  }
+  throw new Error(`Tidak ada hari kerja dalam 14 hari terakhir untuk jam ${jamUtc}:00 UTC.`);
+}
+const SAAT_PUNCAK = cariSaatUji(2);      // 02:00 UTC: di dalam jendela puncak 01:00-04:00
+const SAAT_LUAR_PUNCAK = cariSaatUji(5); // 05:00 UTC: di luar kedua jendela puncak
+
+/** Menjalankan pekerjaan dengan jam proses dipaku pada satu saat; jam asli selalu dipasang kembali. */
+async function denganJam<T>(saatMs: number, kerja: () => Promise<T>): Promise<T> {
+  const jamAsli = Date.now;
+  Date.now = () => saatMs;
+  try { return await kerja(); } finally { Date.now = jamAsli; }
+}
+
+/** Tagihan NYATA satu permintaan playground: baris `user_usage` yang ditulis jalur penagihan server. */
+async function tagihanNyataPlayground(prompt: string): Promise<{ status: number; baris: any }> {
+  const batas = Number((db.prepare("SELECT COALESCE(MAX(rowid),0) AS n FROM user_usage WHERE user_id=?").get(ownerId) as any)?.n ?? 0);
+  const jawab = await owner.call("POST", "/api/v1/playground/run", { prompt, model: modelTarifPuncak });
+  const baris = db.prepare("SELECT model, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_micros AS costMicros, sell_cost_micros AS sellMicros FROM user_usage WHERE user_id=? AND rowid > ? ORDER BY rowid DESC LIMIT 1").get(ownerId, batas) as any;
+  return { status: jawab.status, baris };
+}
+
+/** Satu putaran: tagihan nyata + perkiraan untuk token yang sama, pada jam yang sama. */
+async function putaranBiaya(): Promise<{ tagihan: any; perkiraan: any }> {
+  const tagihan = await tagihanNyataPlayground(promptTarifPuncak);
+  const perkiraan = await owner.call("POST", "/api/v1/playground/estimate", { model: modelTarifPuncak, prompt: promptTarifPuncak, outputTokens: Number(tagihan.baris?.outputTokens ?? 0) });
+  return { tagihan: tagihan.baris, perkiraan: perkiraan.json };
+}
+
+pricingMod.setPricingMarkup(markupUjiPuncak);
+let hasilPuncak: { tagihan: any; perkiraan: any } = { tagihan: null, perkiraan: null };
+let hasilLuarPuncak: { tagihan: any; perkiraan: any } = { tagihan: null, perkiraan: null };
+try {
+  hasilPuncak = await denganJam(SAAT_PUNCAK, putaranBiaya);
+  hasilLuarPuncak = await denganJam(SAAT_LUAR_PUNCAK, putaranBiaya);
+} finally {
+  pricingMod.setPricingMarkup(markupSebelumUji);
+}
+const tagihanPuncakMicros = Number(hasilPuncak.tagihan?.sellMicros ?? -1);
+const tagihanLuarMicros = Number(hasilLuarPuncak.tagihan?.sellMicros ?? -1);
+const perkiraanPuncakMicros = Number(hasilPuncak.perkiraan?.estimatedCostMicros ?? -1);
+const perkiraanLuarMicros = Number(hasilLuarPuncak.perkiraan?.estimatedCostMicros ?? -1);
+console.log(`INFO butir 56: mikrodolar perkiraan vs tagihan nyata - jam puncak ${perkiraanPuncakMicros} vs ${tagihanPuncakMicros}, luar puncak ${perkiraanLuarMicros} vs ${tagihanLuarMicros} (saat uji puncak ${new Date(SAAT_PUNCAK).toISOString()}, saat uji luar puncak ${new Date(SAAT_LUAR_PUNCAK).toISOString()})`);
+check("11j. jam puncak siap: run nyata menulis tagihan untuk 1.000 token masukan + 8 token keluaran", tagihanPuncakMicros > 0 && Number(hasilPuncak.tagihan?.inputTokens) === 1000 && Number(hasilPuncak.tagihan?.outputTokens) === 8, `${short(hasilPuncak.tagihan)}`);
+check("11k. PERKIRAAN jam puncak = TAGIHAN NYATA jam puncak (faktor puncak ikut terhitung)", perkiraanPuncakMicros === tagihanPuncakMicros && perkiraanPuncakMicros > 0, `perkiraan=${perkiraanPuncakMicros} tagihan=${tagihanPuncakMicros}`);
+check("11l. PERKIRAAN di luar jam puncak = TAGIHAN NYATA di luar jam puncak", perkiraanLuarMicros === tagihanLuarMicros && perkiraanLuarMicros > 0, `perkiraan=${perkiraanLuarMicros} tagihan=${tagihanLuarMicros}`);
+check("11m. tagihan nyata jam puncak = 2x tagihan luar puncak (toleransi 1 mikrodolar pembulatan)", Math.abs(Number(hasilPuncak.tagihan?.costMicros) - 2 * Number(hasilLuarPuncak.tagihan?.costMicros)) <= 1, `${hasilPuncak.tagihan?.costMicros} vs ${hasilLuarPuncak.tagihan?.costMicros}`);
+// Pemeriksaan 11n inilah yang GAGAL bila faktor puncak hilang dari perkiraan: versi lama
+// menghasilkan angka yang sama pada kedua jam (rasio 1), bukan 2.
+const rasioPerkiraan = perkiraanLuarMicros > 0 ? perkiraanPuncakMicros / perkiraanLuarMicros : 0;
+check("11n. perkiraan jam puncak ~2x perkiraan luar jam puncak (rasio dalam 1%)", Math.abs(rasioPerkiraan - 2) < 0.01, `${perkiraanPuncakMicros} / ${perkiraanLuarMicros} = ${rasioPerkiraan.toFixed(4)}`);
+check("11o. rute menyebut tarif puncak dipakai pada jam puncak", hasilPuncak.perkiraan?.tarifPuncak?.aktif === true && Number(hasilPuncak.perkiraan?.tarifPuncak?.faktor) === 2, short(hasilPuncak.perkiraan?.tarifPuncak));
+check("11p. rute menyebut tarif luar puncak di luar jam puncak", hasilLuarPuncak.perkiraan?.tarifPuncak?.aktif === false && Number(hasilLuarPuncak.perkiraan?.tarifPuncak?.faktor) === 1, short(hasilLuarPuncak.perkiraan?.tarifPuncak));
+check("11q. markup uji dikembalikan ke nilai sebelumnya", pricingMod.pricingSettings().markup === markupSebelumUji, `${pricingMod.pricingSettings().markup} vs ${markupSebelumUji}`);
+
 // =====================================================================================
 // Bagian 12 (§12, butir 57): fallback model otomatis.
 // =====================================================================================
@@ -641,7 +801,15 @@ check("12d. model cadangan sama dengan model utama ditolak", (await owner.call("
 check("12e. model cadangan ganda ditolak", (await owner.call("PATCH", "/api/v1/agents/settings", { modelUtama, fallbackModels: [modelCadangan1, modelCadangan1] })).json?.error === "INVALID_FALLBACK_MODELS");
 check("12f. lebih dari 3 model cadangan ditolak", (await owner.call("PATCH", "/api/v1/agents/settings", { modelUtama, fallbackModels: ["a1", "a2", "a3", "a4"] })).json?.error === "INVALID_FALLBACK_MODELS");
 check("12g. halaman fallback melaporkan daftar + batas", (await owner.call("GET", "/api/v1/agents/fallback")).json?.maxSwitchesPerRun === 2);
+// Premis: nama model yang dipakai di bagian ini harus ada di katalog mesin, karena rute run menolak
+// nama tak dikenal dengan 400 UNKNOWN_MODEL. Kalau premis ini gagal, hasil bagian 12 tidak sah.
+const katalog11a = await owner.call("GET", "/api/v1/models");
+const namaKatalog: string[] = (katalog11a.json?.models ?? []).map((row: any) => row.model);
+check("12h0. premis: model uji ada di katalog mesin (kalau gagal, bagian 12 tidak sah)",
+  [modelCadangan1, modelCadangan2, modelCadangan3].every((m) => namaKatalog.includes(m)),
+  `katalog=${namaKatalog.length} ${[modelCadangan1, modelCadangan2, modelCadangan3].map((m) => `${m}=${namaKatalog.includes(m)}`).join(" ")}`);
 const runPindah = await owner.call("POST", `/api/v1/projects/${projectId}/runs`, { prompt: "Ringkas berkas rencana.", model: modelCadangan2 });
+if (runPindah.status !== 202) console.log(`INFO 12h. jawaban pembuatan run: ${runPindah.status} ${short(runPindah.text, 300)}`);
 const runPindahRow = await runRow(String(runPindah.json?.id ?? ""));
 check("12h. galat sementara (429) memicu pindah ke model cadangan", runPindahRow?.status === "completed" && runPindahRow?.model === modelCadangan1, short(runPindahRow, 260));
 check("12i. perpindahan tercatat di kolom runs.fallback_from", runPindahRow?.fallback_from === modelCadangan2 && Number(runPindahRow?.fallback_count) === 1, `${runPindahRow?.fallback_from} / ${runPindahRow?.fallback_count}`);
@@ -655,10 +823,47 @@ const biayaJujur = hargaTerpakai.source === "none"
 check("12j. biaya dicatat untuk model yang BENAR-BENAR dipakai (bukan model yang gagal)", pakaiRow?.model === modelCadangan1 && biayaJujur, `${short(pakaiRow)} sumberHarga=${hargaTerpakai.source}`);
 const runPindahApi = await owner.call("GET", `/api/v1/runs/${String(runPindah.json?.id ?? "")}`);
 check("12k. API run melaporkan fallbackFrom + fallbackCount", runPindahApi.json?.fallbackFrom === modelCadangan2 && Number(runPindahApi.json?.fallbackCount) === 1, short(runPindahApi.json, 260));
-process.env.MOCK_ENGINE_FAIL_TEXT = "400 permintaan salah";
+// Galat 400 TIDAK boleh pindah. Pesannya sengaja memuat "429" juga supaya yang diuji benar-benar
+// aturan "galat permanen menang", bukan sekadar "tidak ada pola sementara yang cocok".
+// (Kelemahan yang ditemukan audit 26 Sep 2026: mock dulu memotong "400" dari pesan, sehingga daftar
+// PERMANENT_PATTERNS tidak pernah benar-benar dipakai dan 12l lulus karena alasan yang salah.)
+process.env.MOCK_ENGINE_FAIL_TEXT = "400 permintaan salah setelah 429 rate limit";
 const runPermanen = await owner.call("POST", `/api/v1/projects/${projectId}/runs`, { prompt: "Ringkas berkas rencana sekali lagi.", model: modelCadangan2 });
 const runPermanenRow = await runRow(String(runPermanen.json?.id ?? ""));
-check("12l. galat 400 TIDAK memicu perpindahan", runPermanenRow?.status === "failed" && !runPermanenRow?.fallback_from, short(runPermanenRow, 260));
+check("12l. galat 400 TIDAK memicu perpindahan (walau pesannya juga memuat 429)",
+  runPermanenRow?.status === "failed" && !runPermanenRow?.fallback_from && String(runPermanenRow?.error_code ?? "").includes("400"), short(runPermanenRow, 260));
+// DoD menyebut 400/401/403: kode lain diuji lewat jalur nyata, satu run per kode.
+const runTidakPindah: { kode: string; baris: any }[] = [];
+for (const kode of ["401 unauthorized", "403 forbidden", "404 not found"]) {
+  process.env.MOCK_ENGINE_FAIL_TEXT = kode;
+  const balasan = await owner.call("POST", `/api/v1/projects/${projectId}/runs`, { prompt: `Uji galat ${kode}.`, model: modelCadangan2 });
+  runTidakPindah.push({ kode, baris: await runRow(String(balasan.json?.id ?? "")) });
+}
+check("12l2. galat 401/403/404 TIDAK memicu perpindahan dan kodenya tercatat apa adanya",
+  runTidakPindah.every((item) => item.baris?.status === "failed" && !item.baris?.fallback_from && String(item.baris?.error_code ?? "").includes(item.kode.slice(0, 3))),
+  runTidakPindah.map((item) => `${item.kode.split(" ")[0]}=${item.baris?.error_code ?? "-"}`).join(" | "));
+// Kode galat MESIN sungguhan (bukan pesan gaya HTTP) juga harus dikenali: mesin produksi mengirim
+// `code` dan sering tanpa pesan yang memuat kelas galatnya (temuan audit butir 57 poin 4).
+process.env.MOCK_ENGINE_FAIL_MODELS = modelCadangan2;
+process.env.MOCK_ENGINE_FAIL_TEXT = "ENGINE_EXITED Prime Agent exited with 1";
+const runMesinMati = await owner.call("POST", `/api/v1/projects/${projectId}/runs`, { prompt: "Uji mesin mati.", model: modelCadangan2 });
+const runMesinMatiRow = await runRow(String(runMesinMati.json?.id ?? ""));
+check("12l3. galat mesin ENGINE_EXITED pindah ke model cadangan (kelas koneksi)",
+  runMesinMatiRow?.status === "completed" && runMesinMatiRow?.model === modelCadangan1 && Number(runMesinMatiRow?.fallback_count) === 1, short(runMesinMatiRow, 260));
+process.env.MOCK_ENGINE_FAIL_TEXT = "RPC_FRAME_TOO_LARGE bingkai RPC terlalu besar";
+const runBingkai = await owner.call("POST", `/api/v1/projects/${projectId}/runs`, { prompt: "Uji bingkai RPC terlalu besar.", model: modelCadangan2 });
+const runBingkaiRow = await runRow(String(runBingkai.json?.id ?? ""));
+check("12l4. galat mesin RPC_FRAME_TOO_LARGE TIDAK pindah (kelas permanen)",
+  runBingkaiRow?.status === "failed" && !runBingkaiRow?.fallback_from && String(runBingkaiRow?.error_code ?? "").includes("RPC_FRAME_TOO_LARGE"), short(runBingkaiRow, 260));
+// Tabel klasifikasi: 7 sementara (termasuk 2 kode mesin) dan 6 permanen (termasuk 1 kode mesin).
+const tabelSementara = ["429 rate limit exceeded", "500 internal error", "503 temporarily unavailable", "timeout after 30s", "socket hang up ECONNRESET", "ENGINE_EXITED: Prime Agent exited with 1", "ENGINE_START_FAILED: gagal start"];
+const tabelPermanen = ["400 invalid request", "401 unauthorized", "403 forbidden", "404 not found", "422 unprocessable entity", "RPC_FRAME_TOO_LARGE: bingkai terlalu besar"];
+check("12l5. tabel klasifikasi: semua galat sementara dikenali, semua galat permanen ditolak",
+  tabelSementara.every((teks) => fallbackMod.isTransientEngineError(teks) === true) && tabelPermanen.every((teks) => fallbackMod.isTransientEngineError(teks) === false),
+  `sementara=${tabelSementara.filter((teks) => fallbackMod.isTransientEngineError(teks)).length}/${tabelSementara.length} permanen=${tabelPermanen.filter((teks) => !fallbackMod.isTransientEngineError(teks)).length}/${tabelPermanen.length}`);
+check("12l6. pesan campuran (429 + 400) dan kode kosong: permanen menang, kosong bukan sementara",
+  fallbackMod.isTransientEngineError("400 permintaan salah setelah 429 rate limit") === false && fallbackMod.isTransientEngineError("") === false && fallbackMod.isTransientEngineError(null) === false);
+process.env.MOCK_ENGINE_FAIL_MODELS = "";
 process.env.MOCK_ENGINE_FAIL_TEXT = "429 rate limit exceeded";
 // Dua model cadangan supaya batas 2 perpindahan benar-benar tercapai (1 utama + 2 perpindahan).
 const setDuaCadangan = await owner.call("PATCH", "/api/v1/agents/settings", { modelUtama: modelCadangan2, fallbackModels: [modelCadangan1, modelCadangan3] });
@@ -669,6 +874,19 @@ const runHabisRow = await runRow(String(runHabis.json?.id ?? ""));
 check("12m. batas 2 perpindahan ditegakkan lalu run gagal jujur", runHabisRow?.status === "failed" && Number(runHabisRow?.fallback_count) === 2 && String(runHabisRow?.error_code ?? "").includes("ENGINE_UNAVAILABLE"), short(runHabisRow, 300));
 const playgroundHabis = await owner.call("POST", "/api/v1/playground/run", { prompt: "Uji jalur sinkron tanpa model hidup.", model: modelCadangan2 });
 check("12n. jalur sinkron menjawab 502 ENGINE_UNAVAILABLE saat semua percobaan habis", playgroundHabis.status === 502 && playgroundHabis.json?.error === "ENGINE_UNAVAILABLE", `${playgroundHabis.status} ${short(playgroundHabis.json)}`);
+// Galat permanen SESUDAH satu perpindahan harus dilaporkan apa adanya, bukan sebagai "gangguan
+// mesin" (temuan audit 26 Sep 2026 butir 57 poin 5: dulu selalu `ENGINE_UNAVAILABLE`).
+process.env.MOCK_ENGINE_FAIL_TEXT_BY_MODEL = `${modelCadangan2}=429 rate limit exceeded;${modelCadangan1}=400 permintaan salah`;
+const setCampur = await owner.call("PATCH", "/api/v1/agents/settings", { modelUtama: modelCadangan2, fallbackModels: [modelCadangan1] });
+check("12u0. susunan uji campur tersimpan (utama gagal 429, cadangan gagal 400)",
+  setCampur.status === 200 && String(setCampur.json?.settings?.fallback_models ?? "").includes(modelCadangan1), `${setCampur.status} ${short(setCampur.json, 200)}`);
+const runCampur = await owner.call("POST", `/api/v1/projects/${projectId}/runs`, { prompt: "Uji galat permanen sesudah satu perpindahan.", model: modelCadangan2 });
+const runCampurRow = await runRow(String(runCampur.json?.id ?? ""));
+check("12u. galat 400 sesudah satu perpindahan dilaporkan sebagai galat permintaan, bukan ENGINE_UNAVAILABLE",
+  runCampurRow?.status === "failed" && Number(runCampurRow?.fallback_count) === 1
+  && String(runCampurRow?.error_code ?? "").includes("400") && !String(runCampurRow?.error_code ?? "").includes("ENGINE_UNAVAILABLE"),
+  short(runCampurRow, 300));
+process.env.MOCK_ENGINE_FAIL_TEXT_BY_MODEL = "";
 process.env.MOCK_ENGINE_FAIL_MODELS = ""; // mesin tiruan dikembalikan normal untuk bagian berikutnya
 check("12o. tidak ada sewa rahasia yang tertinggal setelah run gagal", vault.activeSecretLeases().length === 0, short(vault.activeSecretLeases()));
 

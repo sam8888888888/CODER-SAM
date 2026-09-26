@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, type Artifact, type AuditEvent, type ExecutionDetail, type Invitation, type KnowledgeDocument, type KnowledgeHit, type Member, type Workflow, type WorkflowExecution, type WorkflowStep } from './api';
+import { api, type Artifact, type AuditEvent, type ContextBudgetDrop, type ContextBudgetReport, type ExecutionDetail, type Invitation, type KnowledgeDocument, type KnowledgeHit, type Member, type Workflow, type WorkflowExecution, type WorkflowStep } from './api';
 // Wave 11A (butir 48 & 49): pratinjau multi-format dan sunting artefak dengan riwayat revisi.
 import { ArtifactPreview } from './ArtifactPreview';
 import { ArtifactEditor } from './ArtifactEditor';
@@ -61,6 +61,10 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
   const [usage, setUsage] = useState<UsageTotals | null>(null);
   const [usageModels, setUsageModels] = useState<UsageByModel[]>([]);
   const [usageNote, setUsageNote] = useState('');
+  // Wave 11A (butir 80): laporan pagar konteks beserta galat yang ditampilkan apa adanya.
+  const [pagarKonteks, setPagarKonteks] = useState<ContextBudgetReport | null>(null);
+  const [pagarKonteksGalat, setPagarKonteksGalat] = useState('');
+  const [pagarKonteksMemuat, setPagarKonteksMemuat] = useState(false);
 
   // Audit state
   const [audit, setAudit] = useState<AuditEvent[]>([]);
@@ -131,6 +135,16 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
   }
   async function loadUsage() { const data = await api.usage(projectId, 30); setUsage(data.totals); setUsageModels(data.byModel); setUsageNote(data.note); }
 
+  /** Butir 80: memuat laporan pagar konteks. Galat TIDAK disembunyikan — disimpan untuk kartu
+   *  "pagar-konteks-galat" supaya halaman Pemakaian berkata jujur saat server tidak menjawab. */
+  async function loadPagarKonteks() {
+    setPagarKonteksMemuat(true);
+    setPagarKonteksGalat('');
+    try { setPagarKonteks(await api.contextBudgetReport()); }
+    catch (error) { setPagarKonteks(null); setPagarKonteksGalat(error instanceof Error ? error.message : String(error)); }
+    finally { setPagarKonteksMemuat(false); }
+  }
+
   /** Reads a picked file as Base64 and uploads it as a knowledge document. */
   async function uploadDocument(file: File) {
     setUploading(true); setMessage('');
@@ -158,7 +172,7 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
       else if (tab === 'workflow') await loadWorkflows();
       else if (tab === 'team') await loadTeam();
       else if (tab === 'artifacts') await loadArtifacts();
-      else if (tab === 'usage') await loadUsage();
+      else if (tab === 'usage') { await loadUsage(); await loadPagarKonteks(); }
       else await loadAudit();
     });
   }, [tab, projectId, workspaceId]);
@@ -474,6 +488,70 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
     </div>
   );
 
+  /** Butir 80: daftar bagian yang tidak terkirim. Sumber utama `dipotong`; blok dengan
+   *  `terkirim=false` ditambahkan hanya bila belum tercatat di `dipotong` (jangan dobel). */
+  const bagianDipotong = useMemo(() => {
+    if (!pagarKonteks) return [] as { name: string; chars: number; alasan: string }[];
+    const baris = pagarKonteks.dipotong.map((item) => ({ name: item.name, chars: item.chars, alasan: alasanPemotongan(item.alasan) }));
+    const sudahTercatat = new Set(baris.map((item) => item.name));
+    for (const blok of pagarKonteks.blocks) {
+      if (blok.terkirim || sudahTercatat.has(blok.name)) continue;
+      sudahTercatat.add(blok.name);
+      baris.push({ name: blok.name, chars: blok.chars, alasan: blok.keterangan || 'tidak dikirim ke mesin' });
+    }
+    return baris;
+  }, [pagarKonteks]);
+
+  /**
+   * Butir 80: kartu "Pagar konteks & pemotongan" pada halaman Pemakaian. Semua angka diambil apa
+   * adanya dari `GET /v1/context-budget/report`; bila tidak ada yang dipotong, kartu menulis
+   * kalimat jujur tanpa mengarang angka.
+   */
+  const pagarKonteksKartu = (
+    <section className="tool-list" data-testid="pagar-konteks-kartu">
+      <div className="tool-row wrap">
+        <b>Pagar konteks &amp; pemotongan</b>
+        <button type="button" className="link-button" disabled={pagarKonteksMemuat} onClick={() => void loadPagarKonteks()}>
+          {pagarKonteksMemuat ? 'Memuat…' : 'Muat ulang'}
+        </button>
+      </div>
+      <small>Pagar membatasi Knowledge Base, persona, memori, dan skill. Riwayat percakapan Anda tidak pernah dipotong untuk memberi ruang sisipan.</small>
+      {pagarKonteksGalat ? (
+        <p className="notice" data-testid="pagar-konteks-galat">Laporan pagar konteks gagal dimuat: {pagarKonteksGalat}</p>
+      ) : !pagarKonteks ? (
+        <small>{pagarKonteksMemuat ? 'Memuat laporan pagar konteks…' : 'Laporan pagar konteks belum dimuat.'}</small>
+      ) : (
+        <>
+          <div className="tool-row wrap" data-testid="pagar-konteks-angka">
+            <div className="stat"><b>{formatKarakter(pagarKonteks.budgetChars)}</b><small>pagar aktif (karakter)</small></div>
+            <div className="stat"><b>{formatKarakter(pagarKonteks.totalCharsBeforeTrim)}</b><small>total sebelum dipotong</small></div>
+            <div className="stat"><b>{formatKarakter(pagarKonteks.keptChars)}</b><small>terkirim ke mesin</small></div>
+            <div className="stat"><b>{pagarKonteks.overBudget ? 'ya' : 'tidak'}</b><small>melewati pagar</small></div>
+          </div>
+          <div data-testid="pagar-konteks-dipotong">
+            {bagianDipotong.length ? (
+              <>
+                <small>{bagianDipotong.length} bagian tidak terkirim utuh ({formatKarakter(bagianDipotong.reduce((total, item) => total + item.chars, 0))} karakter tidak ikut):</small>
+                <div className="tool-list">
+                  {bagianDipotong.map((item) => (
+                    <div key={`${item.name}-${item.alasan}`}>
+                      <b>{item.name}</b>
+                      <small>{formatKarakter(item.chars)} karakter · {item.alasan}</small>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <small>Tidak ada sisipan yang dipotong pada pemeriksaan terakhir.</small>
+            )}
+          </div>
+          <small data-testid="pagar-konteks-catatan">{pagarKonteks.catatan}</small>
+          <small>Batas pagar yang diizinkan {formatKarakter(pagarKonteks.limitMin)}–{formatKarakter(pagarKonteks.limitMax)} karakter; bawaan {formatKarakter(pagarKonteks.defaultChars)}.</small>
+        </>
+      )}
+    </section>
+  );
+
   const usageTab = (
     <div className="tool-body">
       {usage ? (
@@ -503,6 +581,7 @@ export function Tools({ projectId, workspaceId, onClose, tab: tabProp, embedded 
           </div>
         </>
       ) : <small>Belum ada data pemakaian.</small>}
+      {pagarKonteksKartu}
     </div>
   );
 
@@ -560,6 +639,18 @@ function patchCaseSteps(steps: WorkflowStep[], index: number, caseIndex: number,
     cases[caseIndex] = { ...cases[caseIndex], ...patch };
     return { ...step, cases };
   });
+}
+
+/** Angka karakter dengan pemisah ribuan Indonesia (mis. 12.000). */
+function formatKarakter(nilai: number) {
+  return Number.isFinite(nilai) ? Math.round(nilai).toLocaleString('id-ID') : String(nilai);
+}
+
+/** Terjemahan alasan pemotongan dari server (nilainya hanya dua: lihat `ContextBudgetDrop`). */
+function alasanPemotongan(alasan: ContextBudgetDrop['alasan'] | string) {
+  if (alasan === 'prioritas_terendah') return 'tidak dikirim: prioritas terendah';
+  if (alasan === 'dipotong_sebagian') return 'dipotong sebagian (sisanya tidak ikut)';
+  return String(alasan);
 }
 
 /** Reads a File as Base64 without the data URL prefix. */

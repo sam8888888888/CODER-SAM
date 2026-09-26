@@ -133,13 +133,23 @@ export function connectorChildEnv(env: NodeJS.ProcessEnv = process.env): Record<
  * Batas waktu yang berlaku pada satu pengiriman:
  *   - `childAbortMs`    : batas menunggu hulu, dipakai proses anak;
  *   - `parentDeadlineMs`: batas hidup proses anak, dipakai induk untuk SIGKILL.
- * Keduanya bisa dipendekkan lewat lingkungan supaya uji bisa membuktikan kedua jalur tanpa menunggu lama.
+ * Di luar produksi keduanya bisa dipendekkan lewat lingkungan supaya uji bisa membuktikan kedua jalur
+ * tanpa menunggu lama. DI PRODUKSI (`NODE_ENV=production`) kedua knob itu DIABAIKAN, supaya satu
+ * variabel lingkungan tidak bisa diam-diam memendekkan batas hidup proses anak; yang berlaku nilai
+ * bawaan berkas ini. Lingkungan proses anak bisa membawa `NODE_ENV` sendiri, jadi yang diperiksa:
+ * `env.NODE_ENV` lebih dulu, lalu `process.env.NODE_ENV`.
  */
+function knobUjiHidup(env: NodeJS.ProcessEnv): boolean {
+  return (env.NODE_ENV ?? process.env.NODE_ENV) !== "production";
+}
+
 export function connectorLimits(env: NodeJS.ProcessEnv = process.env): { childAbortMs: number; graceMs: number; parentDeadlineMs: number } {
   const childAbortMs = outboundTimeoutMs(env);
-  const graceRaw = Number(env.CONNECTOR_CHILD_START_GRACE_MS);
+  // Di produksi kedua knob dibaca sebagai NaN, sehingga pemeriksaan di bawah jatuh ke nilai bawaan.
+  const knobHidup = knobUjiHidup(env);
+  const graceRaw = knobHidup ? Number(env.CONNECTOR_CHILD_START_GRACE_MS) : Number.NaN;
   const graceMs = Number.isFinite(graceRaw) && graceRaw >= 0 ? Math.floor(graceRaw) : 3000;
-  const deadlineRaw = Number(env.CONNECTOR_CHILD_DEADLINE_MS);
+  const deadlineRaw = knobHidup ? Number(env.CONNECTOR_CHILD_DEADLINE_MS) : Number.NaN;
   const parentDeadlineMs = Number.isFinite(deadlineRaw) && deadlineRaw >= 200 ? Math.floor(deadlineRaw) : childAbortMs + graceMs;
   return { childAbortMs, graceMs, parentDeadlineMs };
 }
