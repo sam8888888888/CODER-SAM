@@ -642,6 +642,40 @@ kebijakan CSP ketat TIDAK merusak gaya sebaris React — React menulis gaya lewa
    (percobaan ulang "hanya menambah"), supaya katalog terpotong tidak pernah menolak nama model yang sah.
    Sementara ini: jalankan suite itu sendirian bila pemeriksaan premis 12h0 gagal.
 
+### 6.10.3 Bukti produksi v0.24.1 + pelajaran untuk skrip verifikasi produksi (27 Sep 2026)
+
+Deploy v0.24.1 dan verifikasi produksi sudah selesai (angka lengkap di `docs/STATUS.md`, bagian
+"Deploy produksi v0.24.1 + verifikasi produksi"). Verifikasi peramban produksi berakhir
+**31 lulus / 0 gagal** (`/workspace/outputs/prod_ui_v0241.log`), tetapi **tiga pemeriksaan awalnya
+merah karena SALAH SKRIP SAYA, bukan cacat produk**. Dicatat di sini supaya pemeriksa berikutnya
+tidak salah menuduh produk:
+
+1. **Pemeriksaan "daftar proyek terisi sesudah masuk" diukur terlalu cepat.** Saya membaca pilihan
+   `<select>` sekali tepat sesudah menu muncul, padahal `setUser()` terjadi lebih dulu daripada
+   `loadSessions()`, jadi daftar proyek memang belum terisi pada milidetik itu. Setelah diukur
+   dengan **mengulang pembacaan (polling)**, hasilnya: terisi dalam **1,0 detik tanpa muat ulang**
+   — perbaikannya BEKERJA. Pelajaran: pemeriksaan yang mengukur keadaan SESUDAH perubahan status
+   harus menunggu, jangan sekali baca.
+2. **Pemeriksaan "tepat satu kelompok menu terbuka" salah asumsi.** Kelompok yang terbuka
+   **disimpan** di `localStorage['coblai.nav.groups']` (memang fitur yang diminta Bapak), jadi
+   sesudah sesi dipakai berkali-kali bisa lebih dari satu yang terbuka. Yang wajib diperiksa:
+   jumlah kepala kelompok cukup, minimal satu terbuka, dan **kelompok dari menu yang sedang aktif
+   terbuka**. Semua sudah terpenuhi.
+3. **Pemeriksaan "membuka kelompok menambah menu" salah memilih kelompok.** Skrip mengeklik kepala
+   kelompok ke-2 dengan asumsi tertutup; pada sesi itu kelompok tersebut justru sudah tersimpan
+   terbuka, sehingga klik itu MENUTUP-nya (11 → 4). Pelajaran: baca dulu keadaan
+   `aria-expanded`, lalu klik kelompok yang memang masih tertutup (bila semua terbuka, buktikan
+   dua arah: melipat lalu membuka kembali).
+
+Dua catatan jujur lain dari verifikasi produksi ini:
+
+4. **1 galat 401 `/api/v1/auth/me` sebelum masuk** — aplikasi menebak sesi saat pengunjung belum
+   masuk; perilaku lama, bukan cacat baru, dan hilang sesudah masuk (0 galat konsol).
+5. **3 proyek "Smoke Project …" tertinggal di akun uji** (v0.23.0, v0.24.0, v0.24.1; yang terbaru
+   `Smoke Project 1790531293965`, dibuat 27 Sep 2026 17:48Z). Jalur pembersihan data smoke berada di
+   balik gerbang admin, sedangkan akun uji bukan admin, jadi tidak bisa membersihkan sendiri.
+   Menunggu izin Bapak untuk membersihkan.
+
 ### Cara memakai daftar ini
 Bapak cukup menyebut NOMOR (mis. "bereskan 15, 17, 24"). Saya kerjakan satu per satu, dengan
 bukti uji nyata, dan memperbarui status di berkas ini setelah tiap nomor selesai.

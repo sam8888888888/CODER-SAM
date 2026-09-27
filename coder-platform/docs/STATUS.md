@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 27 Sep 2026 (**v0.24.0 LIVE di produksi; v0.24.1 (tata letak ponsel & penataan menu) sudah diuji penuh (61/61 suite dua kali + gerbang UI 253/253) dan dipetikan, menunggu izin deploy dari Bapak**). Produksi menjalankan `coder-platform-app:0.24.0` sejak 27 Sep 2026; skema basis data tetap **21** (v0.24.1 tidak mengubah skema). Rincian rilis v0.24.1 ada di bagian "Rilis v0.24.1 — tata letak ponsel & penataan menu" di bawah; rincian v0.24.0 dan v0.23.0 menyusul sesudahnya.
+Terakhir diperbarui: 27 Sep 2026 (**v0.24.1 (tata letak ponsel & penataan menu) LIVE di produksi dan sudah diverifikasi di produksi: 61/61 suite dua kali + gerbang UI 253/253 + smoke produksi 201/0 + verifikasi peramban produksi 31/0**). Produksi menjalankan `coder-platform-app:0.24.1` sejak 27 Sep 2026; skema basis data tetap **21** (v0.24.1 tidak mengubah skema). Rincian rilis v0.24.1 ada di bagian "Rilis v0.24.1 — tata letak ponsel & penataan menu" di bawah; rincian v0.24.0 dan v0.23.0 menyusul sesudahnya.
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -108,7 +108,59 @@ Skema basis data (tetap 21), seluruh rute API, perizinan, dan berkas `.env`. Kar
 - Gerbang setelah versi dinaikkan:
   `deploy-env-sync.e2e.ts` **70 lulus / 0 gagal** (`env_gate_v0241.log`) dan
   `deploy-paket-integritas.e2e.ts` **24 lulus / 0 gagal** (`paket_gate_v0241.log`), keduanya `EXIT=0`.
-- Status: **BELUM di-deploy**. `deploy/deploy-austria.sh 0.24.1` menunggu izin Bapak.
+- Status: **SUDAH di-deploy dan diverifikasi di produksi** (lihat bagian di bawah).
+
+### Deploy produksi v0.24.1 + verifikasi produksi (27 Sep 2026)
+
+**Izin Bapak:** "Silahkan di deploy sekarang" → dijalankan 27 Sep 2026 mulai 16:5xZ.
+
+Bukti deploy (dari `/workspace/outputs/deploy_v0241.log`, perintah `bash deploy/deploy-austria.sh 0.24.1`):
+
+- `SHA OK` — SHA256 paket cocok di mesin saya DAN di server (pre-flight).
+- `MIGRATION_REHEARSAL_OK` + `REHEARSAL ROW_COUNTS_PRESERVED true` pada cadangan terbaru.
+- `nginx` uji sintaks lolos; `DEPLOY_OK coder-platform-app:0.24.1`; `EXIT=0`.
+- Wadah: `coder-platform-app:0.24.1` (healthy) + pekerja `:0.24.1`; `.env` `APP_VERSION=0.24.1`.
+- Skema basis data di dalam wadah: **21** (perintah `require('/app/dist/api/db.js').SCHEMA_VERSION`).
+
+Bukti produksi publik (tanpa kredensial):
+
+- `https://coder.sam.university/health` → **200**.
+- `/ready` → `{"status":"ready","database":"ok","engine":{"available":true,"version":"rpc-stdio"}}`.
+- Kepala jawaban membawa CSP ketat (samaran nginx == samaran aplikasi, panjang 619–620).
+
+Smoke produksi (akun uji atas izin Bapak, `/workspace/outputs/prod_smoke_v0241.log`):
+`PRODUCTION_SMOKE_PASSED`, `EXIT=0`, `SKIP-TOTAL 0` — **201 lulus, 0 gagal**.
+
+Verifikasi peramban produksi v0.24.1 — skrip baru `/workspace/outputs/prod_ui_v0241.mjs`
+(log `/workspace/outputs/prod_ui_v0241.log`): **31 lulus, 0 gagal, `PROD_UI_V0241_OK`, `EXIT=0`**.
+Peramban Chromium sungguhan menembak `https://coder.sam.university`; penantian memakai
+`locator.count()` dari sisi Node karena CSP produksi (`script-src 'self'`) menolak `waitForFunction`.
+
+Yang dibuktikan khusus untuk rilis ini:
+
+- **Perbaikan v0.24.1 terbukti di produksi:** sesudah masuk lewat form di dalam halaman, pilihan
+  **Proyek langsung terisi dalam 1,0 detik tanpa muat ulang** (`opsi=1 pertama="Smoke Project …"`)
+  — inilah cacat yang diperbaiki (`loadSessions()` dipanggil saat login lewat form).
+- Menu terkelompok tampil (6 kepala kelompok untuk akun non-admin; kelompok `Admin platform` hanya
+  untuk admin — diperiksa konsisten dengan `isAdmin` dari `/api/v1/auth/me`).
+- Kolom cari menu: kata "audit" menemukan **Akun & workspace**; kata yang tidak ada memberi pesan
+  jujur (bukan daftar kosong tanpa keterangan). Membuka kelompok menambah menu di DOM (4 → 11).
+- **0 pelanggaran CSP**, **0 galat halaman** (`pageerror`), **0 galat konsol sesudah masuk**.
+- **Ponsel 360×800 dan tablet 768×1024:** Beranda dan Percakapan **0 luapan mendatar**
+  (`scrollWidth == clientWidth`), tombol kirim 44 px (HP) / 40 px (tablet) dan tetap di dalam layar,
+  tombol "…" (alat lain) terlihat, ketiga tombol bawah bilah samping terlihat di dalam layar,
+  dan panel Pengaturan **bisa digulir** (`scrollTop` bertambah 1990 px / 1739 px sampai judul
+  terakhir "Hapus semua riwayat" terlihat).
+- Catatan jujur: sebelum masuk ada **1 galat 401 `/api/v1/auth/me`** di konsol — itu aplikasi
+  menebak sesi saat pengunjung belum masuk (perilaku lama, bukan cacat baru).
+
+Tangkapan layar produksi (dari skrip yang sama, bukan gambar hiasan):
+`/workspace/outputs/prod241_hp_beranda.png`, `prod241_hp_menu.png`, `prod241_hp_chat.png`,
+`prod241_hp_pengaturan.png`, `prod241_hp_pengaturan_bawah.png`, `prod241_pc_menu.png`.
+
+Catatan sisa dari deploy ini: 3 proyek "Smoke Project …" tertinggal di akun uji
+(v0.23.0, v0.24.0, v0.24.1) karena jalur pembersihan data smoke berada di balik gerbang admin,
+sedangkan akun uji bukan admin. Pembersihannya menunggu izin Bapak.
 
 ### Sisa temuan (jujur, belum diperbaiki)
 
