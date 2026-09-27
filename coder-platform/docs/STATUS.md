@@ -86,7 +86,8 @@ jalan (dilewati dengan alasan tertulis, jadi tidak ada data nyata yang bisa hila
 
 ### Paket rilis v0.24.2
 
-- Commit rilis: **`4112f8c`** (branch `feature/coder-dashboard-local`).
+- Commit rilis: **`4112f8c`** (branch `feature/coder-dashboard-local`); penanda rilis: **tag `v0.24.2`**
+  (tag beranotasi, menunjuk commit rilis — sama polanya dengan `v0.24.1`).
 - Berkas paket: `deploy/coder-sam-university-v0.24.2.tar.gz` — **322 entri**, 1 544 021 bita.
 - **SHA256: `a735a84877af7693e0e1bcc507884a37220315e15838ad985c1b603e7d0be20c`**
 - Isi paket diperiksa langsung: `apps/api/src/server.ts` memuat perbaikan katalog (`gabungKatalog`,
