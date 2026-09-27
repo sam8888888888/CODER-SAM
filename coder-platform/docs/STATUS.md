@@ -97,6 +97,19 @@ sebaris React, karena React menulis gaya lewat CSSOM).
 Skema basis data (tetap 21), seluruh rute API, perizinan, dan berkas `.env`. Karena itu tidak ada
 `SCHEMA_VERSION_NOTE` baru dan tidak ada kunci env baru (gerbang env 70/0 tetap berlaku).
 
+### Paket rilis v0.24.1
+
+- Perintah: `bash deploy/buat-paket.sh 0.24.1` → `PAKET_OK` (322 entri, 1,5 MB), `EXIT=0`
+  (log `/workspace/outputs/paket_v0241.log`).
+- Berkas: `deploy/coder-sam-university-v0.24.1.tar.gz`
+- **SHA256: `32f151ad85f1c5c78e3a39131884300b6df85205388196092313d1b5afa4f918`**
+  (tercatat juga di `deploy/coder-sam-university-v0.24.1.tar.gz.sha256`)
+- Dibangun dari commit **`384b266`** (tag `v0.24.1`), jadi isi paket = pohon yang sudah diuji.
+- Gerbang setelah versi dinaikkan:
+  `deploy-env-sync.e2e.ts` **70 lulus / 0 gagal** (`env_gate_v0241.log`) dan
+  `deploy-paket-integritas.e2e.ts` **24 lulus / 0 gagal** (`paket_gate_v0241.log`), keduanya `EXIT=0`.
+- Status: **BELUM di-deploy**. `deploy/deploy-austria.sh 0.24.1` menunggu izin Bapak.
+
 ### Sisa temuan (jujur, belum diperbaiki)
 
 Dua galat 404 pancingan foto profil di konsol (memang disengaja kode, sudah ada di daftar putih gerbang)
