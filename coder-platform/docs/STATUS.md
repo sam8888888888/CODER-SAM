@@ -94,8 +94,33 @@ menghapus model yang sudah dikenal), pencocokan juga lewat nama dasar tanpa awal
 - Isi paket diperiksa: memuat `wave11a-katalog.e2e.ts`, `wave11b-timeline-alat.e2e.ts`,
   `fixtures/fake-prime-agent-katalog.mjs` (mode 755), `ArtifactEditor.tsx`, `Tools.tsx`;
   **tidak** memuat `node_modules`/`dist`/`.env` (0 kecocokan).
-- **Belum**: push ke GitHub menunggu token Bapak; deploy ulang ke produksi belum dijalankan
-  (produksi masih menjalankan v0.23.0).
+### Deploy produksi v0.24.0 + verifikasi produksi (27 Sep 2026)
+- **Deploy DIJALANKAN** (izin Bapak 27 Sep 2026, "silakan deploy produksi"): `bash deploy/deploy-austria.sh 0.24.0`
+  → **exit 0**, `DEPLOY_OK coder-platform-app:0.24.0` (`/workspace/outputs/deploy_v0240.log`).
+  `ENV_MISSING_COUNT 0`; latihan migrasi pada cadangan terbaru → `SCHEMA_VERSION_AFTER_MIGRATION 21 EXPECTED 21`,
+  `ROW_COUNTS_PRESERVED true`, `MIGRATION_REHEARSAL_OK`; tanpa henti layanan (hijau di 3403 → nginx dipindah →
+  kontainer utama dibuat ulang → nginx dikembalikan ke 3402); pekerja ikut dibuat ulang.
+- Wadah hidup: `coder-platform-app:0.24.0 (healthy)` + `coder-platform-worker:0.24.0`. `/health` 200,
+  `/ready` `{"status":"ready","database":"ok","engine":{"available":true}}`, `/api/v1/public/docs` → `version 0.24.0`.
+- Basis data produksi dibaca langsung (mode hanya-baca): `schema_migrations` terakhir versi **21**, `users = 5`
+  (data lama utuh).
+- **Uji asap produksi** (`apps/api/test/production-smoke.mjs`, akun uji yang diizinkan Bapak):
+  **202 PASS / 0 FAIL `PRODUCTION_SMOKE_PASSED` exit 0** (`/workspace/outputs/prod_smoke_v0240.log`).
+- **Verifikasi peramban sungguhan di produksi** (skrip `/workspace/outputs/prod_ui_v0240.mjs`,
+  log `prod_ui_v0240.log`): **15 PASS / 0 FAIL, `PROD_UI_V0240_OK`, exit 0**. Rinciannya:
+  halaman utama 200; masuk lewat UI berhasil (42 menu); proyek aktif termuat;
+  halaman **Pemakaian** menampilkan kartu **butir 80** (`pagar-konteks-kartu`) dengan angka dari
+  `GET /api/v1/context-budget/report` (200) — `12.000` pagar aktif, `0` total sebelum dipotong, `0` terkirim;
+  kalimat jujur tampil ("Tidak ada sisipan yang dipotong pada pemeriksaan terakhir."); tanpa galat pemuatan;
+  halaman **Status platform** melaporkan `Versi platform: 0.24.0`; 0 galat konsol, 0 galat JavaScript,
+  0 jawaban API 5xx dari 32 panggilan. Tangkapan layar: `outputs/prod_v0240_pemakaian.png`.
+- **CSP produksi**: dua header (nginx + aplikasi) nilainya sama, panjang 310 karakter (penggabungan 619).
+- Catatan alat uji jujur: `page.waitForFunction` **ditolak CSP produksi** (`script-src 'self'` tanpa
+  `'unsafe-eval'`), jadi penantian dilakukan lewat locator dari sisi Node. Ini batasan alat uji, bukan cacat produk.
+- **Temuan baru (belum diperbaiki, di luar butir PRD)**: sesudah masuk lewat form di dalam halaman, dasbor
+  belum memuat workspace/proyek/percakapan sampai halaman dimuat ulang. Bukti dan usul perbaikan ada di
+  `docs/DAFTAR_MASALAH_TERTUNDA.md` §6.9.
+- **Belum**: push ke GitHub menunggu token Bapak (commit `990799a`, `5a3e723`, tag `v0.24.0`).
 
 ## Rilis v0.23.0 — LIVE DI PRODUKSI (26 Sep 2026)
 

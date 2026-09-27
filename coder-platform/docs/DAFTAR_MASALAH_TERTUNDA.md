@@ -524,13 +524,59 @@ Setiap temuan diuji ulang oleh lead sebelum diperbaiki; temuan yang tidak terbuk
   fungsinya, bukan bentuk jawabannya.
 
 **Yang MASIH belum tuntas (jujur).**
-1. **Deploy ulang dashboard ke produksi belum dijalankan.** Semua perubahan antarmuka sesi ini
-   (butir 48 tombol Render, butir 80 kartu pagar konteks, panel MCP, catatan kanal bot) baru ada di
-   repo. Produksi masih memakai paket v0.23.0 lama sampai Bapak memberi izin deploy.
+1. ~~Deploy ulang dashboard ke produksi belum dijalankan.~~ **SUDAH DIJALANKAN 27 Sep 2026** atas izin Bapak:
+   `deploy-austria.sh 0.24.0` exit 0, wadah produksi kini `coder-platform-app:0.24.0 (healthy)`, uji asap
+   produksi 202 lulus/0 gagal, dan verifikasi peramban produksi 15 lulus/0 gagal (lihat §6.9).
 2. **Push ke GitHub** menunggu token dari Bapak. Cadangan sementara: bundel git di `/workspace/outputs/`.
 3. **Pratinjau PDF ujung-ke-ujung** masih belum diuji karena butuh Chrome desktop sungguhan.
-4. **Kredensial uji live** (akun uji produksi #2) masih hidup; akan dihapus setelah pengujian produksi
-   terakhir selesai, sesuai aturan Bapak.
+4. **Kredensial uji live** (akun uji produksi #2) masih hidup. Rangkaian uji produksi v0.24.0 sudah selesai
+   seluruhnya, jadi akun ini siap ditutup — menunggu keputusan Bapak.
+
+### 6.9 Verifikasi produksi v0.24.0 di peramban + tiga catatan temuan (27 Sep 2026)
+
+**Hasil: LULUS.** Skrip `/workspace/outputs/prod_ui_v0240.mjs`, log `/workspace/outputs/prod_ui_v0240.log`,
+tangkapan layar `/workspace/outputs/prod_v0240_pemakaian.png` — **15 lulus / 0 gagal, `PROD_UI_V0240_OK`, exit 0**.
+Yang dibuktikan pada domain sungguhan `coder.sam.university` (akun uji yang diizinkan Bapak):
+halaman utama 200; masuk lewat antarmuka sungguhan (42 tautan menu muncul); proyek aktif termuat;
+halaman **Pemakaian** menampilkan kartu **butir 80** beserta angkanya; halaman memanggil
+`GET /api/v1/context-budget/report` (200) dan angkanya cocok dengan jawaban server; kalimat jujur
+"Tidak ada sisipan yang dipotong pada pemeriksaan terakhir." tampil apa adanya; halaman **Status platform** melaporkan
+`Versi platform: 0.24.0`; 0 galat konsol, 0 galat JavaScript, 0 permintaan jaringan gagal, 0 jawaban API 5xx
+dari 32 panggilan. Nilai kartu saat diperiksa: `12.000` pagar aktif, `0` total sebelum dipotong,
+`0` terkirim ke mesin (jadi "tidak melewati pagar" memang benar untuk akun uji).
+
+**Catatan 1 — batasan alat uji (BUKAN cacat produk): CSP produksi menolak `page.waitForFunction`.**
+CSP produksi `script-src 'self'` tanpa `'unsafe-eval'`, sedangkan `page.waitForFunction` Playwright
+mengevaluasi string JavaScript di halaman. Akibatnya pemeriksaan peramban harus menunggu lewat
+locator/kueri dari sisi Node (`count()`, `innerText()`, `inputValue()`), bukan lewat fungsi di halaman.
+Ini alasan teknis mengapa berkas uji memakai penantian berulang dengan batas 900 ms, bukan penantian pintar.
+
+**Catatan 2 — TEMUAN NYATA yang BELUM diperbaiki (di luar butir PRD 42–83, sudah ada sebelum v0.24.0).**
+Sesudah orang **masuk lewat form di dalam halaman** (bukan membuka situs dengan sesi yang sudah ada),
+dasbor **tidak memuat daftar workspace, proyek, dan percakapan** sampai halaman dimuat ulang.
+Gejalanya: pemilih "Proyek" menulis `(belum ada proyek)`, penanda koneksi menulis `Mode lokal`, halaman
+Pemakaian menulis "Halaman ini butuh proyek aktif…", padahal server sehat.
+Bukti:
+- Kode: `coder-dashboard/src/App.tsx:113` memuat daftar itu hanya di dalam satu efek saat rakitan
+  pertama (`api.me().then(... loadSessions() ...)`), sedangkan `submitAuth` (`App.tsx:322–331`) sesudah
+  masuk hanya memanggil `api.me()` untuk menyegarkan penanda admin — **`loadSessions()` tidak dipanggil**.
+- Pemantauan permintaan di produksi: sesudah masuk dari dalam halaman, **tidak ada** panggilan
+  `GET /api/v1/workspaces` sama sekali (hanya `/onboarding`, `/personas`, `/models`, `/agents/settings`,
+  `/billing/quota-alert`). Setelah `page.reload()`, seluruh daftar langsung termuat normal.
+- Server sehat bersamaan: `GET /api/v1/workspaces` → 200 berisi 1 workspace; `GET /api/v1/workspaces/<id>/projects` → 200.
+- **Bukan regresi v0.24.0**: kode yang sama ada di tag `v0.23.0`; commit `990799a` hanya mengubah 1 baris
+  di `App.tsx`.
+Usul perbaikan (1 baris, perlu bangun ulang dasbor + deploy ulang): sesudah `setUser(d.user)` di
+`submitAuth`, panggil `void loadSessions().catch(() => setOnline(false));`.
+Dampak: pengguna baru selalu melihat dasbor setengah kosong sampai menekan muat ulang. Gerbang uji
+antarmuka saat ini **menyiasati** keadaan itu (`e2e/ui.e2e.mjs` memuat ulang halaman sesudah masuk),
+sehingga gerbang tidak pernah menangkapnya. Status: **menunggu keputusan Bapak** (perbaiki sekarang
+dengan rilis v0.24.1, atau tunda ke gelombang berikutnya).
+
+**Catatan 3 — sisa data uji di akun uji produksi.** `production-smoke.mjs` memakai proyek pertama akun uji
+lalu **mengganti namanya** menjadi `Smoke Project <stempel waktu>` (baris 238) dan tidak mengembalikan
+nama lama. Projek akun uji sekarang bernama `Smoke Project 1790499853279`. Ini hanya menyentuh akun uji,
+tidak menyentuh data pengguna lain, tetapi tercatat supaya tidak mengagetkan Bapak.
 
 ### Cara memakai daftar ini
 Bapak cukup menyebut NOMOR (mis. "bereskan 15, 17, 24"). Saya kerjakan satu per satu, dengan
