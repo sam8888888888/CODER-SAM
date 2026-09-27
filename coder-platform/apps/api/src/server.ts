@@ -937,7 +937,18 @@ function isKnownModel(model: string): boolean {
   if (Date.now() - modelCache.at > 300_000) muatKatalogModel();
   if (!modelCache.names.size) return true; // katalog kosong = tidak ada bahan pembanding, jadi semua diterima
   const nama = model.trim();
-  return modelCache.names.has(nama) || modelCache.bare.has(namaDasarModel(nama));
+  const cocok = () => modelCache.names.has(nama) || modelCache.bare.has(namaDasarModel(nama));
+  if (cocok()) return true;
+  // Butir 57 lanjutan (27 Sep 2026): nama model yang sah tidak boleh ditolak hanya karena katalog
+  // terpotong. Sebelum MENOLAK, katalog dibaca ulang sekali (paling sering sekali per menit, supaya
+  // rentetan permintaan buruk tidak memicu spawn CLI berulang-ulang). Katalog kosong tetap menerima semua.
+  if (bolehBacaUlangKatalog()) {
+    jejakBacaUlangKatalog.push(Date.now());
+    engineModelCatalogue(true);
+    if (!modelCache.names.size) return true; // pembacaan gagal: tidak ada bahan pembanding
+    if (cocok()) return true;
+  }
+  return false;
 }
 
 function providerForModel(model: string): string | undefined {
@@ -1780,7 +1791,7 @@ let catalogueCache: { at: number; value: { available: boolean; models: { provide
 const CATALOGUE_TTL_MS = 10 * 60 * 1000;
 const CATALOGUE_ERROR_TTL_MS = 60 * 1000;
 
-function readEngineModelCatalogue(): { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string; note?: string } {
+function bacaKatalogSekali(): { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string; note?: string } {
   try {
     const binary = config.PRIME_AGENT_BIN ?? "prime-agent";
     const result = spawnSync(binary, ["model", "list"], { encoding: "utf8", timeout: 20_000 });
@@ -1799,6 +1810,53 @@ function readEngineModelCatalogue(): { available: boolean; models: { provider: s
   } catch (error) {
     return { available: false, models: [], error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/**
+ * Butir 57 lanjutan (27 Sep 2026): katalog yang pernah dibaca boleh MEMBESAR, tidak boleh menyusut.
+ * Pembacaan katalog bisa TERPOTONG saat mesin sibuk: pada gerbang uji 27 Sep 2026 rute `/api/v1/models`
+ * melaporkan 252 model padahal pembacaan langsung CLI memuat 354 model, sehingga model yang SAH
+ * ditolak `400 UNKNOWN_MODEL` (11 pemeriksaan §12 ikut merah). Pemulihannya:
+ *  - hasil yang lebih pendek dari yang pernah dilihat dibaca ULANG sekali, lalu
+ *  - hasilnya digabung dengan katalog terbesar yang pernah terlihat (hanya menyatukan baris NYATA,
+ *    tidak ada nama model yang dikarang), dan
+ *  - bila gabungan tetap lebih kecil, yang terbesar tetap dipakai sebagai pembanding nama model.
+ */
+let katalogTerbesar: { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string; note?: string } | null = null;
+/**
+ * Pembatas biaya pembacaan ulang: paling banyak BATAS_BACA_ULANG_KATALOG pembacaan paksa per
+ * JENDELA_BACA_ULANG_MS. Tanpa pembatas ini, rentetan permintaan run dengan nama model ngawur bisa
+ * memicu spawn CLI berulang-ulang; dengan pembatas ini biayanya tetap terbatas dan tetap terukur.
+ */
+const BATAS_BACA_ULANG_KATALOG = 5;
+const JENDELA_BACA_ULANG_MS = 60_000;
+let jejakBacaUlangKatalog: number[] = [];
+function bolehBacaUlangKatalog(sekarang = Date.now()): boolean {
+  jejakBacaUlangKatalog = jejakBacaUlangKatalog.filter((t) => sekarang - t < JENDELA_BACA_ULANG_MS);
+  return jejakBacaUlangKatalog.length < BATAS_BACA_ULANG_KATALOG;
+}
+
+function gabungKatalog(a: { models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[] }, b: { models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[] }) {
+  const peta = new Map<string, { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }>();
+  for (const row of a.models) peta.set(`${row.provider}\u0000${row.model}`, row);
+  for (const row of b.models) peta.set(`${row.provider}\u0000${row.model}`, row);
+  return [...peta.values()];
+}
+
+function readEngineModelCatalogue(): { available: boolean; models: { provider: string; model: string; context: string; maxOutput: string; thinking: boolean; images: boolean }[]; error?: string; note?: string } {
+  const pertama = bacaKatalogSekali();
+  // A failure or an empty catalogue is reported as it is; nothing is invented to fill it up.
+  if (!pertama.available) return pertama;
+  let nilai = pertama;
+  if (katalogTerbesar && pertama.models.length < katalogTerbesar.models.length) {
+    const kedua = bacaKatalogSekali();
+    if (kedua.available) nilai = kedua.models.length > pertama.models.length ? kedua : pertama;
+    const digabung = gabungKatalog(katalogTerbesar, nilai);
+    nilai = { ...nilai, available: true, models: digabung, note: nilai.note
+      ?? `Katalog digabung: pembacaan ini ${pertama.models.length} baris, pembacaan terbesar sebelumnya ${katalogTerbesar.models.length} baris (hanya menambah, tidak mengurangi).` };
+  }
+  if (!katalogTerbesar || nilai.models.length >= katalogTerbesar.models.length) katalogTerbesar = { ...nilai };
+  return nilai;
 }
 
 function engineModelCatalogue(force = false) { return catalogueFor(force); }

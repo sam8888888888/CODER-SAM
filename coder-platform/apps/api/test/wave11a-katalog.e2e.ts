@@ -16,7 +16,8 @@
  * Pakai: npx tsx apps/api/test/wave11a-katalog.e2e.ts
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -24,6 +25,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const port = 7392;
 const dataDir = `/tmp/coder-katalog-${Date.now()}`;
 const penanda = join(dataDir, "penanda-pendek.txt");
+const penandaTambahan = join(dataDir, "penanda-tambahan.txt");
 
 process.env.NODE_ENV = "test";
 process.env.PORT = String(port);
@@ -33,6 +35,7 @@ process.env.PUBLIC_DIR = `${dataDir}/public`;
 process.env.MOCK_ENGINE = "true";
 process.env.PRIME_AGENT_BIN = process.env.PRIME_AGENT_BIN ?? join(here, "fixtures/fake-prime-agent-katalog.mjs");
 process.env.KATALOG_FIXTURE_MARKER = penanda;
+process.env.KATALOG_FIXTURE_TAMBAHAN = penandaTambahan;
 process.env.PRIME_AGENT_MODEL = "deepseek-v4-flash";
 process.env.NOTIFY_EMAIL_ENABLED = "false";
 process.env.RETENTION_ENABLED = "false";
@@ -69,6 +72,18 @@ function klien() {
       return { status: response.status, json };
     },
   };
+}
+
+/** Membaca katalog langsung dari CLI tiruan (tanpa lewat rute), memakai tata cara penguraian yang sama. */
+function bacaKatalogCLI(): string[] {
+  const bin = String(process.env.PRIME_AGENT_BIN);
+  const res = spawnSync(bin, ["model", "list"], { encoding: "utf8", timeout: 20_000 });
+  const raw = `${res.stdout ?? ""}\n${res.stderr ?? ""}`;
+  const lines = raw.split("\n").map((line) => line.trimEnd()).filter(Boolean);
+  const header = lines.findIndex((line) => /^provider\s+model\b/.test(line));
+  const body = (header >= 0 ? lines.slice(header + 1) : lines).filter((line) => !/^provider\s+model\b/.test(line));
+  return body.map((line) => line.trim()).filter(Boolean)
+    .map((line) => line.split(/\s{2,}/)[1] ?? "").filter(Boolean);
 }
 
 const c = klien();
@@ -110,12 +125,17 @@ const runSalahTulis = await kirimRun("mustahil/glm-9.9-tidak-ada");
 check("1d. nama model yang benar-benar tidak dikenal tetap ditolak 400 UNKNOWN_MODEL",
   runSalahTulis.status === 400 && runSalahTulis.json?.error === "UNKNOWN_MODEL", `${runSalahTulis.status} ${potong(runSalahTulis.json)}`);
 
-// Premis untuk cek berikutnya: jawaban CLI benar-benar memendek. Tanpa ini, 1f tidak membuktikan apa pun.
+// Premis untuk cek berikutnya: jawaban CLI benar-benar memendek. Diukur di SUMBERNYA (CLI tiruan
+// langsung), sebab jawaban rute sejak perbaikan 27 Sep 2026 sengaja TIDAK lagi menyusut (lihat 1e2).
 writeFileSync(penanda, "pendek\n");
+const cliPendek = bacaKatalogCLI();
+check("1e. premis: sesudah penanda dibuat, jawaban CLI TIDAK lagi memuat glm-4.7-flash",
+  !cliPendek.includes("glm-4.7-flash") && cliPendek.includes("deepseek-v4-flash"),
+  `cli=[${cliPendek.join(", ")}]`);
 const katalogPendek = await namaKatalog(true);
-check("1e. premis: sesudah penanda dibuat, katalog segar TIDAK lagi memuat glm-4.7-flash",
-  !katalogPendek.daftar.includes("glm-4.7-flash") && katalogPendek.daftar.includes("deepseek-v4-flash"),
-  `status=${katalogPendek.status} daftar=[${katalogPendek.daftar.join(", ")}]`);
+check("1e2. jawaban rute TIDAK menyusut walau CLI memendek (hanya menambah) dan alasannya ditulis apa adanya",
+  katalogPendek.daftar.includes("glm-4.7-flash") && typeof katalogPendek.json?.note === "string" && /digabung/i.test(katalogPendek.json.note),
+  `status=${katalogPendek.status} daftar=[${katalogPendek.daftar.join(", ")}] note=${potong(katalogPendek.json?.note ?? "")}`);
 
 const runLama = await kirimRun("glm-4.7-flash");
 check("1f. model yang pernah dikenal TIDAK ditolak oleh jawaban katalog yang lebih pendek",
@@ -128,6 +148,51 @@ check("1h. penjaga tetap menolak nama tak dikenal sesudah katalog memendek",
   runSalahTulis2.status === 400 && runSalahTulis2.json?.error === "UNKNOWN_MODEL", `${runSalahTulis2.status} ${potong(runSalahTulis2.json)}`);
 check("1i. berkas penanda memang ada (bukti premis 1e nyata, bukan kebetulan)",
   existsSync(penanda), penanda);
+
+console.log("\n--- Bagian 2: katalog terpotong saat PROSES BARU (kejadian gerbang 27 Sep 2026) ---");
+// Kejadian nyata 27 Sep 2026: rute `/api/v1/models` melaporkan 252 model padahal katalog penuh memuat
+// 354 model, sehingga model yang SAH dan BELUM PERNAH terlihat ditolak `400 UNKNOWN_MODEL`.
+// Bagian ini meniru persis itu: satu model yang hanya ada di daftar panjang belum pernah dibaca,
+// lalu permintaan run datang saat jawaban katalog masih pendek.
+const namaBaru = "glm-5.0-flash-uji";
+writeFileSync(penanda, "pendek\n");
+const katalogSaatPendek = await namaKatalog(true);
+const cliSaatPendek = bacaKatalogCLI();
+check("2a. premis: nama model baru belum pernah terbaca (rute maupun CLI) saat jawaban CLI memendek",
+  !katalogSaatPendek.daftar.includes(namaBaru) && !cliSaatPendek.includes(namaBaru)
+    && cliSaatPendek.includes("deepseek-v4-flash") && !cliSaatPendek.includes("glm-4.7-flash"),
+  `rute=[${katalogSaatPendek.daftar.join(", ")}] cli=[${cliSaatPendek.join(", ")}]`);
+
+// Jawaban katalog pulih TEPAT sebelum permintaan run: penyedia kembali sehat (penanda pendek dihapus)
+// dan model baru muncul di daftar. Inilah saat penjaga nama model harus membaca ulang, bukan menolak.
+rmSync(penanda, { force: true });
+writeFileSync(penandaTambahan, "tambahan\n");
+const cliSehat = bacaKatalogCLI();
+check("2a2. premis: jawaban CLI sudah pulih dan memuat model baru", cliSehat.includes(namaBaru), `cli=[${cliSehat.join(", ")}]`);
+const runBaru = await kirimRun(namaBaru);
+check("2b. model yang belum pernah terlihat DITERIMA karena katalog dibaca ulang sebelum menolak",
+  runBaru.status === 202, `${runBaru.status} ${potong(runBaru.json)}`);
+const runBaruRow = await tungguRun(String(runBaru.json?.id ?? ""));
+check("2c. run model baru itu selesai (bukan sekadar diterima)", String(runBaruRow?.status ?? "") === "completed", potong(runBaruRow));
+const katalogSesudah = await namaKatalog(true);
+check("2d. nama model yang baru dikenal ikut masuk ingatan penjaga (katalog menyebutnya)",
+  katalogSesudah.daftar.includes(namaBaru), `daftar=[${katalogSesudah.daftar.join(", ")}]`);
+
+// Hanya MENAMBAH, tidak mengurangi: jawaban boleh memendek dari CLI, tetapi nama yang sudah dikenal
+// tidak boleh hilang dari jawaban rute.
+writeFileSync(penanda, "pendek\n");
+const katalogPendek2 = await namaKatalog(true);
+check("2e. jawaban rute tidak menyusut walau CLI menjawab pendek lagi (gabungan hanya menambah)",
+  katalogPendek2.daftar.includes(namaBaru) && katalogPendek2.daftar.includes("glm-4.7-flash"),
+  `daftar=[${katalogPendek2.daftar.join(", ")}]`);
+check("2f. catatan penggabungan dijelaskan apa adanya di jawaban rute",
+  typeof katalogPendek2.json?.note === "string" && /digabung/i.test(katalogPendek2.json.note), potong(katalogPendek2.json?.note ?? ""));
+
+// Pembacaan ulang hanya sekali per menit: nama yang benar-benar tidak ada TETAP ditolak.
+const runSalah3 = await kirimRun("mustahil/glm-9.9-tidak-ada");
+check("2g. penjaga TIDAK berubah jadi 'terima semua': nama tak dikenal tetap 400 UNKNOWN_MODEL",
+  runSalah3.status === 400 && runSalah3.json?.error === "UNKNOWN_MODEL", `${runSalah3.status} ${potong(runSalah3.json)}`);
+check("2h. berkas penanda masih ada (premis 2e nyata)", existsSync(penanda), penanda);
 
 console.log(`\nRINGKASAN: ${failures === 0 ? "lulus semua" : `${failures} gagal`}`);
 if (failures) { console.log("WAVE11A_KATALOG_FAILED"); process.exit(1); }

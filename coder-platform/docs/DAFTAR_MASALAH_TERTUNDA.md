@@ -93,6 +93,12 @@ Rincian lengkap: `docs/PLAN_WAVE_9.md`.
 16. [SELESAI 26 Sep 2026] Smoke produksi berkredensial — akun uji dibuat sendiri atas izin Bapak,
     **202 lulus / 0 gagal**, lalu akun ditutup lewat jalur resmi. Rincian di §6.7.
 
+17. [SELESAI 27 Sep 2026] Bersihkan sisa data smoke di produksi — dijalankan atas perintah Bapak
+    ("Bersihkan smoke"): cadangan lebih dulu, lalu 3 proyek sisa dihapus lewat jalur aman milik
+    aplikasi. Bukti dan penyimpangannya di §6.10.4. Kunci API akun uji sengaja TIDAK dihapus.
+18. [BAPAK] Bila Bapak ingin jejak audit uji juga dibersihkan: 561 baris `audit_events` di workspace
+    Bapak (butir 12 di atas) masih menunggu izin — tidak tersentuh oleh pembersihan smoke.
+
 ## 3. UTANG TEKNIS
 
 15. [SELESAI] Batas laju kini disimpan di tabel `rate_limit_hits` (Wave 8), jadi tahan restart
@@ -637,10 +643,23 @@ kebijakan CSP ketat TIDAK merusak gaya sebaris React — React menulis gaya lewa
    dijalankan bersamaan dengan puluhan suite lain (pola yang sudah dikenal pada butir 57: "katalog
    mesin bisa menjawab TIDAK LENGKAP saat mesin sibuk"). Suite ini justru bekerja BENAR: ia menolak
    menilai bagian §12 dan mengatakannya apa adanya.
-   Usul lanjutan (perlu persetujuan Bapak karena menyentuh platform, bukan dasbor): `readEngineModelCatalogue`
-   (`server.ts`) membaca ulang katalog sekali bila hasilnya tidak memuat model yang barusan dipakai
-   (percobaan ulang "hanya menambah"), supaya katalog terpotong tidak pernah menolak nama model yang sah.
-   Sementara ini: jalankan suite itu sendirian bila pemeriksaan premis 12h0 gagal.
+   **SUDAH DIPERBAIKI 27 Sep 2026 atas izin Bapak ("perbaikan platform di izinkan") — rilis v0.24.2.**
+   Perbaikan di `readEngineModelCatalogue` dan `isKnownModel` (`apps/api/src/server.ts`):
+   - katalog **hanya boleh membesar**: pembacaan yang lebih pendek dari yang pernah dilihat dibaca ulang
+     sekali lalu digabung dengan katalog terbesar (hanya menyatukan baris NYATA — tidak ada nama model
+     yang dikarang); jawaban rute menuliskan alasan penggabungan di `note`.
+   - nama model yang **belum pernah** terlihat TIDAK langsung ditolak: katalog dibaca ulang sekali lebih
+     dulu, dibatasi **maksimal 5 pembacaan ulang per 60 detik** supaya rentetan nama ngawur tidak memicu
+     spawn CLI berulang-ulang.
+   Angka pembanding: pada kejadian merah rute melaporkan **252 model**; pembacaan langsung CLI pada
+   27 Sep 2026 memuat **354 model** (354 baris tabel, keluaran 355 baris) dan `z-ai/glm-4.7-flash` ada di
+   dalamnya. Jadi jawaban rute memang terpotong saat itu.
+   Bukti uji: `wave11a-katalog.e2e.ts` **21/21 lulus** (2 pemeriksaan premis baru diukur di sumbernya —
+   CLI tiruan langsung — sebab jawaban rute memang sengaja tidak lagi menyusut); **bukti mutasi dua arah**
+   di salinan `/tmp/mutasi-katalog`: pembacaan ulang dihilangkan → cek 2b gagal dengan tepat
+   `400 {"error":"UNKNOWN_MODEL"}`; penggabungan dihilangkan → 3 cek gagal (jawaban rute menyusut lagi);
+   Wave 11A nyata **208 lulus / 0 gagal**; `npm run verify` **61/61 dua kali**.
+   Bila pemeriksaan premis `12h0` masih pernah meleset di masa depan, jalankan suite itu sendirian dulu.
 
 ### 6.10.3 Bukti produksi v0.24.1 + pelajaran untuk skrip verifikasi produksi (27 Sep 2026)
 
@@ -675,6 +694,68 @@ Dua catatan jujur lain dari verifikasi produksi ini:
    `Smoke Project 1790531293965`, dibuat 27 Sep 2026 17:48Z). Jalur pembersihan data smoke berada di
    balik gerbang admin, sedangkan akun uji bukan admin, jadi tidak bisa membersihkan sendiri.
    Menunggu izin Bapak untuk membersihkan.
+
+### 6.10.4 Bersih-bersih sisa data smoke di produksi + suite smoke membersihkan diri (27 Sep 2026)
+
+Perintah Bapak: "Bersihkan smoke, perbaikan platform di izinkan, github nanti paling akhir setelah semua
+sesuai harapan." Bagian ini mencatat pembersihan yang **sudah dijalankan di produksi**.
+
+#### Temuan (periksa dulu, hapus kemudian)
+
+Tiga proyek sisa, masing-masing di workspace satu-anggota milik akun uji yang BERBEDA. Ketiganya lulus
+penjaga produk: akun bukan admin platform, workspace miliknya sendiri, satu anggota, dan workspace itu
+HANYA berisi proyek smoke itu (`proyek_lain: 0`).
+
+| Proyek (nama) | Dibuat | Workspace | Pemilik akun | Baris yang ikut terhapus |
+| --- | --- | --- | --- | --- |
+| `Smoke Project 1790025073701` | 14 Sep 2026 17:43Z | `Smoke Bot's Workspace` | `smoke.bot@coder.sam.university` | run 27, run_events 2539, pesan 52, percakapan 38, workflow 48, langkah eksekusi 72 |
+| `Smoke Project 1790454304279` | 26 Sep 2026 20:24Z | `Uji Live Dinda's Workspace` | `dinda.uji.v0230@coblai.com` | run 1, run_events 97, pesan 2, percakapan 2, workflow 2, langkah eksekusi 3 |
+| `Smoke Project 1790531293965` | 27 Sep 2026 09:03Z | `Uji Live PDF Dinda's Workspace` | `dinda.uji2.v0230@coblai.com` | run 2, run_events 177, pesan 4, percakapan 4, workflow 4, langkah eksekusi 6 |
+
+#### Cara membersihkan (cadangan dulu, jalur aman milik aplikasi)
+
+- Cadangan basis data lebih dulu: `better-sqlite3 db.backup()` → `/app/backups/backup-sebelum-bersih-smoke-1790536137478.db`
+  (12 644 352 bita; diperiksa isinya: 4 proyek + 49 percakapan — sama dengan basis data hidup saat itu).
+- Penghapusan memakai jalur aman milik aplikasi sendiri (tiruan `cleanupSmokeData` di `server.ts`), bukan
+  SQL mentah: proyek dihapus seperti `deleteProjectFully` (runs, run_events, pesan, percakapan, run_usage,
+  artefak, workflow + langkahnya, dokumen), ditambah undangan/notifikasi khusus workspace itu dan surat
+  tertunda akun itu. Akun, workspace, dan keanggotaan TETAP ADA — sama seperti rutin resmi.
+- Perkakas: `/workspace/outputs/bersih_smoke.cjs` dengan tiga mode: `periksa` (hitung saja),
+  `--backup`, `--hapus`. Dijalankan di dalam wadah produksi (`docker exec -i ... node -`).
+- Alasan tidak memakai rute resmi `POST /api/v1/admin/smoke/cleanup`: rute itu **hanya untuk admin
+  platform**, sedangkan pemilik sisa data adalah akun uji biasa.
+
+#### Hasil (angka nyata)
+
+| Ukuran | Sebelum | Sesudah |
+| --- | --- | --- |
+| Proyek (semua) | 4 | 1 (lihat catatan) |
+| Percakapan (semua) | 49 | 5 |
+| Proyek sisa di 3 workspace smoke | 3 | **0** |
+| Percakapan / notifikasi / undangan di 3 workspace smoke | — | **0 / 0 / 0** |
+| Baris yatim (percakapan, pesan, run, run_event, artefak, run_usage, dokumen, keanggotaan) | — | **0 semuanya** |
+| Kesehatan | — | `/health` **200**, `/ready` **siap** (`database ok`, `engine available`) |
+
+Catatan jujur: sesudah pembersihan, **Bapak membuat proyek baru `Music Genertor`** (27 Sep 2026 19:12:44Z)
+di workspace `Sammy An's Workspace`. Jadi jumlah proyek produksi sekarang **2** (`TESTER` + `Music Genertor`),
+keduanya milik `samianpacing@gmail.com`. Skrip pembersih TIDAK menyentuh keduanya: penjaganya menolak
+akun admin platform.
+
+Penyimpangan yang dinyatakan terbuka:
+- **Kunci API akun uji TIDAK dihapus** (4 + 2 + 30 = 36 kunci). Rutin resmi ikut menghapusnya, tetapi kunci
+  API adalah konfigurasi akun uji, bukan sisa data smoke — jadi sengaja dibiarkan.
+- Satu notifikasi lama milik `smoke.bot` tetap ada: jenis `billing`, `workspace_id` kosong
+  ("Kredit token ditambahkan", 15 Sep 2026). Itu catatan penagihan tingkat akun, bukan sisa proyek smoke.
+- Jejak audit uji di workspace Bapak (§2 butir 12) tidak tersentuh — masih menunggu izin terpisah.
+
+#### Sebab sisa data itu muncul + pencegahannya
+
+Suite `production-smoke.mjs` mengganti nama proyeknya menjadi `Smoke Project <waktu>` lalu **membiarkannya**
+setiap jalan. Rute pembersihan resmi hanya untuk admin platform, sedangkan akun uji bukan admin — jadi sisa
+data menumpuk. **Pencegahan (v0.24.2):** suite smoke kini **menghapus sendiri** proyek yang IA BUAT di jalan
+itu (dua pemeriksaan baru: "sisa data: proyek smoke dihapus sendiri oleh akun uji" dan "tidak ada lagi proyek
+bernama Smoke Project di akun uji"), dan **tidak menyentuh** proyek yang sudah ada sebelum suite jalan —
+kalau akun uji sudah punya proyek, suite melewatinya dengan alasan tertulis (`SKIP`).
 
 ### Cara memakai daftar ini
 Bapak cukup menyebut NOMOR (mis. "bereskan 15, 17, 24"). Saya kerjakan satu per satu, dengan

@@ -46,6 +46,8 @@ const workspaces = await call("GET", "/api/v1/workspaces");
 const workspaceId = workspaces.json[0].id;
 const projects = await call("GET", `/api/v1/workspaces/${workspaceId}/projects`);
 let projectId = projects.json[0]?.id;
+/** Apakah proyek ini lahir di jalan ini? Hanya proyek yang lahir di sini yang boleh dihapus di akhir. */
+const proyekDibuatSuite = !projectId;
 if (!projectId) {
   const created = await call("POST", `/api/v1/workspaces/${workspaceId}/projects`, { name: "Workflow Prod", slug: `workflow-prod-${Date.now()}` });
   projectId = created.json.id;
@@ -711,6 +713,23 @@ check("wave10 the status hub says how long the clean up keeps webhook history",
   && typeof hub10.json?.housekeeping?.smokeCleanup === "boolean",
   JSON.stringify(hub10.json?.housekeeping));
 console.log(`INFO wave10 searchIndexed=${hub10.json?.search?.indexedMessages}/${hub10.json?.search?.messages} pushConfigured=${hub10.json?.push?.configured} pushSubs=${hub10.json?.push?.activeSubscriptions} devices=${hub10.json?.devices?.devices} verifyMode=${hub10.json?.devices?.mode} reservedTokens=${hub10.json?.housekeeping?.reservedTokensWaiting} growthSources=${JSON.stringify(hub10.json?.openPlatform?.growthSources)}`);
+
+// Sisa data (27 Sep 2026): proyek uji di atas dinamai "Smoke Project <waktu>" dan dulu DIBIARKAN di
+// produksi setiap jalan. Rute pembersihan resmi (`POST /api/v1/admin/smoke/cleanup`) hanya untuk admin
+// platform, sedangkan akun uji bukan admin — karena itu suite ini membersihkan dirinya lewat jalur biasa:
+// akun uji menghapus proyek yang IA SENDIRI buat di jalan ini. Proyek yang sudah ada sebelum suite jalan
+// TIDAK disentuh, supaya data nyata tidak pernah ikut terhapus.
+if (proyekDibuatSuite) {
+  const hapus = await call("DELETE", `/api/v1/projects/${projectId}`);
+  check("sisa data: proyek smoke dihapus sendiri oleh akun uji (tanpa perlu admin)",
+    hapus.status === 200 && hapus.json?.ok === true, `${hapus.status} ${JSON.stringify(hapus.json)?.slice(0, 160)}`);
+  const sisaProyek = await call("GET", `/api/v1/workspaces/${workspaceId}/projects`);
+  check("sisa data: tidak ada lagi proyek bernama Smoke Project di akun uji",
+    Array.isArray(sisaProyek.json) && !sisaProyek.json.some((row) => row.id === projectId || String(row.name ?? "").startsWith("Smoke Project")),
+    JSON.stringify(sisaProyek.json)?.slice(0, 200));
+} else {
+  skip("sisa data: proyek smoke dihapus sendiri", "akun sudah punya proyek sebelum suite jalan, jadi proyek itu tidak dihapus");
+}
 
 console.log(`SKIP-TOTAL ${skips}`);
 console.log(failures === 0 ? "PRODUCTION_SMOKE_PASSED" : `PRODUCTION_SMOKE_FAILURES=${failures}`);

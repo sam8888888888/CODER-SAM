@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 27 Sep 2026 (**v0.24.1 (tata letak ponsel & penataan menu) LIVE di produksi dan sudah diverifikasi di produksi: 61/61 suite dua kali + gerbang UI 253/253 + smoke produksi 201/0 + verifikasi peramban produksi 31/0**). Produksi menjalankan `coder-platform-app:0.24.1` sejak 27 Sep 2026; skema basis data tetap **21** (v0.24.1 tidak mengubah skema). Rincian rilis v0.24.1 ada di bagian "Rilis v0.24.1 — tata letak ponsel & penataan menu" di bawah; rincian v0.24.0 dan v0.23.0 menyusul sesudahnya.
+Terakhir diperbarui: 27 Sep 2026 (**v0.24.1 LIVE di produksi dan sudah diverifikasi: 61/61 suite dua kali + gerbang UI 253/253 + smoke produksi 201/0 + verifikasi peramban produksi 31/0**. **v0.24.2 sudah siap di kode dan lulus gerbang 61/61 dua kali + bukti mutasi, MENUNGGU IZIN Bapak untuk deploy**: perbaikan platform katalog mesin + suite smoke yang membersihkan dirinya sendiri; skema basis data tetap **21**. Sisa data smoke di produksi sudah dibersihkan 27 Sep 2026 atas perintah Bapak — rinciannya di bagian "Perbaikan platform katalog mesin + bersih-bersih sisa data smoke" di bawah).
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -14,6 +14,74 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - DNS `coblai.com` belum dipasang (MX/SPF/DKIM); rinciannya di `docs/DNS_COBLAI_COM.md`.
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
+
+## Perbaikan platform katalog mesin + bersih-bersih sisa data smoke (27 Sep 2026, menuju v0.24.2)
+
+**Perintah Bapak (27 Sep 2026):** "Bersihkan smoke, perbaikan platform di izinkan, github nanti paling
+akhir setelah semua sesuai harapan." Rilisan ini **tidak mengubah skema** (tetap **21**) dan **tidak
+menyentuh dasbor** — jadi hasil gerbang UI v0.24.1 (253/253) tetap berlaku.
+
+### 1. Sisa data smoke di produksi — SUDAH DIBERSIHKAN
+
+Tiga proyek sisa ditemukan lewat pemeriksaan dulu (mode `periksa`), masing-masing di workspace
+satu-anggota milik akun uji yang berbeda, dan masing-masing workspace itu **hanya** berisi proyek smoke
+tersebut. Penghapusan memakai jalur aman milik aplikasi (tiruan `cleanupSmokeData`), bukan SQL mentah,
+dengan cadangan lebih dulu.
+
+| Proyek | Dibuat | Pemilik akun uji | Baris yang ikut terhapus |
+| --- | --- | --- | --- |
+| `Smoke Project 1790025073701` | 14 Sep 2026 17:43Z | `smoke.bot@coder.sam.university` | run 27, run_events 2539, pesan 52, percakapan 38, workflow 48, langkah 72 |
+| `Smoke Project 1790454304279` | 26 Sep 2026 20:24Z | `dinda.uji.v0230@coblai.com` | run 1, run_events 97, pesan 2, percakapan 2, workflow 2, langkah 3 |
+| `Smoke Project 1790531293965` | 27 Sep 2026 09:03Z | `dinda.uji2.v0230@coblai.com` | run 2, run_events 177, pesan 4, percakapan 4, workflow 4, langkah 6 |
+
+- Cadangan: `/app/backups/backup-sebelum-bersih-smoke-1790536137478.db` (12 644 352 bita; isinya
+  diperiksa: 4 proyek + 49 percakapan — sama dengan basis data hidup).
+- Hasil: proyek **4 → 1**, percakapan **49 → 5**, proyek sisa di ketiga workspace smoke **0**,
+  percakapan/notifikasi/undangan di sana **0**, dan **semua penghitung yatim 0** (percakapan, pesan, run,
+  run_event, artefak, run_usage, dokumen, keanggotaan). `/health` **200**, `/ready` **siap**.
+- Penyimpangan yang dinyatakan terbuka: **kunci API akun uji (36 kunci) sengaja TIDAK dihapus** — itu
+  konfigurasi akun, bukan sisa data smoke; satu notifikasi `billing` milik `smoke.bot` (15 Sep 2026,
+  `workspace_id` kosong) juga tetap, karena itu catatan penagihan tingkat akun.
+- Catatan jujur: sesudah pembersihan, **Bapak membuat proyek baru `Music Genertor`** (27 Sep 2026
+  19:12:44Z) di workspace `Sammy An's Workspace`. Jumlah proyek produksi sekarang **2** (`TESTER` +
+  `Music Genertor`), keduanya milik `samianpacing@gmail.com` — tidak satu pun disentuh skrip pembersih.
+- Perkakas dan rincian: `docs/DAFTAR_MASALAH_TERTUNDA.md` §6.10.4.
+
+### 2. Sebab sisa data itu muncul + pencegahannya
+
+Suite `production-smoke.mjs` menamai proyeknya `Smoke Project <waktu>` lalu **membiarkannya** setiap
+jalan; rute pembersihan resmi `POST /api/v1/admin/smoke/cleanup` hanya untuk admin platform, sedangkan
+akun uji bukan admin. Karena itu suite itu sekarang **menghapus sendiri proyek yang ia buat** di akhir
+jalan (dua pemeriksaan baru: "sisa data: proyek smoke dihapus sendiri oleh akun uji" dan "tidak ada lagi
+proyek bernama Smoke Project di akun uji"), dan **tidak menyentuh** proyek yang sudah ada sebelum suite
+jalan (dilewati dengan alasan tertulis, jadi tidak ada data nyata yang bisa hilang).
+
+### 3. Perbaikan platform: katalog mesin terpotong tidak lagi menolak model yang sah
+
+- Bukti cacatnya: pada gerbang 27 Sep 2026 pemeriksaan premis `12h0` melaporkan `katalog=252 ...
+  z-ai/glm-4.7-flash=false`, lalu 11 pemeriksaan bagian §12 ikut merah karena run ditolak
+  `400 UNKNOWN_MODEL`. Pembacaan langsung CLI pada hari yang sama memuat **354 model** dan
+  `z-ai/glm-4.7-flash` ada di dalamnya — jadi jawaban rute memang terpotong.
+- Perbaikan di `apps/api/src/server.ts`: (a) katalog **hanya boleh membesar** — pembacaan yang lebih
+  pendek dibaca ulang sekali lalu digabung dengan katalog terbesar (hanya menyatukan baris NYATA; tidak ada
+  nama model yang dikarang) dan alasannya ditulis di `note`; (b) nama model yang belum pernah terlihat
+  **tidak langsung ditolak** — katalog dibaca ulang sekali lebih dulu, dibatasi **maksimal 5 pembacaan
+  ulang per 60 detik** supaya rentetan nama ngawur tidak memicu spawn CLI berulang.
+- Bukti uji: suite `wave11a-katalog.e2e.ts` **21/21 lulus**; **bukti mutasi dua arah** di salinan
+  `/tmp/mutasi-katalog` (pembacaan ulang dihilangkan → cek 2b gagal dengan tepat `400 UNKNOWN_MODEL`;
+  penggabungan dihilangkan → 3 cek gagal karena jawaban rute menyusut lagi); Wave 11A nyata
+  **208 lulus / 0 gagal / 0 dilewati**; `npm run verify` **61/61 hijau dua kali**.
+
+### Gerbang uji v0.24.2 (27 Sep 2026)
+
+- `npm run verify` — **61/61 suite hijau, `ALL_SUITES_PASSED`, EXIT=0** dua kali berturut-turut:
+  `/workspace/outputs/verify_v0242_run1.log`, `/workspace/outputs/verify_v0242_run2.log`.
+- Suite terkait: `wave11a-katalog.e2e.ts` **21/21** (`/workspace/outputs/katalog_baru_run2.log`),
+  `wave11a.e2e.ts` **208/0** (`/workspace/outputs/wave11a_setelah_fix_run1.log`).
+- Bukti mutasi: `/workspace/outputs/katalog_mutasi1.log` (2 gagal) dan `katalog_mutasi2.log` (3 gagal).
+- Gerbang tipe: `apps/api/tsconfig.json` **0 galat**, `tsconfig.test.json` **0 galat**, dasbor `tsc -b` **0 galat**.
+- Penyebab gerbang merah sebelumnya (katalog terpotong saat mesin sibuk) sudah DIPERBAIKI, bukan sekadar
+  dicatat: rinciannya di `docs/DAFTAR_MASALAH_TERTUNDA.md` §6.10.2 butir 4.
 
 ## Rilis v0.24.1 — tata letak ponsel & penataan menu (27 Sep 2026)
 
