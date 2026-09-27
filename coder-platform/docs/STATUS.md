@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 26 Sep 2026 (**v0.23.0 LIVE di produksi; v0.24.0 siap dipetikan, menunggu izin deploy** — Wave 11A + 11B + 11C sudah di-commit, dipetikan, dideploy, dan diperiksa di peladen; sebelumnya produksi menjalankan 0.20.2 sejak 21 Sep 2026. Rincian deploy, bukti periksa, dan dua temuan nginx ada di bagian "Rilis v0.23.0 — LIVE DI PRODUKSI" di bawah. Wave 11C menutup 13 butir (68–76, 78, 81, 82) dengan skema **21**.)
+Terakhir diperbarui: 27 Sep 2026 (**v0.24.0 LIVE di produksi; v0.24.1 (tata letak ponsel & penataan menu) sudah diuji penuh (61/61 suite dua kali + gerbang UI 253/253) dan dipetikan, menunggu izin deploy dari Bapak**). Produksi menjalankan `coder-platform-app:0.24.0` sejak 27 Sep 2026; skema basis data tetap **21** (v0.24.1 tidak mengubah skema). Rincian rilis v0.24.1 ada di bagian "Rilis v0.24.1 — tata letak ponsel & penataan menu" di bawah; rincian v0.24.0 dan v0.23.0 menyusul sesudahnya.
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -14,6 +14,94 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - DNS `coblai.com` belum dipasang (MX/SPF/DKIM); rinciannya di `docs/DNS_COBLAI_COM.md`.
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
+
+## Rilis v0.24.1 — tata letak ponsel & penataan menu (27 Sep 2026)
+
+**Permintaan Bapak:** tampilan di HP berantakan, menu "Pengaturan & akun" tidak bisa digulir, menu perlu
+dirapikan per kategori (tetap lengkap tetapi dilipat, admin dan pengguna biasa harus berbeda, wajib ada
+kolom cari menu), dan kotak chat harus menyesuaikan ukuran peramban/tata letak. Rilisan kecil tanpa
+perubahan skema (skema tetap **21**).
+
+### Yang diubah (3 berkas sumber, hanya dasbor)
+
+- `coder-dashboard/src/nav.ts` — satu sumber kebenaran menu. Tambahan: `adminOnly` pada 8 menu
+  (`admin`, `adminPricing`, `adminEmail`, `adminJobs`, `growth`, `growthBackfill`, `metrics`,
+  `adminErrors`), `ADMIN_PAGES` kini DITURUNKAN dari `NAV_ITEMS.filter(i => i.adminOnly)` (dulu daftar
+  terpisah dan `adminPricing` tidak ada di dalamnya, sehingga pengguna non-admin bisa membuka halaman
+  rusak), 7 kelompok menu (`NAV_GROUPS`): Mulai di sini (4), Pengetahuan & hasil (7), Agen & otomasi (9),
+  Run uji & biaya (7), Integrasi & kanal (6), Akun & workspace (8), Admin platform (8; hanya admin),
+  serta `navGroupsFor(isAdmin)`, `grupHalaman`, dan `cariNavItem(kueri, isAdmin)`.
+  Catatan kejujuran: menu `knowledgeBase` sengaja ada di kelompok "Pengetahuan & hasil" (bukan Admin)
+  karena halamannya memang membaca-saja untuk non-admin; hanya karena itu kelompok Admin menjadi benar
+  benar khusus admin.
+- `coder-dashboard/src/App.tsx` — bilah menu kini berkelompok dan bisa dilipat, dengan **kolom cari menu**;
+  kelompok aktif terbuka otomatis, keadaan buka/tutup disimpan di `localStorage['coblai.nav.groups']`.
+  Bilah atas dirapikan: alat sekunder (Harga, Laporan proyek, Unduh percakapan, Chat baru, palet perintah,
+  tombol tema) masuk ke tombol `⋯` pada layar sempit. Sekaligus **perbaikan temuan produksi v0.24.0**:
+  `submitAuth` kini memanggil `loadSessions()` sesudah masuk, jadi daftar workspace/proyek/percakapan tidak
+  lagi kosong sampai halaman dimuat ulang (rujuk `docs/DAFTAR_MASALAH_TERTUNDA.md` §6.9 Catatan 2).
+- `coder-dashboard/src/styles.css` — +160 baris: aturan `.top-more` (panel `⋯` dari 760 px menjadi 900 px),
+  pembungkusan baris alat kotak chat di semua lebar, bilah samping menempel (`position: fixed` di ponsel,
+  `overflow-y: auto`, tombol bawah `position: sticky`), panel Pengaturan `max-height: calc(100dvh - 40px)`
+  + `overflow-y: auto`, ukuran sentuh ≥44 px, dan gaya kelas menu baru (termasuk tema terang).
+
+### Bukti ukur sebelum/sesudah (Chromium sungguhan, 5 viewport)
+
+Skrip `/workspace/outputs/diag_ui4.mjs`; log sebelum `diag_ui4_sesudah.log`, sesudah
+`diag_ui4_sesudah2.log`. Diringkas (angka nyata dari log):
+
+| Keluhan | Sebelum | Sesudah |
+|---|---|---|
+| Beranda lebih lebar dari layar | 490 px pada layar 360 px (luapan 130 px) | `scrollWidth == clientWidth` di 360/412/768/820/1366 |
+| Percakapan lebih lebar dari layar | 610 px pada layar 360 px (luapan 250 px) | muat layar di kelima viewport |
+| Kotak chat di lebar menengah | 820 px: lebar 1076 px (luapan 256 px) | muat layar; baris alat membungkus sejak < ~1180 px |
+| Panel Pengaturan tidak bisa digulir | kartu 4262 px, `overflowY: visible`, `scrollTop` tetap 0 | `max-height` sesuai layar + `overflow-y: auto`; `scrollTop` bergerak 500 px; digulir sampai bawah judul terakhir "Hapus semua riwayat" benar-benar terlihat |
+| Tombol "Pengaturan & akun"/"Keluar" tak terjangkau di HP | `top` 1888–2085, di luar layar 800 px; bilah ikut tergeser ke `top -400` | tiga tombol `terlihat: true`; bilah `position: fixed` dan tetap `top 64` sesudah halaman digulir 400 px |
+| Tombol kirim terhimpit | 16x34 px | 44x44 px di ponsel, 40x40 px di layar besar |
+| Menu berserakan | 49 menu satu daftar | 7 kelompok bisa dilipat + kolom cari ("audit" -> 1 hasil; kata tak ada -> pesan kosong; klik kelompok kedua -> menu di DOM 4 -> 11) |
+
+Pelanggaran CSP terukur: **0** di kelima viewport (menegaskan kebijakan CSP ketat tidak merusak gaya
+sebaris React, karena React menulis gaya lewat CSSOM).
+
+### Gerbang uji
+
+- Gerbang UI dasbor `coder-dashboard/e2e/ui.e2e.mjs`: **253 lulus, 0 gagal, 1 lewat dari 254 titik**,
+  `UI_E2E_PASSED`, `EXIT=0`, galat konsol 0, bundel segar (`dist/index.html` 27 Sep 2026 15:14Z).
+  Dijalankan dua kali oleh dua pihak dan hasilnya sama: pekerja gerbang
+  (`/workspace/outputs/ui_gate_mobile_run3.log`) dan saya sendiri
+  (`/workspace/outputs/ui_gate_lead_run1.log`).
+  Naik dari 237 titik (rilis v0.24.0) menjadi 254 titik: 17 pemeriksaan baru untuk tata letak ponsel,
+  gulir panel Pengaturan, bilah samping, kolom cari menu, kelompok menu yang dilipat, pembedaan peran
+  admin/non-admin, dan nol pelanggaran CSP. Log: `/workspace/outputs/ui_gate_mobile_run3.log`.
+  Satu titik `SKIP` tetap ada dan dilaporkan apa adanya (baris galat server vs basis data uji).
+- Gerbang API penuh `npm run verify`: **61 dari 61 suite hijau**, `ALL_SUITES_PASSED`, `EXIT=0`,
+  **dua kali berturut-turut** (log `/workspace/outputs/verify_v0241_run1.log` dan
+  `verify_v0241_run2.log`). Isinya termasuk `tsconfig.test.json`, `migration-check` (skema 21,
+  `REOPEN_IDEMPOTENT true`, `INTEGRITY_CHECK ok`, `MIGRATION_REHEARSAL_OK`, `ROW_COUNTS_PRESERVED true`),
+  `wave11a` 208/0, `wave11a-katalog` 10/10, `wave11a-csp` **117/117**, `wave11b` 109/0,
+  `wave11c-konektor` 53/0, dan `TMP_DIBERSIHKAN 43 direktori kerja`.
+- Tiga gerbang TypeScript (`apps/api`, `tsconfig.test.json`, dasbor `tsc -b`): **EXIT=0**.
+- Dua catatan jujur dari gerbang ini:
+  1. `apps/api/test/wave11a-csp.e2e.ts` diperbarui di rilis ini: pemeriksaan "menu samping muncul"
+     dulu menuntut `jumlah .page-link > 5`, sedangkan menu baru terlipat sehingga hanya 4 menu yang
+     terender. Sekarang pemeriksaannya menuntut 7 kepala kelompok + kolom cari + membuka satu kelompok
+     yang benar-benar **menambah** menu di DOM (bukan pemeriksaan yang selalu lulus).
+  2. Pada percobaan penuh pertama (15:32Z) `wave11a.e2e.ts` merah 196/12 karena **katalog mesin terbaca
+     terpotong** saat mesin sibuk (premis `12h0`: `z-ai/glm-4.7-flash` tidak ada di katalog), lalu run
+     ditolak `400 UNKNOWN_MODEL`. Dibuktikan FANA: `prime-agent model list` memuat model itu, dan suite
+     yang sama dijalankan sendirian **208/0 EXIT=0**. Rincian dan usul perbaikan platform ada di
+     `docs/DAFTAR_MASALAH_TERTUNDA.md` §6.10.2 nomor 4.
+
+### Yang TIDAK diubah
+
+Skema basis data (tetap 21), seluruh rute API, perizinan, dan berkas `.env`. Karena itu tidak ada
+`SCHEMA_VERSION_NOTE` baru dan tidak ada kunci env baru (gerbang env 70/0 tetap berlaku).
+
+### Sisa temuan (jujur, belum diperbaiki)
+
+Dua galat 404 pancingan foto profil di konsol (memang disengaja kode, sudah ada di daftar putih gerbang)
+dan isi kepala halaman yang 2 px lebih tinggi dari bilahnya di layar lebar (sudah ada sebelum perubahan,
+kosmetik) — rinci di `docs/DAFTAR_MASALAH_TERTUNDA.md` §6.10.2.
 
 ## Audit menyeluruh Wave 11 + perbaikan (26 Sep 2026) — persiapan rilis v0.24.0
 

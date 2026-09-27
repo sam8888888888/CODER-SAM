@@ -570,13 +570,77 @@ Usul perbaikan (1 baris, perlu bangun ulang dasbor + deploy ulang): sesudah `set
 `submitAuth`, panggil `void loadSessions().catch(() => setOnline(false));`.
 Dampak: pengguna baru selalu melihat dasbor setengah kosong sampai menekan muat ulang. Gerbang uji
 antarmuka saat ini **menyiasati** keadaan itu (`e2e/ui.e2e.mjs` memuat ulang halaman sesudah masuk),
-sehingga gerbang tidak pernah menangkapnya. Status: **menunggu keputusan Bapak** (perbaiki sekarang
-dengan rilis v0.24.1, atau tunda ke gelombang berikutnya).
+sehingga gerbang tidak pernah menangkapnya.
+Status (27 Sep 2026): **SUDAH DIPERBAIKI** pada rilis v0.24.1. `App.tsx` `submitAuth` sekarang memanggil
+`void api.me().then(fresh => { setUser(fresh.user); return loadSessions(); }).catch(() => setOnline(false));`
+sehingga daftar workspace/proyek/percakapan dimuat tepat sesudah masuk. Bukti uji: seluruh pemeriksaan gerbang UI
+yang dulu menyiasati dengan muat ulang tetap lulus (253/253 lulus, 0 gagal). Sisa pekerjaan: pemeriksaan
+gerbang khusus untuk jalur ini (masuk lewat formulir lalu **tanpa** `reload` langsung memastikan daftar
+proyek terisi) belum ada — dicatat sebagai pekerjaan lanjutan, bukan cacat terbuka.
 
 **Catatan 3 — sisa data uji di akun uji produksi.** `production-smoke.mjs` memakai proyek pertama akun uji
 lalu **mengganti namanya** menjadi `Smoke Project <stempel waktu>` (baris 238) dan tidak mengembalikan
 nama lama. Projek akun uji sekarang bernama `Smoke Project 1790499853279`. Ini hanya menyentuh akun uji,
 tidak menyentuh data pengguna lain, tetapi tercatat supaya tidak mengagetkan Bapak.
+
+## §6.10 Tata letak ponsel & penataan menu — hasil ukur 27 Sep 2026 (rilis v0.24.1)
+
+Latar: Bapak melaporkan (1) tampilan di HP berantakan, (2) menu "Pengaturan & akun" tidak bisa digulir /
+tidak terjangkau, (3) tombol kirim di kotak chat terhimpit. Semuanya diukur dengan Chromium sungguhan
+(skrip `/workspace/outputs/diag_ui4.mjs`, lima viewport: 360x800, 412x915, 768x1024, 820x1180, 1366x900)
+sebelum dan sesudah perbaikan. Angka di bawah adalah angka nyata dari log
+`/workspace/outputs/diag_ui4_sesudah.log` dan `diag_ui4_sesudah2.log`.
+
+### 6.10.1 Sudah DIPERBAIKI (bukti terukur)
+
+| Keluhan | Sebelum | Sesudah |
+|---|---|---|
+| Halaman Beranda lebih lebar dari layar (luapan mendatar) | `scrollWidth` 490 px pada layar 360 px (luapan 130 px); pelaku `.top-actions` dan `.profile-button` di `right=490` | `scrollWidth == clientWidth` di 360, 412, 768, 820, dan 1366 px |
+| Halaman Percakapan lebih lebar dari layar | `scrollWidth` 610 px pada layar 360 px (luapan 250 px); tombol kirim `width 16` px, tombol unggah `width 4` px | muat layar di semua lima viewport; tombol kirim 44x44 px di ponsel |
+| Luapan kotak chat di lebar menengah (iPad/laptop kecil) | pada 820 px: `scrollWidth` 1076 px (luapan 256 px), `button.send` di `right=1076` | `scrollWidth == clientWidth`; baris alat membungkus sendiri sejak lebar < ~1180 px |
+| Panel Pengaturan tidak bisa digulir | tinggi kartu 4262 px, `maxHeight: none`, `overflowY: visible`, `scrollTop = 500` **tidak bergerak** (tetap 0) | `maxHeight` 760/875/984/1140/860 px sesuai layar, `overflowY: auto`, `scrollTop` bergerak 500 px, dan setelah digulir sampai bawah judul terakhir ("Hapus semua riwayat") **benar-benar terlihat** |
+| Menu "Pengaturan & akun" dan "Keluar" di bilah samping tidak terjangkau di HP | tombol di `top 1888–2085`, di luar layar 800 px; bilah samping `position: absolute` sehingga ikut tergeser ke `top -400` saat halaman digulir | tiga tombol bawah `terlihat: true` di 360/412/768/820; bilah samping `position: fixed` (ponsel) dan tetap di `top 64` sesudah halaman digulir 400 px |
+| Menu berserakan tanpa kelompok | 49 menu dalam satu daftar panjang | 7 kelompok yang bisa dilipat + **kotak cari menu**; terukur: "audit" -> 1 hasil, kata tak ada -> pesan kosong, klik kelompok kedua -> menu di DOM 4 -> 11 |
+
+Catatan tambahan yang ikut terukur: **0 pelanggaran CSP** di kelima viewport (menegaskan bahwa
+kebijakan CSP ketat TIDAK merusak gaya sebaris React — React menulis gaya lewat CSSOM). Kelompok menu
+`Admin platform` hanya dirender untuk admin; akun non-admin melihat 6 kelompok.
+
+### 6.10.2 Sisa temuan dari pengukuran ini (BELUM diperbaiki, bukan regresi)
+
+1. **Dua galat 404 di konsol setiap halaman dimuat** — `GET /api/v1/media/avatar/<userId>?v=0` dan
+   `GET /api/v1/media/agent-avatar?v=0`. Ini **bukan cacat**: `ProfilePanel.tsx:346` memang memakai
+   `<img>` sebagai alat pancing untuk mengetahui ada/tidaknya foto (`onLoad`/`onError` mengisi
+   `data-ada`), dan gerbang uji `e2e/ui.e2e.mjs` sudah mendaftarkan kedua jalur itu di daftar putih
+   `galat11CDisengaja` beserta alasannya. Tetap dicatat karena membuat konsol tampak berisik bagi
+   pemeriksa baru. Usul bila Bapak mau bersih: panggil `HEAD`/`GET` kecil lebih dulu, atau sembunyikan
+   gambar saat `avatarAda === false`.
+2. **Isi kepala halaman 2 px lebih tinggi dari bilahnya pada layar lebar** — di 1366 px
+   `.top-actions` setinggi 68 px di dalam bilah 64 px (`top -2`, `bottom 66`; `scrollHeight 66` vs
+   `clientHeight 63`). Penyebabnya kelompok pemilih Workspace/Proyek yang memang bertingkat dua baris di
+   layar lebar. **Sudah ada sebelum perubahan ini** dan tidak menimbulkan luapan halaman; sifatnya
+   kosmetik.
+3. **Kotak cari menu selalu ikut dikosongkan** sesudah dipakai oleh gerbang uji; bila Bapak mengetik
+   lalu berpindah halaman, isi kotak cari tidak disimpan (hanya terbuka/tertutup kelompok yang disimpan
+   di `localStorage['coblai.nav.groups']`). Ini pilihan rancangan, bukan cacat — dicatat supaya jelas.
+
+4. **Kegagalan FANA gerbang `wave11a.e2e.ts` saat mesin sibuk (27 Sep 2026) — bukan cacat, sudah dibuktikan.**
+   Pada `npm run verify` 15:32Z suite ini merah 196/12 dengan pemicu tunggal: pemeriksaan premis
+   `12h0` melaporkan `katalog=252 ... z-ai/glm-4.7-flash=false` (katalog mesin tidak memuat model
+   cadangan kedua), lalu 11 pemeriksaan bagian §12 ikut gagal karena run ditolak
+   `400 UNKNOWN_MODEL`. Bukti bahwa ini fana dan bukan cacat:
+   - `prime-agent model list` dijalankan langsung pada 15:44Z: katalog memuat
+     `openrouter z-ai/glm-4.7-flash` (baris 347, 355 baris keluaran) — jadi modelnya ADA.
+   - Suite yang sama dijalankan ULANG sendirian: **208 lulus, 0 gagal, EXIT=0**
+     (`/workspace/outputs/w11a_rerun_v0241.log`). Durasi turun dari 283 detik menjadi ±5 detik.
+   Penyebab yang paling cocok: pembacaan katalog `prime-agent model list` terpotong ketika proses
+   dijalankan bersamaan dengan puluhan suite lain (pola yang sudah dikenal pada butir 57: "katalog
+   mesin bisa menjawab TIDAK LENGKAP saat mesin sibuk"). Suite ini justru bekerja BENAR: ia menolak
+   menilai bagian §12 dan mengatakannya apa adanya.
+   Usul lanjutan (perlu persetujuan Bapak karena menyentuh platform, bukan dasbor): `readEngineModelCatalogue`
+   (`server.ts`) membaca ulang katalog sekali bila hasilnya tidak memuat model yang barusan dipakai
+   (percobaan ulang "hanya menambah"), supaya katalog terpotong tidak pernah menolak nama model yang sah.
+   Sementara ini: jalankan suite itu sendirian bila pemeriksaan premis 12h0 gagal.
 
 ### Cara memakai daftar ini
 Bapak cukup menyebut NOMOR (mis. "bereskan 15, 17, 24"). Saya kerjakan satu per satu, dengan

@@ -362,6 +362,99 @@ const apiCalls = [];
 page.on("response", (response) => { const url = response.url(); if (url.includes("/api/v1/")) apiCalls.push(`${response.status()} ${url.replace(base, "")}`); });
 const callsTo = (part) => apiCalls.filter((line) => line.includes(part));
 
+/* ---------------- Navigasi menu bilah samping (struktur berkelompok, 27 Sep 2026) ----------------
+ * Bilah samping BUKAN lagi satu daftar rata 49 tombol: menunya dikelompokkan, bisa dilipat, dan
+ * kelompok yang TERTUTUP tidak merender isinya (DOM-nya kosong). Karena itu pemilih lama
+ * `page.click('nav.page-nav .page-link:has-text("...")')` tidak sahih lagi — tombol halamannya sering
+ * tidak ada di DOM walaupun menunya memang ada. Menu dibuka lewat kotak cari menu
+ * (`input[data-testid="nav-cari-menu"]`), sama seperti pengguna: kotak diisi label menu, hasil
+ * pencarian ditunggu, lalu tombol hasilnya ditekan, dan kotak dikosongkan kembali.
+ *
+ * Pencocokan label bertingkat: PERSIS, lalu AKHIRAN, lalu MENGANDUNG. Tingkat terakhir ada karena
+ * pemilih lama (`:has-text`) juga mencocokkan sebagian teks (mis. "Pengaturan" untuk menu
+ * "Pengaturan & akun"), sehingga argumen pemanggilan lama tidak perlu diubah.
+ *
+ * Penungguan dilakukan di sisi Node (bukan `page.waitForFunction`) karena halaman produksi memakai CSP
+ * ketat. Menu yang tidak ditemukan MENGGAGAL dengan pesan berisi hasil pencariannya — tidak boleh
+ * lolos diam-diam. Pemanggil yang perilaku lamanya memang membiarkan gagal (mis. di layar HP yang
+ * bilah sampingnya tertutup) memakai `{ wajib: false }`.
+ */
+async function bukaMenu(page, label, opts = {}) {
+  const wajib = opts.wajib !== false;
+  /** Gagal dengan pesan yang jelas (atau `false` bila pemanggil memang mengizinkan gagal). */
+  const menyerah = (sebab) => {
+    if (wajib) throw new Error(`bukaMenu("${label}") gagal: ${sebab}`);
+    return false;
+  };
+  const kotak = page.locator('nav.page-nav input[data-testid="nav-cari-menu"]').first();
+  try {
+    await kotak.waitFor({ state: "visible", timeout: opts.timeoutKotak ?? 8000 });
+  } catch (error) {
+    return menyerah(`kotak cari menu tidak siap (${error instanceof Error ? error.message.split("\n")[0] : String(error)})`);
+  }
+  let hasil = [];
+  let galatKlik = "";
+  try {
+    await kotak.fill(label);
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      // Hasil pencarian dibaca langsung dari DOM: daftar hasil muncul setelah React melukis ulang.
+      hasil = await page.evaluate(() => [...document.querySelectorAll('nav.page-nav [data-testid="nav-hasil-cari"] button[data-testid^="nav-item-"]')]
+        .map((node) => ({
+          testid: String(node.getAttribute("data-testid") || ""),
+          label: String((node.querySelector(".page-label") ?? node).textContent || "").trim(),
+        })));
+      const cocok = hasil.find((item) => item.label === label)
+        ?? hasil.find((item) => item.label.endsWith(label))
+        ?? hasil.find((item) => item.label.includes(label));
+      if (cocok) {
+        await page.click(`nav.page-nav [data-testid="nav-hasil-cari"] button[data-testid="${cocok.testid}"]`, { timeout: opts.timeoutKlik ?? 5000 });
+        return true;
+      }
+      await page.waitForTimeout(150);
+    }
+  } catch (error) {
+    galatKlik = error instanceof Error ? error.message.split("\n")[0] : String(error);
+  } finally {
+    // Kotak cari selalu dikosongkan lagi supaya daftar kelompok normal kembali seperti sebelum dicari.
+    await kotak.fill("").catch(() => undefined);
+  }
+  if (galatKlik) return menyerah(`menekan menu hasil pencarian gagal (${galatKlik})`);
+  return menyerah(`menu tidak ada di hasil pencarian (hasil: ${hasil.map((item) => item.label).join(", ") || "kosong"})`);
+}
+
+/**
+ * Membuka semua kelompok menu yang masih tertutup, lalu mengembalikan label seluruh tombol halaman
+ * yang dirender. Pemeriksaan lama yang membaca daftar rata `nav.page-nav .page-link` memerlukannya,
+ * karena tombol halaman kelompok yang tertutup tidak ada di DOM. Yang berubah hanya keadaan lipat
+ * (pilihan itu memang disimpan di localStorage); peran, alamat, dan data tidak diubah.
+ */
+async function labelSemuaMenu(page) {
+  // Bila kotak cari sedang berisi kata, daftar kelompok tidak dirender sama sekali; kosongkan dulu
+  // supaya label yang dikembalikan benar-benar daftar menu, bukan hasil pencarian yang tertinggal.
+  const kotak = page.locator('nav.page-nav input[data-testid="nav-cari-menu"]').first();
+  if (await kotak.count()) await kotak.fill("").catch(() => undefined);
+  const kepala = () => page.locator('nav.page-nav button[data-testid^="nav-grup-"]');
+  for (let putaran = 0; putaran < 6; putaran += 1) {
+    // React melukis ulang sesudah tombol kelompok diklik, jadi daftar kepala kelompok dibaca ulang
+    // setiap putaran dan pengulangan berhenti hanya setelah SEMUA melaporkan aria-expanded="true".
+    const jumlah = await kepala().count();
+    if (jumlah === 0) {
+      await page.waitForTimeout(200);
+      continue;
+    }
+    const tertutup = [];
+    for (let i = 0; i < jumlah; i += 1) {
+      const satu = kepala().nth(i);
+      const terbuka = String(await satu.getAttribute("aria-expanded").catch(() => "")) === "true";
+      if (!terbuka) tertutup.push(satu);
+    }
+    if (tertutup.length === 0) break;
+    for (const satu of tertutup) await satu.click({ timeout: 5000 }).catch(() => undefined);
+    await page.waitForTimeout(200);
+  }
+  return page.locator("nav.page-nav .page-link").evaluateAll((nodes) => nodes.map((node) => String(node.textContent || "").trim()));
+}
+
 try {
   // ----- 1) Daftar lewat layar masuk (antarmuka sungguhan, bukan panggilan API langsung).
   await page.goto(base, { waitUntil: "domcontentloaded" });
@@ -375,10 +468,16 @@ try {
   await page.fill('input[type="password"]', password);
   await page.click("button.primary");
   await page.waitForSelector("nav.page-nav", { timeout: 20000 });
-  // Sesi dibaca ulang sesudah daftar; menu admin baru muncul setelah jawabannya tiba.
-  await page.waitForSelector('nav.page-nav .page-link:has-text("Metrik")', { timeout: 15000 });
+  // Sesi dibaca ulang sesudah daftar; kepala kelompok menu baru muncul setelah jawabannya tiba.
+  // Sejak menu berkelompok, tombol halaman kelompok yang tertutup tidak dirender, jadi yang bisa
+  // ditunggu di sini adalah kepala kelompoknya — bukan tombol "Metrik" seperti sebelumnya. Bahwa akun
+  // ini benar-benar admin dibuktikan oleh daftar label di bawah ("Metrik" dan "Pelengkapan data"
+  // memang hanya untuk admin).
+  await page.waitForSelector('nav.page-nav button[data-testid^="nav-grup-"]', { timeout: 15000 });
+  // Daftar menu dibaca dengan semua kelompok DIBUKA lebih dulu: kelompok yang tertutup tidak
+  // merender tombol halamannya, jadi tanpa ini daftarnya hanya berisi kelompok halaman aktif.
   // innerText kosong untuk elemen yang belum dilukis, jadi teks dibaca dari textContent.
-  const navLabels = await page.locator("nav.page-nav .page-link").evaluateAll((nodes) => nodes.map((node) => String(node.textContent || "").trim()));
+  const navLabels = await labelSemuaMenu(page);
   check("pendaftaran lewat layar masuk membuka ruang kerja", navLabels.length > 5, navLabels.length);
   check("menu samping memuat halaman baru Wave 10",
     ["Pencarian", "Perangkat", "Metrik", "Pelengkapan data", "Riwayat webhook"].every((label) => navLabels.some((item) => item.trim().endsWith(label))),
@@ -399,7 +498,9 @@ try {
   // diambil diam-diam), jadi uji ini menekan tombolnya lebih dulu, sama seperti pengguna.
   async function openPage(label, urlPart, clickText) {
     const before = apiCalls.length;
-    await page.click(`nav.page-nav .page-link:has-text("${label}")`);
+    // Menu dibuka lewat kotak cari menu (lihat bukaMenu): tombol halaman bisa tidak ada di DOM
+    // selagi kelompoknya tertutup.
+    await bukaMenu(page, label);
     await page.waitForTimeout(600);
     const active = await page.locator("nav.page-nav .page-link.active").first().innerText().catch(() => "");
     check(`halaman ${label} menjadi halaman aktif`, active.trim().endsWith(label), active);
@@ -520,7 +621,7 @@ try {
   // "menunggu API" supaya kegagalan karena rute belum ada tidak dilaporkan sebagai lulus.
   async function bukaHalamanBaru(label, urlPart) {
     const before = apiCalls.length;
-    await page.click(`nav.page-nav .page-link:has-text("${label}")`);
+    await bukaMenu(page, label);
     await page.waitForTimeout(600);
     let seen = !urlPart;
     for (let attempt = 0; attempt < 40 && !seen; attempt += 1) {
@@ -614,11 +715,11 @@ try {
   // Proyek uji baru dikenal halaman setelah dimuat ulang; lalu proyek itu dipilih seperti pengguna.
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForSelector("nav.page-nav", { timeout: 20000 });
-  await page.click('nav.page-nav .page-link:has-text("Proyek")');
+  await bukaMenu(page, "Proyek");
   await page.waitForTimeout(500);
   await page.locator("main.main .tool-list > div", { hasText: proyekUji }).first().click();
   await page.waitForTimeout(500);
-  await page.click('nav.page-nav .page-link:has-text("Artefak")');
+  await bukaMenu(page, "Artefak");
   await page.waitForSelector("main.main .tool-list", { timeout: 15000 });
   await page.waitForTimeout(800);
 
@@ -824,14 +925,11 @@ try {
   // kartu harus menulis kalimat jujur itu dan TIDAK boleh mengarang angka pemotongan.
   const angkaID = (nilai) => Number(nilai ?? 0).toLocaleString("id-ID");
   const panggilanPagarSebelum = callsTo("/api/v1/context-budget/report").length;
-  const diklikPemakaian = await page.evaluate(() => {
-    const tautan = [...document.querySelectorAll("nav.page-nav .page-link")];
-    // Label "Pemakaian saya" juga memuat "Pemakaian": yang dicari menu yang BERAKHIR "Pemakaian".
-    const cocok = tautan.find((node) => String(node.textContent || "").trim().endsWith("Pemakaian"));
-    if (!cocok) return false;
-    cocok.click();
-    return true;
-  });
+  // Label "Pemakaian saya" juga memuat "Pemakaian": bukaMenu mendahulukan label yang PERSIS cocok,
+  // jadi yang dibuka tetap menu "Pemakaian" (perilaku lama mencari label yang berakhiran "Pemakaian").
+  // Hasilnya dipakai sebagai bagian pemeriksaan di bawah, jadi kegagalan dibiarkan terbaca di situ
+  // (`diklik=false`) alih-alih melempar dan menghentikan sisa gerbang — sama seperti perilaku lama.
+  const diklikPemakaian = await bukaMenu(page, "Pemakaian", { wajib: false });
   await page.waitForTimeout(600);
   let panggilanPagar = 0;
   let teksAngkaPagar = ""; let teksDipotongPagar = ""; let teksCatatanPagar = ""; let adaGalatPagar = 0;
@@ -885,7 +983,7 @@ try {
     `server dipotong=${dipotongPagar.length} blokTidakTerkirim=${blokTidakTerkirim.length} harapan=${jumlahBagianDiLayar} bagian/${totalKarakterDiLayar} karakter layar="${teksDipotongPagar.replace(/\s+/g, " ").slice(0, 200)}" catatan="${teksCatatanPagar.slice(0, 120)}"`);
 
   // ----- 5) butir 42: mode diskusi/eksekusi pada percakapan, plus satu run untuk Riwayat run.
-  await page.click('nav.page-nav .page-link:has-text("Percakapan")');
+  await bukaMenu(page, "Percakapan");
   await page.waitForTimeout(400);
   await page.click("button.new-chat");
   const bilahMode = page.locator('[data-testid="chat-mode-bar"]').first();
@@ -1183,7 +1281,8 @@ try {
   const tautanManifes = await page.locator('link[rel="manifest"]').count();
   check("index.html menautkan manifest sehingga peramban menawarkan pemasangan", tautanManifes > 0, String(tautanManifes));
   await page.evaluate(() => { window.dispatchEvent(new Event("beforeinstallprompt")); });
-  await page.click('nav.page-nav .page-link:has-text("Pengaturan")');
+  // Label menunya kini "Pengaturan & akun"; bukaMenu mencocokkan sebagian teks seperti pemilih lama.
+  await bukaMenu(page, "Pengaturan");
   await page.waitForTimeout(800);
   let tombolInstalAda = 0;
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -1259,7 +1358,9 @@ try {
   const halamanIos = await konteksIos.newPage();
   await halamanIos.goto(base, { waitUntil: "domcontentloaded" }).catch(() => undefined);
   await halamanIos.waitForSelector("nav.page-nav", { timeout: 20000 }).catch(() => undefined);
-  await halamanIos.click('nav.page-nav .page-link:has-text("Pengaturan")').catch(() => undefined);
+  // Di layar HP (390px) bilah samping tertutup di luar layar, jadi membuka menu memang bisa gagal.
+  // Perilaku lama juga membiarkan gagal (`.catch`), dan panduan iOS tetap terbaca dari kartu Beranda.
+  await bukaMenu(halamanIos, "Pengaturan", { wajib: false }).catch(() => undefined);
   await halamanIos.waitForTimeout(1200);
   const panduanIos = await halamanIos.locator('[data-testid="install-ios-guide"]').first().innerText().catch(() => "");
   check("panduan pemasangan iOS muncul di iPhone (Safari tidak punya beforeinstallprompt)",
@@ -1272,7 +1373,7 @@ try {
   const halamanStandalone = await konteksStandalone.newPage();
   await halamanStandalone.goto(base, { waitUntil: "domcontentloaded" }).catch(() => undefined);
   await halamanStandalone.waitForSelector("nav.page-nav", { timeout: 20000 }).catch(() => undefined);
-  await halamanStandalone.click('nav.page-nav .page-link:has-text("Pengaturan")').catch(() => undefined);
+  await bukaMenu(halamanStandalone, "Pengaturan", { wajib: false }).catch(() => undefined);
   await halamanStandalone.waitForTimeout(1200);
   const tawaranStandalone = await halamanStandalone.locator('[data-testid="install-prompt"]').count();
   check("tawaran pasang hilang saat aplikasi berjalan dalam mode standalone", tawaranStandalone === 0, String(tawaranStandalone));
@@ -1472,9 +1573,13 @@ try {
   await halamanNonAdmin.fill('input[type="password"]', password);
   await halamanNonAdmin.click("button.primary");
   await halamanNonAdmin.waitForSelector("nav.page-nav", { timeout: 20000 });
-  const menuAdminKedua = await halamanNonAdmin.locator('nav.page-nav .page-link:has-text("Metrik")').count();
-  check("akun kedua lewat layar masuk bukan admin platform (menu admin tidak muncul)", menuAdminKedua === 0, String(menuAdminKedua));
-  await halamanNonAdmin.click('nav.page-nav .page-link:has-text("Status platform")');
+  // Sejak menu berkelompok, tombol halaman kelompok yang tertutup tidak ada di DOM — termasuk menu
+  // admin. Semua kelompok dibuka lebih dulu supaya pemeriksaan "menu admin tidak muncul" tetap
+  // menguji menu yang benar-benar ditawarkan ke akun ini, bukan sekadar kelompok yang tertutup.
+  const labelNonAdmin = await labelSemuaMenu(halamanNonAdmin);
+  const menuAdminKedua = labelNonAdmin.filter((teks) => teks.endsWith("Metrik")).length;
+  check("akun kedua lewat layar masuk bukan admin platform (menu admin tidak muncul)", menuAdminKedua === 0, `menuMetrik=${menuAdminKedua} menu=${labelNonAdmin.length}`);
+  await bukaMenu(halamanNonAdmin, "Status platform");
   await halamanNonAdmin.waitForSelector('[data-testid="health-run"]', { timeout: 15000 }).catch(() => undefined);
   await halamanNonAdmin.click('[data-testid="health-run"]').catch(() => undefined);
   let pesanNonAdmin = "";
@@ -1492,6 +1597,8 @@ try {
   // Halaman khusus admin (Laporan galat, tab Operasional) memang tidak ditawarkan ke akun bukan admin,
   // jadi yang diuji di sini bukan layar halamannya, melainkan dua hal yang bisa dibuktikan: menunya
   // tidak muncul, dan rute adminnya dijawab 403 oleh server.
+  // Seluruh kelompok menu akun ini sudah dibuka di atas (`labelSemuaMenu`), jadi daftar ini memuat
+  // semua menu yang benar-benar ditawarkan — bukan hanya kelompok halaman yang sedang aktif.
   const menuNonAdmin = await halamanNonAdmin.evaluate(() => {
     const tautan = [...document.querySelectorAll("nav.page-nav .page-link")].map((node) => String(node.textContent || "").trim());
     return { galat: tautan.filter((teks) => teks.endsWith("Laporan galat")).length, total: tautan.length };
@@ -1533,7 +1640,8 @@ try {
   // Aturan uji bagian ini: setiap pemeriksaan membandingkan apa yang DILUKIS halaman dengan jawaban
   // server pada saat itu juga, bukan angka atau nama yang ditulis di berkas uji. Halaman baru tidak bisa
   // memakai pencocokan `has-text` bawaan Playwright karena label "Pemakaian saya" juga memuat "Pemakaian";
-  // pemilih menu di bawah mencocokkan AKHIRAN teks menu, yang selalu berisi nama halaman.
+  // pemilih menu di bawah mencocokkan label yang PERSIS lebih dulu (lihat `bukaMenu`), lalu akhiran, lalu
+  // yang memuat label — sama seperti dulu, yang membedakan hanya caranya: lewat kotak cari menu.
   const serverJson = (jalur, init) => page.evaluate(async (pesan) => {
     const jawaban = await fetch(pesan.jalur, pesan.init || undefined);
     const teks = await jawaban.text();
@@ -1548,14 +1656,12 @@ try {
   const rapi = (teks) => String(teks ?? "").replace(/\s+/g, " ").trim();
   const daftarDari = (badan, kunci) => (Array.isArray(badan) ? badan : (badan && Array.isArray(badan[kunci]) ? badan[kunci] : []));
 
+  // Dulu fungsi ini mencari tombol menu di DOM lalu menekannya langsung. Sejak menu berkelompok,
+  // tombol halaman kelompok yang tertutup tidak ada di DOM, jadi pencariannya dilakukan lewat kotak
+  // cari menu (`bukaMenu`). Sifatnya dipertahankan: mengembalikan benar/salah (bukan melempar), dan
+  // kesalahan itu tetap terbaca di pemeriksaan `bukaHalaman11B` / pemanggil lain.
   async function klikMenu11B(label) {
-    const diklik = await page.evaluate((label) => {
-      const tautan = [...document.querySelectorAll("nav.page-nav .page-link")];
-      const cocok = tautan.find((node) => String(node.textContent || "").trim().endsWith(label));
-      if (!cocok) return false;
-      cocok.click();
-      return true;
-    }, label);
+    const diklik = await bukaMenu(page, label, { wajib: false });
     await page.waitForTimeout(500);
     return diklik;
   }
@@ -3563,6 +3669,379 @@ try {
     expectedSignedOut.length > 0 && expectedSignedOut.every((line) => line.includes("/auth/me")), String(expectedSignedOut.length));
   await writeFile(`${shots}/api-calls.txt`, apiCalls.join("\n"), "utf8");
   console.log(`INFO ui-calls=${apiCalls.length} shots=${shots} consoleErrors=${consoleErrors.length}`);
+
+  /* ---------------- Fase 2 (27 Sep 2026): luapan, gulir, bilah samping ponsel, kotak cari, kelompok, peran, CSP ----------------
+   * Semua pemeriksaan berikut MENGUKUR DOM sungguhan (angka diambil dari peramban), tidak menyalin nilai
+   * dari berkas. Penungguan dilakukan di sisi Node dengan gelung + jeda; `page.waitForFunction` TIDAK
+   * dipakai karena halaman produksi memakai CSP ketat. Kalau ada yang memang tidak bisa diukur di sini,
+   * ditulis SKIP dengan alasan jujur, bukan dihapus diam-diam.
+   */
+  const galatKonsolSebelumFase2 = consoleErrors.length;
+  const UA_ANDROID = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36";
+  const UA_IPAD = "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+  const cspPola = /Content Security Policy|Refused to/;
+  const cspPelanggaran = [];
+  const cspDipantau = [];
+  const pantauCsp = (halaman, nama) => {
+    cspDipantau.push(nama);
+    halaman.on("console", (pesan) => { const teks = String(pesan.text() ?? ""); if (cspPola.test(teks)) cspPelanggaran.push(`${nama}: ${teks.slice(0, 160)}`); });
+    halaman.on("pageerror", (galat) => { const teks = `pageerror: ${galat.message}`; if (cspPola.test(teks)) cspPelanggaran.push(`${nama}: ${teks.slice(0, 160)}`); });
+  };
+  /** Gelung tunggu sisi Node: `fn` dipanggil berkali-kali sampai memberi nilai benar (tanpa waitForFunction). */
+  const tungguDi = async (halaman, fn, batas = 30, jeda = 150) => {
+    for (let putaran = 0; putaran < batas; putaran += 1) {
+      const nilai = await fn().catch(() => null);
+      if (nilai) return nilai;
+      await halaman.waitForTimeout(jeda);
+    }
+    return null;
+  };
+  /** Buka bilah samping ponsel. Tombolnya (`.icon-button.mobile-only`) ditutup tombol lain di layar
+   *  sempit, jadi ditekan lewat `evaluate` — sama seperti cara pemeriksaan lama menekan tombol tertutup. */
+  const bukaBilahSamping = async (halaman) => {
+    await halaman.evaluate(() => { const tombol = document.querySelector("button.icon-button.mobile-only"); if (tombol) tombol.click(); });
+    return tungguDi(halaman, () => halaman.evaluate(() => Boolean(document.querySelector("aside.sidebar.open"))), 20, 150);
+  };
+  /** Pindah halaman lewat menu seperti pengguna. Di ponsel bilah samping dibuka lebih dulu; bila tombolnya
+   *  tetap tidak bisa ditekan (bilah belum tergeser penuh), tombol ditekan lewat `evaluate`. */
+  const keHalamanKecil = async (halaman, key) => {
+    if ((halaman.viewportSize()?.width ?? 1366) <= 760) await bukaBilahSamping(halaman);
+    const pilih = `aside.sidebar [data-testid="nav-item-${key}"]`;
+    const ada = await tungguDi(halaman, async () => (await halaman.locator(pilih).count()) > 0, 20, 150);
+    if (!ada) return false;
+    try { await halaman.click(pilih, { timeout: 4000 }); }
+    catch { await halaman.evaluate((sel) => { const tombol = document.querySelector(sel); if (tombol) tombol.click(); }, pilih); }
+    return Boolean(await tungguDi(halaman, () => halaman.evaluate((k) => Boolean(document.querySelector(`aside.sidebar [data-testid="nav-item-${k}"].active`)), key), 20, 200));
+  };
+  /** Panel Pengaturan: dibuka lewat `.profile-button` (dengan `evaluate` karena di layar sempit bisa
+   *  tertutup tombol lain), lalu diukur apakah kartunya benar-benar bisa digulir sampai judul terakhir
+   *  terlihat di dalam layar. Panel ditutup lagi di akhir supaya pemeriksaan berikutnya tidak terhalang. */
+  const ukurGulirPengaturan = async (halaman) => {
+    await halaman.evaluate(() => { const tombol = document.querySelector(".profile-button"); if (tombol) tombol.click(); });
+    const ada = await tungguDi(halaman, () => halaman.evaluate(() => Boolean(document.querySelector(".modal-backdrop > .settings-card"))), 30, 200);
+    if (!ada) return { ada: false };
+    await halaman.waitForTimeout(500);
+    // Dibaca bertahap dengan jeda: satu bacaan sebelum digulir, satu sesudah `scrollTop = 500`, dan satu
+    // sesudah digulir sampai dasar — supaya hasilnya tidak bergantung pada kapan peramban melukis ulang.
+    const baca = () => halaman.evaluate(() => {
+      const kartu = document.querySelector(".modal-backdrop > .settings-card");
+      if (!kartu) return null;
+      const judul = [...kartu.querySelectorAll(".settings-heading")].pop();
+      const kotak = judul ? judul.getBoundingClientRect() : null;
+      const atasTengah = kotak ? document.elementFromPoint(Math.round((kotak.left + kotak.right) / 2), Math.round((kotak.top + kotak.bottom) / 2)) : null;
+      return {
+        scrollTop: Math.round(kartu.scrollTop), scrollHeight: kartu.scrollHeight, clientHeight: kartu.clientHeight,
+        judul: judul ? String(judul.textContent ?? "").trim().replace(/\s+/g, " ") : "(tidak ada judul)",
+        atas: kotak ? Math.round(kotak.top) : null, bawah: kotak ? Math.round(kotak.bottom) : null,
+        tinggi: window.innerHeight,
+        tertutup: kotak ? !(atasTengah && (atasTengah === judul || judul.contains(atasTengah))) : null,
+      };
+    });
+    const awal = await baca();
+    await halaman.evaluate(() => { const kartu = document.querySelector(".modal-backdrop > .settings-card"); if (kartu) kartu.scrollTop = 500; });
+    await halaman.waitForTimeout(300);
+    const posisiTengah = await baca();
+    await halaman.evaluate(() => { const kartu = document.querySelector(".modal-backdrop > .settings-card"); if (kartu) kartu.scrollTop = kartu.scrollHeight; });
+    await halaman.waitForTimeout(400);
+    const posisiUjung = await baca();
+    // Panel ditutup lewat tombol "×" (anak langsung kartu modal). Tombol "primary" TIDAK dipakai karena
+    // di dalam panel itu ada beberapa tombol primary (mis. "Simpan password"), jadi pilihannya ambigu.
+    await halaman.evaluate(() => { const tombol = document.querySelector(".modal-backdrop > .settings-card > button.close"); if (tombol) tombol.click(); });
+    const sudahTutup = await tungguDi(halaman, () => halaman.evaluate(() => !document.querySelector(".modal-backdrop > .settings-card")), 20, 200);
+    if (!awal || !posisiTengah || !posisiUjung) return { ada: false };
+    return { ada: true, sebelum: awal.scrollTop, setelah500: posisiTengah.scrollTop, ujung: posisiUjung.scrollTop,
+      scrollHeight: awal.scrollHeight, clientHeight: awal.clientHeight, tertutupSetelah: Boolean(sudahTutup),
+      judul: posisiUjung.judul, atas: posisiUjung.atas, bawah: posisiUjung.bawah, tinggi: posisiUjung.tinggi, tertutup: posisiUjung.tertutup };
+  };
+  /** Ringkasan satu pengukuran panel untuk pesan lulus/gagal. */
+  const ringkasGulir = (angka) => angka.ada
+    ? `scrollHeight=${angka.scrollHeight} clientHeight=${angka.clientHeight} scrollTop=${angka.sebelum}->${angka.setelah500}->${angka.ujung} judul=「${angka.judul}」atas=${angka.atas} bawah=${angka.bawah} tinggi=${angka.tinggi} tertutupJudul=${angka.tertutup} panelTertutupLagi=${angka.tertutupSetelah}`
+    : "panel Pengaturan tidak terbuka lewat .profile-button";
+  const gulirTerbukti = (angka) => Boolean(angka.ada) && angka.scrollHeight > angka.clientHeight && angka.setelah500 !== angka.sebelum
+    && angka.ujung > 0 && angka.judul === "Hapus semua riwayat" && angka.atas !== null && angka.atas >= 0 && angka.bawah !== null && angka.bawah <= angka.tinggi
+    && angka.tertutupSetelah === true;
+
+  // ---- F1) Luapan horizontal + F2b) panel Pengaturan di ponsel + F3) bilah samping ponsel ----
+  const layarUji = [
+    { nama: "360x800", viewport: { width: 360, height: 800 }, ua: UA_ANDROID },
+    { nama: "412x915", viewport: { width: 412, height: 915 }, ua: UA_ANDROID },
+    { nama: "768x1024", viewport: { width: 768, height: 1024 }, ua: UA_IPAD },
+  ];
+  for (const layar of layarUji) {
+    const konteks = await browser.newContext({ viewport: layar.viewport, isMobile: true, hasTouch: true, userAgent: layar.ua, storageState: statusSesi });
+    const halaman = await konteks.newPage();
+    halaman.setDefaultTimeout(10000);
+    pantauCsp(halaman, `layar-${layar.nama}`);
+    await halaman.goto(base, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+    const masuk = await tungguDi(halaman, () => halaman.evaluate(() => Boolean(document.querySelector(".profile-button"))), 60, 250);
+    if (!masuk) {
+      skip(`luapan horizontal di layar ${layar.nama}`, "sesi uji tidak terbaca di konteks layar ini sehingga antarmuka tidak bisa diukur");
+      skip(`panel Pengaturan di layar ${layar.nama}`, "sesi uji tidak terbaca di konteks layar ini");
+      await konteks.close();
+      continue;
+    }
+    const angkaHalaman = [];
+    for (const [namaHalaman, key] of [["Beranda", "home"], ["Percakapan", "chat"]]) {
+      const pindah = await keHalamanKecil(halaman, key);
+      await halaman.waitForTimeout(600);
+      const ukur = await halaman.evaluate(() => {
+        const akar = document.documentElement;
+        const lebar = akar.clientWidth;
+        const melampaui = [...document.querySelectorAll("body *")]
+          .map((el) => ({ el, kotak: el.getBoundingClientRect() }))
+          .filter(({ kotak }) => kotak.width > 0 && kotak.height > 0 && kotak.right > lebar + 1)
+          .slice(0, 10)
+          .map(({ el, kotak }) => `${el.tagName.toLowerCase()}${el.className ? `.${String(el.className).trim().split(/\s+/).slice(0, 2).join(".")}` : ""}「${String(el.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 40)}」kanan=${Math.round(kotak.right)}`);
+        return { scrollWidth: akar.scrollWidth, clientWidth: lebar, melampaui };
+      });
+      angkaHalaman.push({ namaHalaman, pindah, ...ukur });
+    }
+    const melebar = angkaHalaman.filter((baris) => baris.scrollWidth !== baris.clientWidth);
+    const takPindah = angkaHalaman.filter((baris) => baris.pindah !== true).map((baris) => baris.namaHalaman);
+    check(`luapan horizontal di layar ${layar.nama}: Beranda dan Percakapan tidak melebar melebihi layar`,
+      melebar.length === 0 && takPindah.length === 0,
+      angkaHalaman.map((baris) => `${baris.namaHalaman}: scrollWidth=${baris.scrollWidth} clientWidth=${baris.clientWidth} pindah=${baris.pindah}`).join(" ; ")
+        + (melebar.length ? ` || melampaui: ${melebar.flatMap((baris) => baris.melampaui.map((satu) => `${baris.namaHalaman} ${satu}`)).join(" | ").slice(0, 600)}` : "")
+        + (takPindah.length ? ` || halaman tidak berpindah: ${takPindah.join(", ")}` : ""));
+    if (layar.nama === "360x800") {
+      // F3) Bilah samping ponsel: tiga tombol blok bawah harus di dalam tinggi layar DAN bilahnya tidak
+      // boleh ikut tergeser saat halaman digulir (dulu `position:absolute` sehingga ikut ke -400).
+      await bukaBilahSamping(halaman);
+      await halaman.waitForTimeout(400);
+      const bilah = await halaman.evaluate(() => {
+        const aside = document.querySelector("aside.sidebar");
+        const gulir = document.scrollingElement;
+        return {
+          posisi: aside ? getComputedStyle(aside).position : "(tidak ada bilah)",
+          tombol: [...document.querySelectorAll(".sidebar-bottom button")].map((b) => { const kotak = b.getBoundingClientRect(); return { teks: String(b.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 26), atas: Math.round(kotak.top), bawah: Math.round(kotak.bottom) }; }),
+          tinggi: window.innerHeight,
+          bisaGulir: gulir ? gulir.scrollHeight > gulir.clientHeight : false,
+          gulirSebelum: gulir ? gulir.scrollTop : 0,
+          atasSebelum: aside ? Math.round(aside.getBoundingClientRect().top) : null,
+        };
+      });
+      await halaman.evaluate(() => window.scrollBy(0, 400));
+      await halaman.waitForTimeout(500);
+      const sesudah = await halaman.evaluate(() => {
+        const aside = document.querySelector("aside.sidebar");
+        const gulir = document.scrollingElement;
+        return { gulirSesudah: gulir ? gulir.scrollTop : 0, atasSesudah: aside ? Math.round(aside.getBoundingClientRect().top) : null };
+      });
+      check("bilah samping ponsel 360x800: tiga tombol blok bawah berada di dalam tinggi layar",
+        bilah.tombol.length === 3 && bilah.tombol.every((butir) => butir.atas >= -1 && butir.bawah <= bilah.tinggi + 1),
+        `tinggi=${bilah.tinggi} tombol=${bilah.tombol.map((butir) => `${butir.teks}(${butir.atas}..${butir.bawah})`).join(" | ")}`);
+      if (!bilah.bisaGulir) {
+        skip("bilah samping ponsel 360x800 tetap di tempat saat halaman digulir 400px",
+          `halaman tidak bisa digulir di layar ini (scrollHeight == clientHeight) sehingga pergeseran bilah tidak bisa diukur; position=${bilah.posisi}`);
+      } else {
+        check("bilah samping ponsel 360x800 tetap di tempat saat halaman digulir 400px",
+          sesudah.gulirSesudah > bilah.gulirSebelum && sesudah.atasSesudah === bilah.atasSebelum,
+          `position=${bilah.posisi} gulir=${bilah.gulirSebelum}->${sesudah.gulirSesudah} atasBilah=${bilah.atasSebelum}->${sesudah.atasSesudah}`);
+      }
+      const gulirHp = await ukurGulirPengaturan(halaman);
+      check("panel Pengaturan bisa digulir di ponsel 360x800 sampai judul terakhir terlihat",
+        gulirTerbukti(gulirHp), ringkasGulir(gulirHp));
+    }
+    await konteks.close();
+  }
+
+  // ---- F4) Kotak cari menu di halaman utama (akun admin, konteks utama) ----
+  const kotakCariMenu = 'nav.page-nav input[data-testid="nav-cari-menu"]';
+  await page.fill(kotakCariMenu, "audit").catch(() => undefined);
+  const hasilAudit = await tungguDi(page, () => page.evaluate(() => {
+    const kotak = document.querySelector('nav.page-nav [data-testid="nav-hasil-cari"]');
+    if (!kotak) return null;
+    const tombol = [...kotak.querySelectorAll('button[data-testid^="nav-item-"]')];
+    if (!tombol.length) return null;
+    return {
+      jumlah: tombol.length,
+      label: tombol.map((b) => String(b.querySelector(".page-label")?.textContent ?? "").trim()),
+      grup: tombol.map((b) => String(b.querySelector(".nav-grup-kecil")?.textContent ?? "").trim()),
+      kepalaKelompok: document.querySelectorAll('nav.page-nav button[data-testid^="nav-grup-"]').length,
+    };
+  }), 30, 150);
+  check("kotak cari menu: kata 'audit' memberi tepat satu hasil berlabel 'Audit'",
+    Boolean(hasilAudit) && hasilAudit.jumlah === 1 && hasilAudit.label[0] === "Audit",
+    hasilAudit ? `jumlah=${hasilAudit.jumlah} label=${hasilAudit.label.join(" | ")} grup=${hasilAudit.grup.join(" | ")} kepalaKelompokTampil=${hasilAudit.kepalaKelompok}` : "hasil pencarian tidak muncul dalam batas tunggu");
+  await page.fill(kotakCariMenu, "menu-tidak-ada-xyz").catch(() => undefined);
+  const kosongCari = await tungguDi(page, () => page.evaluate(() => {
+    const kosong = document.querySelector('nav.page-nav [data-testid="nav-kosong-cari"]');
+    const hasil = document.querySelectorAll('nav.page-nav [data-testid="nav-hasil-cari"] button[data-testid^="nav-item-"]').length;
+    return kosong && hasil === 0 ? { teks: String(kosong.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 80), hasil } : null;
+  }), 30, 150);
+  check("kotak cari menu: kata yang tidak ada memberi pesan kosong dan nol hasil",
+    Boolean(kosongCari), kosongCari ? `nav-kosong-cari=「${kosongCari.teks}」hasil=${kosongCari.hasil}` : "keadaan kosong tidak muncul dalam batas tunggu");
+  await page.fill(kotakCariMenu, "").catch(() => undefined);
+  await page.waitForTimeout(400);
+  const kembaliNormal = await page.evaluate(() => ({
+    isi: String(document.querySelector('nav.page-nav input[data-testid="nav-cari-menu"]')?.value ?? "(tidak terbaca)"),
+    kepala: document.querySelectorAll('nav.page-nav button[data-testid^="nav-grup-"]').length,
+    hasil: document.querySelectorAll('nav.page-nav [data-testid="nav-hasil-cari"] button[data-testid^="nav-item-"]').length,
+  }));
+  check("kotak cari menu dikosongkan lagi: daftar kelompok kembali seperti semula",
+    kembaliNormal.isi === "" && kembaliNormal.kepala === 7 && kembaliNormal.hasil === 0,
+    `isi="${kembaliNormal.isi}" kepalaKelompok=${kembaliNormal.kepala} hasil=${kembaliNormal.hasil}`);
+
+  // ---- F2a) Panel Pengaturan di PC + F5) kelompok menu + F6a) peran admin, di konteks PC 1366x900 ----
+  const konteksPc = await browser.newContext({ viewport: { width: 1366, height: 900 }, storageState: statusSesi });
+  const halamanPc = await konteksPc.newPage();
+  halamanPc.setDefaultTimeout(10000);
+  pantauCsp(halamanPc, "pc-1366x900");
+  await halamanPc.goto(base, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+  const masukPc = await tungguDi(halamanPc, () => halamanPc.evaluate(() => Boolean(document.querySelector(".profile-button"))), 60, 250);
+  if (!masukPc) {
+    skip("panel Pengaturan bisa digulir di PC 1366x900 sampai judul terakhir terlihat", "sesi uji tidak terbaca di konteks PC sehingga panel tidak bisa diukur");
+    skip("kelompok menu saat halaman dimuat (admin)", "sesi uji tidak terbaca di konteks PC sehingga menu tidak bisa diukur");
+    skip("menekan kepala kelompok lain menambah menu yang dirender", "sesi uji tidak terbaca di konteks PC");
+    skip("akun admin melihat kelompok 'Admin platform' dan bisa membuka 'Metrik' lewat kotak cari", "sesi uji tidak terbaca di konteks PC");
+  } else {
+    // F5) Hanya kunci lipatan kelompok yang dibuang (bukan kunci sesi), lalu halaman dimuat ulang supaya
+    // keadaan "saat memuat" benar-benar terukur, bukan keadaan sisa pemeriksaan sebelumnya.
+    await halamanPc.evaluate(() => { try { window.localStorage.removeItem("coblai.nav.groups"); } catch { /* mode privat */ } });
+    await halamanPc.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+    const adaKepala = await tungguDi(halamanPc, () => halamanPc.evaluate(() => document.querySelectorAll('nav.page-nav button[data-testid^="nav-grup-"]').length > 0), 60, 250);
+    const awal = adaKepala ? await halamanPc.evaluate(() => {
+      const kepala = [...document.querySelectorAll('nav.page-nav button[data-testid^="nav-grup-"]')];
+      const mulai = document.querySelector('nav.page-nav [data-testid="nav-grup-mulai"]');
+      const aktif = document.querySelector("nav.page-nav .nav-grup-isi .page-link.active");
+      const grupAktif = aktif ? aktif.closest(".nav-grup")?.querySelector('button[data-testid^="nav-grup-"]')?.getAttribute("data-testid") : null;
+      return {
+        jumlah: kepala.length,
+        kunci: kepala.map((b) => String(b.getAttribute("data-testid"))),
+        terbuka: kepala.filter((b) => String(b.getAttribute("aria-expanded")) === "true").map((b) => String(b.getAttribute("data-testid"))),
+        tertutupBerisi: kepala.filter((b) => String(b.getAttribute("aria-expanded")) !== "true").map((b) => b.parentElement.querySelectorAll(".page-link").length),
+        mulai: mulai ? String(mulai.getAttribute("aria-expanded")) : "(tidak ada kepala mulai)",
+        menu: document.querySelectorAll("nav.page-nav .page-link").length,
+        isiTerbuka: document.querySelectorAll("nav.page-nav .nav-grup-isi").length,
+        badgeMulai: Number(String(mulai?.querySelector(".nav-grup-jumlah")?.textContent ?? "").trim()),
+        grupAktif,
+        aktif: aktif ? String(aktif.textContent ?? "").trim() : "(tidak ada halaman aktif)",
+      };
+    }) : null;
+    check("kelompok menu saat halaman dimuat: 7 kepala kelompok untuk admin, hanya kelompok halaman aktif yang terbuka",
+      Boolean(awal) && awal.jumlah === 7 && awal.terbuka.length === 1 && awal.mulai === "true" && awal.grupAktif === "nav-grup-mulai"
+        && awal.isiTerbuka === 1 && awal.tertutupBerisi.every((n) => n === 0) && awal.menu === awal.badgeMulai && awal.menu > 0,
+      awal ? `kepala=${awal.jumlah} kunci=${awal.kunci.join(",")} terbuka=${awal.terbuka.join(",")} mulai=${awal.mulai} menu=${awal.menu} badgeMulai=${awal.badgeMulai} isiTerbuka=${awal.isiTerbuka} isiTertutup=${awal.tertutupBerisi.join(",")} aktif=「${awal.aktif}」di=${awal.grupAktif}` : "kepala kelompok tidak muncul sesudah muat ulang");
+    const sebelumKlik = awal ? awal.menu : 0;
+    const kepalaBiaya = halamanPc.locator('nav.page-nav button[data-testid="nav-grup-biaya"]').first();
+    if (!(await kepalaBiaya.count())) {
+      skip("menekan kepala kelompok lain membuka kelompoknya dan menambah menu yang dirender", "kepala kelompok 'nav-grup-biaya' tidak ada di halaman ini");
+    } else {
+      await kepalaBiaya.click();
+      const sesudahBuka = await tungguDi(halamanPc, () => halamanPc.evaluate((angka) => {
+        const kepala = document.querySelector('nav.page-nav [data-testid="nav-grup-biaya"]');
+        if (!kepala || String(kepala.getAttribute("aria-expanded")) !== "true") return null;
+        const menu = document.querySelectorAll("nav.page-nav .page-link").length;
+        return menu > angka ? { menu, badge: Number(String(kepala.querySelector(".nav-grup-jumlah")?.textContent ?? "").trim()) } : null;
+      }, sebelumKlik), 20, 150);
+      await kepalaBiaya.click();
+      const sesudahTutup = await tungguDi(halamanPc, () => halamanPc.evaluate((angka) => {
+        const kepala = document.querySelector('nav.page-nav [data-testid="nav-grup-biaya"]');
+        if (!kepala || String(kepala.getAttribute("aria-expanded")) !== "false") return null;
+        const menu = document.querySelectorAll("nav.page-nav .page-link").length;
+        return menu === angka ? { menu } : null;
+      }, sebelumKlik), 20, 150);
+      check("menekan kepala kelompok lain membuka kelompoknya (menambah menu di DOM) lalu menutupnya lagi",
+        Boolean(sesudahBuka) && sesudahBuka.menu === sebelumKlik + sesudahBuka.badge && Boolean(sesudahTutup),
+        `menuSebelum=${sebelumKlik} menuSesudahBuka=${sesudahBuka ? sesudahBuka.menu : "(tidak terbuka)"} badgeGrupBiaya=${sesudahBuka ? sesudahBuka.badge : "-"} menuSesudahTutup=${sesudahTutup ? sesudahTutup.menu : "(tidak tertutup)"}`);
+    }
+    const gulirPc = await ukurGulirPengaturan(halamanPc);
+    check("panel Pengaturan bisa digulir di PC 1366x900 sampai judul terakhir terlihat",
+      gulirTerbukti(gulirPc), ringkasGulir(gulirPc));
+    const grupAdmin = await halamanPc.evaluate(() => {
+      const kepala = document.querySelector('nav.page-nav [data-testid="nav-grup-admin"]');
+      return {
+        ada: Boolean(kepala),
+        teks: kepala ? String(kepala.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 60) : "(tidak ada)",
+        kepalaKelompok: document.querySelectorAll('nav.page-nav button[data-testid^="nav-grup-"]').length,
+        modalTerbuka: Boolean(document.querySelector(".modal-backdrop")),
+      };
+    });
+    // Kalau panel Pengaturan masih terbuka karena sebab lain, ditutup dulu: modal yang menutupi layar
+    // membuat klik pada hasil pencarian gagal karena tombolnya terhalang.
+    await halamanPc.evaluate(() => { const tombol = document.querySelector(".modal-backdrop > .settings-card > button.close"); if (tombol) tombol.click(); });
+    await tungguDi(halamanPc, () => halamanPc.evaluate(() => !document.querySelector(".modal-backdrop")), 20, 200);
+    // Menu dibuka lewat kotak cari menu; alasan kegagalan dicatat apa adanya supaya laporan tidak menebak.
+    let bukaMetrik = false;
+    let alasanMetrik = "";
+    try { bukaMetrik = await bukaMenu(halamanPc, "Metrik"); }
+    catch (galat) { alasanMetrik = galat instanceof Error ? galat.message : String(galat); }
+    await halamanPc.waitForTimeout(600);
+    const aktifMetrik = await halamanPc.evaluate(() => {
+      const aktif = document.querySelector("nav.page-nav .page-link.active");
+      return { label: aktif ? String(aktif.textContent ?? "").trim() : "(tidak ada halaman aktif)", utama: String(document.querySelector("main.main")?.textContent ?? "").trim().slice(0, 60) };
+    });
+    check("akun admin melihat kelompok 'Admin platform' dan bisa membuka halaman 'Metrik' lewat kotak cari",
+      grupAdmin.ada && bukaMetrik === true && /Metrik/.test(aktifMetrik.label),
+      `grupAdmin=${grupAdmin.ada} kepalaKelompok=${grupAdmin.kepalaKelompok} teks=「${grupAdmin.teks}」modalTerbukaSebelumCari=${grupAdmin.modalTerbuka} bukaMetrik=${bukaMetrik} aktif=「${aktifMetrik.label}」isiUtama=「${aktifMetrik.utama}」${alasanMetrik ? ` alasan=「${alasanMetrik.slice(0, 200)}」` : ""}`);
+  }
+  await konteksPc.close();
+
+  // ---- F6b + F6c) Peran bukan admin: kelompok admin dan pencarian menu admin. Akun baru didaftarkan
+  // lewat layar masuk (bukan panggilan API), sama seperti pemeriksaan bukan admin sebelumnya.
+  const nonAdminFase2 = `w11c-nonadmin-${stamp}@example.test`;
+  const konteksNonAdmin2 = await browser.newContext({ viewport: { width: 1366, height: 900 } });
+  const halamanNonAdmin2 = await konteksNonAdmin2.newPage();
+  halamanNonAdmin2.setDefaultTimeout(10000);
+  pantauCsp(halamanNonAdmin2, "non-admin-1366x900");
+  await halamanNonAdmin2.goto(base, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+  const masukNonAdmin = await tungguDi(halamanNonAdmin2, () => halamanNonAdmin2.evaluate(() => Boolean(document.querySelector(".profile-button"))), 60, 250);
+  let ukurNonAdmin = null;
+  let kosongMetrik = null;
+  if (masukNonAdmin) {
+    await halamanNonAdmin2.click(".profile-button").catch(() => undefined);
+    await halamanNonAdmin2.waitForSelector("form.auth-card", { timeout: 15000 }).catch(() => undefined);
+    const daftarFase2 = halamanNonAdmin2.locator("button.switch", { hasText: "Daftar" }).first();
+    if (await daftarFase2.count()) await daftarFase2.click();
+    await halamanNonAdmin2.fill('input[placeholder="Nama Anda"]', "Pengguna Uji Wave 11C").catch(() => undefined);
+    await halamanNonAdmin2.fill('input[placeholder="Email atau username"]', nonAdminFase2).catch(() => undefined);
+    await halamanNonAdmin2.fill('input[type="password"]', password).catch(() => undefined);
+    await halamanNonAdmin2.click("button.primary").catch(() => undefined);
+    const siapMenu = await tungguDi(halamanNonAdmin2, () => halamanNonAdmin2.evaluate(() => document.querySelectorAll('nav.page-nav button[data-testid^="nav-grup-"]').length > 0), 80, 250);
+    if (siapMenu) {
+      await halamanNonAdmin2.evaluate(() => { try { window.localStorage.removeItem("coblai.nav.groups"); } catch { /* mode privat */ } });
+      await halamanNonAdmin2.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+      await tungguDi(halamanNonAdmin2, () => halamanNonAdmin2.evaluate(() => document.querySelectorAll('nav.page-nav button[data-testid^="nav-grup-"]').length > 0), 60, 250);
+      await halamanNonAdmin2.waitForTimeout(400);
+      ukurNonAdmin = await halamanNonAdmin2.evaluate(() => {
+        const kepala = [...document.querySelectorAll('nav.page-nav button[data-testid^="nav-grup-"]')];
+        const adminGrup = document.querySelector('nav.page-nav [data-testid="nav-grup-admin"]');
+        return {
+          jumlah: kepala.length,
+          kunci: kepala.map((b) => String(b.getAttribute("data-testid"))),
+          adaGrupAdmin: Boolean(adminGrup),
+          isiGrupAdmin: adminGrup ? adminGrup.parentElement.querySelectorAll(".page-link").length : 0,
+          teksGrupAdmin: adminGrup ? String(adminGrup.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 60) : "(tidak ada)",
+        };
+      });
+      await halamanNonAdmin2.fill(kotakCariMenu, "Metrik").catch(() => undefined);
+      kosongMetrik = await tungguDi(halamanNonAdmin2, () => halamanNonAdmin2.evaluate(() => {
+        const kosong = document.querySelector('nav.page-nav [data-testid="nav-kosong-cari"]');
+        const hasil = document.querySelectorAll('nav.page-nav [data-testid="nav-hasil-cari"] button[data-testid^="nav-item-"]').length;
+        return kosong && hasil === 0 ? { teks: String(kosong.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 80), hasil } : null;
+      }), 30, 150);
+      await halamanNonAdmin2.fill(kotakCariMenu, "").catch(() => undefined);
+    }
+  }
+  check("akun bukan admin: tidak melihat kelompok 'Admin platform' (6 kepala kelompok, tanpa nav-grup-admin)",
+    Boolean(ukurNonAdmin) && ukurNonAdmin.jumlah === 6 && ukurNonAdmin.adaGrupAdmin === false,
+    ukurNonAdmin
+      ? `kepala=${ukurNonAdmin.jumlah} adaGrupAdmin=${ukurNonAdmin.adaGrupAdmin} teksGrupAdmin=「${ukurNonAdmin.teksGrupAdmin}」menuDiGrupItu=${ukurNonAdmin.isiGrupAdmin} kunci=${ukurNonAdmin.kunci.join(",")}`
+      : "akun bukan admin tidak sampai ke antarmuka menu sehingga kelompoknya tidak bisa diukur");
+  check("akun bukan admin: pencarian 'Metrik' berakhir di pesan kosong (nav-kosong-cari), bukan halaman kosong",
+    Boolean(kosongMetrik), kosongMetrik ? `nav-kosong-cari=「${kosongMetrik.teks}」hasil=${kosongMetrik.hasil}` : "keadaan kosong untuk pencarian 'Metrik' tidak muncul dalam batas tunggu");
+  await konteksNonAdmin2.close();
+
+  // ---- F7) Pelanggaran CSP + galat konsol baru selama Fase 2 ----
+  const cspKonsolUtama = consoleErrors.filter((baris) => cspPola.test(String(baris)));
+  const cspGalurGalur = [...expectedApiErrors, ...expectedSignedOut].filter((baris) => cspPola.test(String(baris)));
+  check("tidak ada pelanggaran CSP (Content Security Policy / Refused to) di seluruh viewport uji",
+    cspKonsolUtama.length === 0 && cspPelanggaran.length === 0 && cspGalurGalur.length === 0,
+    `konteksDipantau=${cspDipantau.length} konsolUtama=${cspKonsolUtama.length} konsolKonteksBaru=${cspPelanggaran.length} alurGalur=${cspGalurGalur.length}${cspPelanggaran.length ? ` contoh=${cspPelanggaran.slice(0, 3).join(" | ").slice(0, 400)}` : ""}`);
+  const galatFase2 = consoleErrors.slice(galatKonsolSebelumFase2);
+  check("pemeriksaan Fase 2 tidak memunculkan galat konsol baru di halaman utama",
+    galatFase2.length === 0, `galatBaru=${galatFase2.length}${galatFase2.length ? ` contoh=${galatFase2.slice(0, 2).join(" | ").slice(0, 300)}` : ""}`);
+
 } catch (error) {
   failed += 1; failures.push("alur uji antarmuka");
   console.log(`FAIL alur uji antarmuka ${error instanceof Error ? error.message : String(error)}`);

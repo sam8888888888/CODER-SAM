@@ -519,7 +519,20 @@ if (!chromium || !useBuiltDashboard) {
     check("peramban benar-benar menerima header CSP pada dokumen dashboard", Boolean(cspDiPeramban) && /default-src 'self'/.test(String(cspDiPeramban)), String(cspDiPeramban).slice(0, 90));
     await halaman.waitForSelector("nav.page-nav", { timeout: 20000 }).catch(() => undefined);
     const jumlahLink = await halaman.locator("nav.page-nav .page-link").count();
-    check("dashboard hasil build termuat di peramban (menu samping muncul)", jumlahLink > 5, String(jumlahLink));
+    // Sejak v0.24.1 menu samping DIKELOMPOKKAN dan kelompok yang tertutup tidak merender isinya, jadi
+    // "jumlah .page-link > 5" tidak lagi sah sebagai bukti menu muncul. Yang diperiksa sekarang: kepala
+    // kelompok lengkap, ada kolom cari menu, ada menu yang tampil, dan membuka satu kelompok benar-benar
+    // MENAMBAH menu di DOM (jadi ini bukan pemeriksaan yang selalu lulus).
+    const jumlahKepala = await halaman.locator("nav.page-nav [data-testid^='nav-grup-']").count();
+    const adaCari = await halaman.locator("nav.page-nav [data-testid='nav-cari-menu']").count();
+    const kepalaKedua = halaman.locator("nav.page-nav [data-testid^='nav-grup-']").nth(1);
+    let jumlahSetelahBuka = jumlahLink;
+    if (jumlahKepala > 1) {
+      await kepalaKedua.click({ timeout: 5000 }).catch(() => undefined);
+      await halaman.waitForTimeout(300);
+      jumlahSetelahBuka = await halaman.locator("nav.page-nav .page-link").count();
+    }
+    check("dashboard hasil build termuat di peramban (menu samping muncul)", jumlahKepala >= 5 && jumlahLink >= 1 && adaCari === 1 && jumlahSetelahBuka > jumlahLink, `kepala_kelompok=${jumlahKepala} link=${jumlahLink} kolom_cari=${adaCari} link_sesudah_kelompok_dibuka=${jumlahSetelahBuka}`);
     check("halaman awal dashboard tanpa galat CSP", galatCsp.length === 0, galatCsp.slice(0, 2).join(" | "));
 
     const aturanCss = await halaman.evaluate(() => {

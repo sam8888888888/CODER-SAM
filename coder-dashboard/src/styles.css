@@ -231,3 +231,163 @@
 
 /* Wave 11C (butir 76): pratinjau foto profil dan avatar agen. */
 .avatar-preview { display: block; margin: 6px 0; border: 1px solid var(--line, #2a2f3a); }
+
+/* =====================================================================================
+   Wave 11D — tata letak ponsel + panel yang benar-benar bisa digulir.
+   Semua angka di komentar di bawah berasal dari pengukuran Chromium yang dilaporkan lead
+   (Android 360x800, docClientW=360, sebelum berkas ini diubah):
+     - documentElement.scrollWidth = 490 (Beranda, pelaku .top-actions) dan 610 (Percakapan,
+       pelaku baris .composer-actions yang terhimpit: .send 16px, label.upload-button 4px);
+     - .page-nav 1749px di dalam bilah samping 736px → tiga tombol .sidebar-bottom di y=1888;
+     - .settings-card 4262px di layar 800px dengan max-height:none + overflow-y:visible.
+   ===================================================================================== */
+
+/* --- A1. Kepala halaman: di layar lebar .top-more tetap sebaris seperti dulu ---------- */
+/* Sengaja TIDAK diberi position:relative: panel melayang (<=900px) harus dipatok ke
+   .topbar (satu-satunya leluhur berposisi), supaya right:12px-nya tepi jendela, bukan tepi tombol ⋯. */
+.top-more { display: flex; align-items: center; gap: 12px; }
+.top-more-wrap { display: flex; align-items: center; }
+/* Tombol ⋯ (kelas .top-more-btn di App.tsx, bukan lagi .mobile-only yang baru aktif <=760px):
+   dasar display:none, dinyalakan mulai <=900px supaya 761-900px tidak lagi kehilangan
+   akses ke Harga/Laporan/Chat baru/palet/tema setelah .picker-group disembunyikan. */
+.top-more-btn { display: none; }
+
+/* --- D. Kelas baru menu bilah samping: kotak cari, kelompok, hasil cari -------------- */
+/* Baris menu yang bisa ditekan minimal 40px (44px di ponsel), lihat blok @media di bawah. */
+.nav-cari{display:flex;align-items:center;gap:6px;background:#090b1699;border:1px solid #252b42;border-radius:11px;padding:0 8px;margin:0 4px 10px}
+.nav-cari-icon{flex:none;color:#64748b;font-size:13px;line-height:1}
+.nav-cari-isian{flex:1;min-width:0;border:0;outline:0;background:transparent;color:#f8fafc;font-size:13px;padding:11px 0}
+.nav-cari-isian::placeholder{color:#64748b}
+.nav-cari-bersih{flex:none;width:32px;height:32px;min-width:32px;border:0;border-radius:8px;background:transparent;color:#94a3b8;font-size:13px;line-height:1;cursor:pointer}
+.nav-cari-bersih:hover{background:#ffffff12;color:#f8fafc}
+.nav-hasil{display:flex;flex-direction:column;gap:2px;padding-top:2px}
+.nav-grup{display:block}
+/* Judul kelompok dibuat jelas sebagai kepala: lebih tebal + berlatar sedikit. */
+.nav-grup-head{display:flex;align-items:center;gap:8px;width:100%;min-height:40px;padding:8px 9px;border:1px solid transparent;border-radius:10px;background:#ffffff09;color:#e2e8f0;text-align:left;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+.nav-grup-head:hover{background:#ffffff14}
+.nav-grup.open .nav-grup-head{background:#8b5cf622;border-color:#8b5cf655;color:#ede9fe}
+.nav-grup-icon{flex:none;width:16px;text-align:center;opacity:.9}
+.nav-grup-label{flex:1;min-width:0;overflow-wrap:anywhere}
+.nav-grup-jumlah{flex:none;margin-left:auto;background:#ffffff12;border-radius:999px;padding:1px 7px;color:#94a3b8;font-size:10px;font-weight:700}
+.nav-grup-panah{flex:none;width:14px;text-align:center;color:#94a3b8;font-size:11px}
+.nav-grup-isi{display:flex;flex-direction:column;gap:1px;padding:2px 0 6px 8px}
+/* Markup sudah tidak merender isi kelompok yang tertutup; aturan ini menjaga bila markup berubah. */
+.nav-grup:not(.open) .nav-grup-isi{display:none}
+.nav-grup-kecil{flex:none;margin-left:auto;color:#64748b;font-size:10px;letter-spacing:.04em;text-transform:uppercase}
+.nav-kosong{margin:4px 8px 10px;color:#64748b;font-size:12px;line-height:1.5}
+.page-link{min-height:40px}
+.page-label{min-width:0;overflow-wrap:anywhere}
+
+/* --- B. Bilah samping: SATU kolom bergulir, blok bawah selalu terlihat -------------- */
+/* Sebelum ini .page-nav tumbuh 1749px di dalam bilah 736px (daftar menu lama 49 tombol) sehingga
+   .sidebar-bottom terdorong ke y=1888, di luar layar. Perbaikannya:
+   1) bilah samping sendiri yang menggulir (bukan tiap anak punya gulir sendiri, yang di layar
+      360px justru membuat perangkap gulir), dan tingginya tidak boleh melebihi sisa layar
+      supaya isinya tidak pernah mendorong halaman jadi lebih tinggi;
+   2) .sidebar-bottom dijadikan menempel (position:sticky;bottom:0) supaya tetap terlihat
+      walau daftar menu atau daftar percakapan lebih panjang dari layar. */
+.sidebar{overflow-y:auto;overflow-x:hidden;max-height:calc(100vh - 64px);max-height:calc(100dvh - 64px);overscroll-behavior:contain}
+.page-nav{flex:0 0 auto}
+.sidebar nav.session-list{flex:0 0 auto;min-height:0}
+/* Latar penuh (margin negatif menembus padding 12px bilah) supaya isi yang tergulir tidak
+   menyembul di sisi kiri/kanan blok ini. */
+.sidebar-bottom{flex:0 0 auto;margin-top:auto;position:sticky;bottom:0;z-index:2;margin-left:-12px;margin-right:-12px;padding-left:12px;padding-right:12px;background:#0e1322f2;backdrop-filter:blur(6px)}
+
+/* --- C. Panel Pengaturan bisa digulir (PC maupun ponsel) ---------------------------- */
+/* .modal-backdrop dulu overflow:visible dan kartu Pengaturan 4262px tanpa max-height, sehingga
+   baik kartu maupun halaman tidak bisa digulir sama sekali. Sisa 8px (40px vs padding 2x16px)
+   sengaja disisakan supaya pembulatan piksel tidak memunculkan gulir 1px di latarnya. */
+.modal-backdrop{overflow:auto;overscroll-behavior:contain}
+.settings-card{max-height:calc(100vh - 40px);max-height:calc(100dvh - 40px);overflow-y:auto;overscroll-behavior:contain}
+/* Kartu bersarang (mis. .danger-zone di dalam kartu Pengaturan) tidak digulir sendiri-sendiri. */
+.settings-card .settings-card{max-height:none;overflow:visible}
+/* Tombol tutup ikut menggulir bersama kartu; dibuat menempel supaya tetap bisa ditekan.
+   Hanya untuk kartu Pengaturan (.auth-card tanpa .settings-card, mis. formulir masuk/daftar,
+   tidak disentuh: sudutnya tetap position:absolute seperti semula). */
+.modal-backdrop > .settings-card > .close{position:sticky;top:4px;display:block;width:fit-content;margin-left:auto;z-index:2;background:inherit;border-radius:10px;padding:0 6px}
+/* Baris alat kotak chat WAJIB boleh membungkus di SEMUA lebar: lebar minimum isinya ~848px,
+   sedangkan pada 820px ruang konten hanya ~820 - 285 (bilah samping) - padding = ~510px,
+   sehingga button.send terlempar sampai right=1076px (luapan 256px, docScrollW 1076 vs clientW 820).
+   Di 1366px barisnya masih muat (~848px <= ~1060px), jadi tampilannya tidak berubah (tetap satu baris). */
+.composer-actions{flex-wrap:wrap;row-gap:6px}
+/* min-width:0 pada pemilih model/persona/penalaran supaya select boleh menyusut saat baris sempit. */
+.composer-actions .model-picker{min-width:0;max-width:100%}
+.composer-actions .model-picker select{min-width:0;max-width:100%}
+/* Tombol kirim kotak chat: minimal 40x40px dan tidak boleh menyusut terhimpit. */
+.composer-actions .send{flex:0 0 auto;min-width:40px;min-height:40px}
+.composer-actions .icon-button,.composer-actions .upload-button{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;min-width:34px;min-height:34px}
+.composer-actions .stop{flex:0 0 auto}
+
+/* --- A2. Tablet / jendela sedang (<=900px): tombol ⋯ muncul, panel alat jadi melayang ----- */
+/* Dipindah dari blok <=760px karena pada 761-900px .picker-group sudah disembunyikan (<=900px)
+   sementara .mobile-only baru aktif <=760px, sehingga tanpa ini alat lain tidak bisa dijangkau. */
+@media (max-width: 900px) {
+  /* Tombol ⋯ (kelas .top-more-btn). display:flex + pemusatan supaya "⋯" tetap di tengah seperti
+     tombol .icon-button lain yang mengandalkan pemusatan bawaan <button>. */
+  .top-more-btn{display:flex;align-items:center;justify-content:center}
+  /* Panel disembunyikan dari baris: dulu isinya (Harga, Laporan proyek, Chat baru, ⌘, tema ≈ 180px,
+     butuh ~640px) ikut baris dan melebarkan .top-actions sampai kanan=490px di layar 360px. */
+  .top-more{display:none}
+  .top-more.open{display:flex;flex-direction:column;align-items:stretch;gap:6px;position:absolute;right:12px;top:calc(100% + 6px);width:min(300px,calc(100vw - 24px));padding:10px;background:#111525f5;border:1px solid #252b42;border-radius:14px;box-shadow:0 18px 44px #000000a6;z-index:41}
+  .top-more.open>*{width:100%;min-width:0;min-height:44px}
+  .top-more.open .link-button{display:flex;align-items:center;padding:0 12px;border-radius:10px;font-size:14px}
+  .top-more.open .link-button:hover{background:#ffffff12}
+}
+
+/* --- B2. Ponsel (<=760px): kepala menempel, panel alat 44px, bilah samping fixed ------- */
+@media (max-width: 760px) {
+  /* Kepala halaman boleh menempel (z-index 6 = di atas bilah samping 2, di bawah notifikasi 40). */
+  .topbar{position:sticky;top:0;z-index:6;padding:0 12px;gap:6px}
+  /* Khusus ponsel: tinggi sentuh panel alat 44px (aturan panelnya ada di blok <=900px di atas). */
+  .top-more.open>*{min-height:44px}
+  /* Bilah samping dipaku ke jendela: dulu position:absolute sehingga ikut tergeser saat halaman digulir. */
+  .sidebar{position:fixed;top:64px;left:0;right:auto;bottom:auto;height:calc(100vh - 64px);height:calc(100dvh - 64px);z-index:2;overflow-y:auto;overflow-x:hidden;transform:translateX(-100%);box-shadow:20px 0 50px #0008}
+  .sidebar.open{transform:translateX(0)}
+  /* Blok bawah menempel di dasar bilah samping: tetap terlihat dan tidak tertutup bilah rumah ponsel. */
+  .sidebar-bottom{padding-bottom:max(10px,env(safe-area-inset-bottom))}
+  /* Sasaran tekan 44px di ponsel. */
+  .page-link,.nav-grup-head{min-height:44px}
+  .modal-backdrop > .settings-card > .close{padding:7px 9px}
+  .nav-cari-isian{padding:13px 0}
+  .nav-cari-bersih{width:36px;height:36px;min-width:36px}
+  .nav-grup-isi{padding-bottom:8px}
+  /* Ponsel: rapatkan jarak baris alat (pembungkusan sendiri sudah berlaku di semua lebar). */
+  .composer-actions{gap:6px;row-gap:8px}
+  .composer-actions button,.composer-actions .upload-button{flex:0 0 auto;width:40px;height:40px;min-width:40px;min-height:40px}
+  .composer-actions .send{width:44px;height:44px;min-width:44px;min-height:44px;font-size:20px}
+  .composer-actions .stop{width:auto;min-width:auto;padding:0 12px}
+  /* Pemilih model/persona/penalaran: dua per baris, select menyempit ikut lebar baris. */
+  .model-picker{flex:1 1 45%;min-width:0;max-width:100%}
+  .model-picker select{width:100%;min-width:0;max-width:100%}
+  /* Jaring pengaman halaman isi: tabel dan blok kode lebar menggulir sendiri, tidak melebarkan halaman. */
+  .admin-table{display:block;width:100%;overflow-x:auto}
+  .admin-table th,.admin-table td{white-space:normal}
+  .page-shell pre,.settings-card pre,.page-shell .artifact-preview-text{max-width:100%;overflow-x:auto}
+}
+
+/* --- A3. Layar sangat sempit (<=420px): rapatkan kepala halaman --------------------- */
+@media (max-width: 420px) {
+  .topbar{padding:0 10px}
+  .top-actions{gap:6px}
+  .brand{gap:8px}
+  .brand-mark{width:32px;height:32px;border-radius:10px}
+  .brand-name{font-size:15px}
+}
+
+/* --- E. Padanan tema terang untuk kelas baru (tidak ada teks gelap di latar gelap) --- */
+[data-theme="terang"] .nav-cari{background:#fff;border-color:#dbe2f0}
+[data-theme="terang"] .nav-cari-isian{color:#0f172a}
+[data-theme="terang"] .nav-cari-isian::placeholder{color:#94a3b8}
+[data-theme="terang"] .nav-cari-icon,[data-theme="terang"] .nav-cari-bersih{color:#475569}
+[data-theme="terang"] .nav-cari-bersih:hover{background:#e8edfa;color:#0f172a}
+[data-theme="terang"] .nav-grup-head{background:#f1f5fd;border-color:#dbe2f0;color:#1e293b}
+[data-theme="terang"] .nav-grup-head:hover{background:#e8edfa}
+[data-theme="terang"] .nav-grup.open .nav-grup-head{background:#e0e7ff;border-color:#8b5cf6aa;color:#1e1b4b}
+[data-theme="terang"] .nav-grup-jumlah{background:#e2e8f0;color:#475569}
+[data-theme="terang"] .nav-grup-panah,[data-theme="terang"] .nav-grup-kecil,[data-theme="terang"] .nav-grup-icon{color:#64748b}
+[data-theme="terang"] .nav-kosong{color:#475569}
+[data-theme="terang"] .sidebar-bottom{background:#fffffff7;border-top-color:#dbe2f0}
+[data-theme="terang"] .top-more.open{background:#fff;border-color:#dbe2f0;box-shadow:0 18px 44px #0f172a26}
+[data-theme="terang"] .top-more.open .link-button{color:#1d4ed8}
+[data-theme="terang"] .top-more.open .link-button:hover{background:#e8edfa}
+[data-theme="terang"] .top-more.open .icon-button{background:#fff;border-color:#dbe2f0;color:#0f172a}
