@@ -82,6 +82,18 @@ jalan (dilewati dengan alasan tertulis, jadi tidak ada data nyata yang bisa hila
 - Gerbang tipe: `apps/api/tsconfig.json` **0 galat**, `tsconfig.test.json` **0 galat**, dasbor `tsc -b` **0 galat**.
 - Penyebab gerbang merah sebelumnya (katalog terpotong saat mesin sibuk) sudah DIPERBAIKI, bukan sekadar
   dicatat: rinciannya di `docs/DAFTAR_MASALAH_TERTUNDA.md` §6.10.2 butir 4.
+- Gerbang paket: `deploy-paket-integritas.e2e.ts` **24/24 lulus** (`ALL_DEPLOY_PAKET_TESTS_PASSED`).
+
+### Paket rilis v0.24.2
+
+- Commit rilis: **`4112f8c`** (branch `feature/coder-dashboard-local`).
+- Berkas paket: `deploy/coder-sam-university-v0.24.2.tar.gz` — **322 entri**, 1 544 021 bita.
+- **SHA256: `a735a84877af7693e0e1bcc507884a37220315e15838ad985c1b603e7d0be20c`**
+- Isi paket diperiksa langsung: `apps/api/src/server.ts` memuat perbaikan katalog (`gabungKatalog`,
+  `BATAS_BACA_ULANG_KATALOG`), `apps/api/test/production-smoke.mjs` memuat pembersihan mandiri
+  (`proyekDibuatSuite`), `deploy/env.keys.txt` memuat `APP_VERSION=0.24.2`.
+- **Belum di-deploy.** Menunggu izin Bapak.
+
 
 ## Rilis v0.24.1 — tata letak ponsel & penataan menu (27 Sep 2026)
 
