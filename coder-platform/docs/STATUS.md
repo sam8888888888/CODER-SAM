@@ -94,6 +94,12 @@ jalan (dilewati dengan alasan tertulis, jadi tidak ada data nyata yang bisa hila
   `BATAS_BACA_ULANG_KATALOG`), `apps/api/test/production-smoke.mjs` memuat pembersihan mandiri
   (`proyekDibuatSuite`), `deploy/env.keys.txt` memuat `APP_VERSION=0.24.2`.
 - Sudah di-deploy 27 Sep 2026 (izin Bapak) — buktinya di bagian berikut.
+- Paket dibangun ulang sesudah commit `0412ce2` (perbaikan skrip pemeriksa nginx + dokumen ini):
+  **SHA256 `86a12f04bd022458df778198815663b680adb77c38241969fb4b7c0982ee57d4`** (322 entri). Sama
+  seperti catatan rilis sebelumnya, SHA ini tercatat satu commit dokumen lebih baru dari paket itu
+  sendiri. Kode aplikasi di dalamnya **tidak berbeda** dari paket yang di-deploy: commit `0412ce2`
+  hanya menyentuh 2 berkas dokumen (ikut dipaketkan) dan `deploy/nginx-sync-csp.sh` (tidak ikut
+  dipaketkan — isi `coder-platform/deploy/` pada paket: `env-sync.sh`, `env.keys.txt`, `mailcow/`).
 
 ### Deploy produksi v0.24.2 + verifikasi produksi (27 Sep 2026)
 
