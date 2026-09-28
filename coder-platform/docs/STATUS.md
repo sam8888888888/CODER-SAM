@@ -15,6 +15,38 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
 
+## Pemisahan kode `chat.coblai.com` vs `coder.sam.university` (28 Sep 2026)
+
+Dua proyek ini beda versi dan beda tujuan: `coder.sam.university` adalah **versi baru** yang disiapkan
+**menggantikan** `chat.coblai.com`; layanan lama dipensiunkan setelah platform baru siap. Karena itu
+kodenya dipisahkan supaya tidak tumpang tindih.
+
+**Yang dikeluarkan dari repo ini** (kini hanya ada di repo arsip lama):
+
+| Berkas | Proyek |
+|---|---|
+| `server/` (chat-proxy-server.js, hub-server.js), `web/`, `web-new/`, `_snapshots/` | chat.coblai.com |
+| `docs/API-ENDPOINTS.md`, `docs/CATATAN-VERSI-2026-09-12.md`, `docs/FEATURE-PARITY.md` | chat.coblai.com |
+| `deploy/Caddyfile`, `deploy/Dockerfile.chat`, `deploy/Dockerfile.hub`, `deploy/docker-compose.yml` | chat.coblai.com (Caddy → coblai-chat → prime-agent-hub) |
+
+**Yang tetap di repo ini** (coder.sam.university): `coder-platform/`, `coder-dashboard/`, `deploy/`
+(skrip Austria: `deploy-austria.sh`, `buat-paket.sh`, `env-sync.sh`, `env.keys.txt`,
+`nginx-sync-csp.sh`, `enable-ai-provider.sh`, `ops/`), `docs/LOCAL-CODER-DASHBOARD.md`.
+
+**Tidak ada kode yang hilang.** Salinan kode lama ada di dua tempat: repo arsip lokal
+`/workspace/siap-push/CHAT-COBLAI` (riwayat khusus chat) dan cadangan utuh
+`/workspace/outputs/arsip-campuran-chat-coder-20260928.bundle` (riwayat campuran sebelum pemisahan,
+`git bundle verify` → complete history).
+
+**Kode aplikasi tidak diubah** oleh pemisahan ini: rilis produksi tetap v0.24.2. Bukti bahwa jalur
+deploy masih utuh sesudah pemisahan: `deploy/buat-paket.sh 0.24.2` dijalankan ulang →
+`PAKET_OK ... (314 entri)`. Gerbang `npm run verify` dan gerbang peramban tidak dijalankan ulang
+karena tidak ada berkas kode yang berubah.
+
+**Cabang kerja repo ini sekarang `main`** (commit rilis v0.24.2 + commit pemisahan). Riwayat remote
+`origin` diarahkan ke repo baru `github.com/sam8888888888/CODER-SAM`; repo lama
+`github.com/sam8888888888/coblai-dinda` tetap terpasang sebagai remote `arsip-coblai-dinda`.
+
 ## Perbaikan platform katalog mesin + bersih-bersih sisa data smoke (27 Sep 2026, menuju v0.24.2)
 
 **Perintah Bapak (27 Sep 2026):** "Bersihkan smoke, perbaikan platform di izinkan, github nanti paling
