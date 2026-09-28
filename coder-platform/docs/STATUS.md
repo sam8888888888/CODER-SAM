@@ -15,6 +15,19 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
 
+### Kirim ke GitHub (28 Sep 2026)
+
+- `github.com/sam8888888888/CODER-SAM` (publik): cabang `main` = commit pemisahan `fc73fac` + 5 tag
+  (`v0.20.2`, `v0.23.0`, `v0.24.0`, `v0.24.1`, `v0.24.2`). Isi 314 berkas: hanya `coder-platform/`,
+  `coder-dashboard/`, `deploy/` — nol berkas `chat.coblai.com`.
+- `github.com/sam8888888888/coblai-dinda` (privat, repo lama): cabang `main` **tidak diubah**
+  (tetap `3f75d9e6`); kode lama ditambahkan sebagai cabang baru **`arsip-chat-coblai-lama`** =
+  `cf25cc64`, 48 berkas, nol berkas koder.
+- Pengirim: repo kerja `/workspace/coblai-dinda` (remote `origin`) dan arsip
+  `/workspace/siap-push/CHAT-COBLAI` (remote `arsip`). Aturan yang dipakai: **tidak pernah `--force`**.
+- Bukti: `git push` exit 0 di kedua repo, lalu diverifikasi lewat GitHub API
+  (`GET /repos/.../commits/main`, `GET /repos/.../git/trees/main?recursive=1`).
+
 ## Pemisahan kode `chat.coblai.com` vs `coder.sam.university` (28 Sep 2026)
 
 Dua proyek ini beda versi dan beda tujuan: `coder.sam.university` adalah **versi baru** yang disiapkan
