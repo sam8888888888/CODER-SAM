@@ -15,6 +15,20 @@ Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4
 - Kedaluwarsa/gap: tidak ada tombol "Masuk dengan Google" di UI, jadi tidak ada yang perlu dimatikan.
 - Smoke produksi setelah perubahan ini: 156 lulus, 0 gagal, 0 lewat.
 
+### Jalur siaga: kunci SSH GitHub (disimpan 28 Sep 2026, belum aktif)
+
+Kalau suatu saat token GitHub tidak bisa dipakai, tersedia jalur kedua memakai kunci SSH (deploy key).
+
+- Kunci: `/workspace/.ssh/id_ed25519_coder_sam` (salinan di `/root/.ssh/`). Kunci publiknya:
+  `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFdrYjZHjUoF4mHFhafxCr+aIq+dGHipkERCDg0nKsri dinda-deploy-coder-sam`
+- Sidik jari: `SHA256:BHt3/5MZcUC3VlgDSAmJ5JeVAbvO7aMVVZVI+/90JBE`
+- Alias di `~/.ssh/config`: `github-coder-sam` dan `github-coblai-dinda`.
+- Cara mengaktifkan: GitHub → repo → *Settings* → *Deploy keys* → *Add deploy key* → tempel kunci publik di
+  atas → centang **Allow write access** → *Add key*. Lalu ubah remote repo menjadi
+  `git@github-coder-sam:sam8888888888/CODER-SAM.git` (atau `github-coblai-dinda` untuk repo arsip).
+- Keadaan sekarang: **belum ditambahkan di GitHub**, jadi `ssh -T git@github-coder-sam` masih menjawab
+  `Permission denied (publickey)`. Kunci ini tidak memberi akses apa pun sampai ditambahkan.
+
 ### Kirim ke GitHub (28 Sep 2026)
 
 - `github.com/sam8888888888/CODER-SAM` (publik): cabang `main` = commit pemisahan `fc73fac` + 5 tag
