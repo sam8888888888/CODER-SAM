@@ -661,6 +661,13 @@ kebijakan CSP ketat TIDAK merusak gaya sebaris React — React menulis gaya lewa
    Wave 11A nyata **208 lulus / 0 gagal**; `npm run verify` **61/61 dua kali**.
    Bila pemeriksaan premis `12h0` masih pernah meleset di masa depan, jalankan suite itu sendirian dulu.
 
+5. [DIPERBAIKI 27 Sep 2026] `deploy/nginx-sync-csp.sh` melaporkan `BLOK_ARTEFAK_ADA=0` padahal blok
+   `location ~ ^/api/v1/artifacts/[^/]+/(raw|download)` ADA di `/etc/nginx/sites-enabled/coder.sam.university.conf`
+   (baris 29). Sebabnya pola `grep` memakai regex (`[^/]\+`) padahal berkas memuat teks harfiah; akibatnya
+   `--apply` di masa depan berpotensi menambah blok kembar. Diganti `grep -cF 'api/v1/artifacts/'`; sesudah
+   itu `BLOK_ARTEFAK_ADA=1` dan `RENCANA_TAMBAH_BLOK_ARTEFAK=tidak`. Tidak ada suite yang menguji skrip itu
+   (dinyatakan apa adanya) — buktinya keluaran periksa-saja skrip itu sendiri.
+
 ### 6.10.3 Bukti produksi v0.24.1 + pelajaran untuk skrip verifikasi produksi (27 Sep 2026)
 
 Deploy v0.24.1 dan verifikasi produksi sudah selesai (angka lengkap di `docs/STATUS.md`, bagian
@@ -747,6 +754,15 @@ Penyimpangan yang dinyatakan terbuka:
 - Satu notifikasi lama milik `smoke.bot` tetap ada: jenis `billing`, `workspace_id` kosong
   ("Kredit token ditambahkan", 15 Sep 2026). Itu catatan penagihan tingkat akun, bukan sisa proyek smoke.
 - Jejak audit uji di workspace Bapak (§2 butir 12) tidak tersentuh — masih menunggu izin terpisah.
+
+#### Bukti pencegahan bekerja di produksi (sesudah deploy v0.24.2)
+
+- Smoke produksi 27 Sep 2026: **204 lulus / 0 gagal / SKIP-TOTAL 0 — `PRODUCTION_SMOKE_PASSED`, EXIT=0**
+  (`/workspace/outputs/prod_smoke_v0242.log`). Dibanding v0.24.1 (202 lulus), satu-satunya selisih adalah
+  **2 pemeriksaan baru yang lulus** (hapus-sendiri + "tidak ada lagi proyek Smoke Project").
+- Sesudah smoke, produksi diperiksa ulang lewat kueri langsung: **2 proyek, keduanya milik
+  `samianpacing@gmail.com`** (`TESTER`, `Music Genertor`). Tidak ada sisa proyek uji. Jadi jalan smoke
+  kini bersih total dari awal sampai akhir.
 
 #### Sebab sisa data itu muncul + pencegahannya
 

@@ -1,6 +1,6 @@
 # Status implementasi COBLAI Coder
 
-Terakhir diperbarui: 27 Sep 2026 (**v0.24.1 LIVE di produksi dan sudah diverifikasi: 61/61 suite dua kali + gerbang UI 253/253 + smoke produksi 201/0 + verifikasi peramban produksi 31/0**. **v0.24.2 sudah siap di kode dan lulus gerbang 61/61 dua kali + bukti mutasi, MENUNGGU IZIN Bapak untuk deploy**: perbaikan platform katalog mesin + suite smoke yang membersihkan dirinya sendiri; skema basis data tetap **21**. Sisa data smoke di produksi sudah dibersihkan 27 Sep 2026 atas perintah Bapak — rinciannya di bagian "Perbaikan platform katalog mesin + bersih-bersih sisa data smoke" di bawah).
+Terakhir diperbarui: 27 Sep 2026 (**v0.24.2 LIVE di produksi dan sudah diverifikasi**: gerbang uji 61/61 suite dua kali + gerbang UI 253/253 + **smoke produksi 204/0** + **verifikasi peramban produksi 31/0**. Rilisan ini memperbaiki katalog mesin yang bisa terbaca terpotong dan membuat suite smoke membersihkan proyeknya sendiri; skema basis data tetap **21**. Sebelumnya v0.24.1 juga sudah diverifikasi di produksi (smoke 201/0, peramban 31/0). Sisa data smoke lama di produksi sudah dibersihkan 27 Sep 2026 atas perintah Bapak — rinciannya di bagian "Perbaikan platform katalog mesin + bersih-bersih sisa data smoke" di bawah).
 
 Konfigurasi produksi yang AKTIF sejak 16 Sep 2026 (keputusan Bapak butir 1, 2, 4, 5):
 - `NOTIFY_EMAIL_ENABLED=true` — email keluar hidup. Bukti: surat uji ke `noreply@coblai.com`
@@ -93,7 +93,36 @@ jalan (dilewati dengan alasan tertulis, jadi tidak ada data nyata yang bisa hila
 - Isi paket diperiksa langsung: `apps/api/src/server.ts` memuat perbaikan katalog (`gabungKatalog`,
   `BATAS_BACA_ULANG_KATALOG`), `apps/api/test/production-smoke.mjs` memuat pembersihan mandiri
   (`proyekDibuatSuite`), `deploy/env.keys.txt` memuat `APP_VERSION=0.24.2`.
-- **Belum di-deploy.** Menunggu izin Bapak.
+- Sudah di-deploy 27 Sep 2026 (izin Bapak) — buktinya di bagian berikut.
+
+### Deploy produksi v0.24.2 + verifikasi produksi (27 Sep 2026)
+
+- `bash deploy/deploy-austria.sh 0.24.2` → **EXIT=0**, baris akhir **`DEPLOY_OK coder-platform-app:0.24.2`**
+  (`/workspace/outputs/deploy_v0242.log`).
+- Gerbang latihan migrasi (dijalankan otomatis sebelum versi hidup diganti):
+  `SCHEMA_VERSION_AFTER_MIGRATION 21 EXPECTED 21`, `ROW_COUNTS_PRESERVED true`, `MIGRATION_REHEARSAL_OK`;
+  cadangan latihan `/app/backups/coder-2026-09-28T01-17-01.770Z.db`.
+- Pergantian tanpa mati: hijau di 3403 → nginx diarahkan ke 3403 → salinan hidup dibuat ulang →
+  `NGINX_POINTED 3402`, `ZERO_DOWNTIME_DONE hijau dihentikan, biru melayani 3402`. Wadah antrean
+  (`worker`) dibuat ulang dan melaporkan `[jobs] worker aktif`.
+- Keadaan sesudah deploy: `APP_VERSION=0.24.2` di app **dan** worker; kedua wadah memakai image
+  `coder-platform-app:0.24.2`; `/health` **200**; `/ready` `{"status":"ready","database":"ok",
+  "engine":{"available":true,"version":"rpc-stdio"}}`; header CSP ada di halaman produksi dan
+  `CSP_NGINX_SUDAH_SAMA=true` (nginx == aplikasi); `schema_migrations` versi **21**; `integrity_check` ok.
+- **Smoke produksi: 204 lulus / 0 gagal / SKIP-TOTAL 0 — `PRODUCTION_SMOKE_PASSED`, EXIT=0**
+  (`/workspace/outputs/prod_smoke_v0242.log`). Dibanding v0.24.1 (202 lulus), satu-satunya selisih adalah
+  **2 pemeriksaan baru yang lulus**: "sisa data: proyek smoke dihapus sendiri oleh akun uji (tanpa perlu
+  admin)" dan "sisa data: tidak ada lagi proyek bernama Smoke Project di akun uji". Jadi pembersihan
+  mandiri suite smoke **terbukti bekerja di produksi**, dan produksi kembali bersih (2 proyek, keduanya
+  milik Bapak: `TESTER` + `Music Genertor`).
+- **Verifikasi peramban produksi: 31 lulus / 0 gagal — `PROD_UI_V0242_OK`, EXIT=0**
+  (`/workspace/outputs/prod_ui_v0242b.log`; skrip `/workspace/outputs/prod_ui_v0242.mjs`, hanya membaca,
+  memakai sesi tersimpan sehingga tidak ada masuk ulang).
+- Temuan kecil saat verifikasi dan sudah dibereskan: skrip pemeriksa `deploy/nginx-sync-csp.sh` melaporkan
+  `BLOK_ARTEFAK_ADA=0` padahal blok `location ~ ^/api/v1/artifacts/...` **ada** di nginx — polanya salah
+  (`grep` pola regex vs teks harfiah). Pola diganti `grep -cF`, sesudah itu `BLOK_ARTEFAK_ADA=1` dan
+  `RENCANA_TAMBAH_BLOK_ARTEFAK=tidak`, jadi `--apply` di masa depan tidak akan menambah blok kembar.
+  Tidak ada suite yang menguji skrip itu (dicatat apa adanya).
 
 
 ## Rilis v0.24.1 — tata letak ponsel & penataan menu (27 Sep 2026)

@@ -49,11 +49,11 @@ LAMA="$(grep -m1 'add_header Content-Security-Policy "' "$CONF" | sed -E 's/.*Co
 echo "CSP_NGINX_SEKARANG_CHARS=${#LAMA}"
 echo "CSP_NGINX_SEKARANG=${LAMA}"
 if [ "$LAMA" = "$CSP_BARU" ]; then echo "CSP_NGINX_SUDAH_SAMA=true"; else echo "CSP_NGINX_SUDAH_SAMA=false"; fi
-echo "BLOK_ARTEFAK_ADA=$(grep -c 'api/v1/artifacts/\[^/\]\+/(raw|download)' "$CONF" || true)"
+echo "BLOK_ARTEFAK_ADA=$(grep -cF 'api/v1/artifacts/' "$CONF" || true)"
 
 if [ "$MODE" != "--apply" ]; then
   echo "RENCANA_CSP_BARU=${CSP_BARU}"
-  echo "RENCANA_TAMBAH_BLOK_ARTEFAK=$( [ "$(grep -c 'api/v1/artifacts/\[^/\]\+/(raw|download)' "$CONF" || true)" = "0" ] && echo ya || echo tidak )"
+  echo "RENCANA_TAMBAH_BLOK_ARTEFAK=$( [ "$(grep -cF 'api/v1/artifacts/' "$CONF" || true)" = "0" ] && echo ya || echo tidak )"
   echo "CEK_SAJA_SELESAI=true"
   exit 0
 fi
